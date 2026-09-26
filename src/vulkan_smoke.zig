@@ -6332,9 +6332,9 @@ fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool, 
         renderer.descriptor_set = renderer.descriptor_sets[0];
         @memset(&renderer.active_storage_buffers, 0);
     }
-    // With draw uploads enabled, only a fingerprinted persistent hit reaches
-    // the host-write path. Seed it before enabling the ring, as a prior
-    // compute upload would, then change the same resource between draws.
+    // Seed a persistent fingerprinted hit before enabling draw uploads.
+    // That path now orders ring copies on the GPU instead of renaming a
+    // host-written allocation, but must preserve the same queued snapshots.
     if (draw_uploads) {
         std.debug.assert(fingerprint);
         _ = try renderer.stageGuestStorageBufferAt(0, 0x1000, 16);
@@ -6357,14 +6357,14 @@ fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool, 
             _ = try renderer.stageGuestStorageBufferAt(1, 0x2000 + index * 0x100, 16);
             _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
             try std.testing.expectEqual(submitted, renderer.submitted_tick);
-            try std.testing.expectEqual(index + 1, renderer.pending_command_buffers.items.len);
+            try std.testing.expect(renderer.recording_command_buffer != null or renderer.pending_command_buffers.items.len != 0);
         }
-        try std.testing.expectEqual(renames + 7, renderer.frame_profile.storage_buffer_renames);
+        try std.testing.expectEqual(renames + @as(u64, if (draw_uploads) 0 else 7), renderer.frame_profile.storage_buffer_renames);
         // The completed oversized original is released, leaving six small
         // spares from the first batch. One additional small spare is needed.
-        if (pass != 0) try std.testing.expectEqual(reuses + @as(u64, if (oversized) 6 else 7), renderer.frame_profile.storage_buffer_rename_reuses);
+        if (pass != 0) try std.testing.expectEqual(reuses + @as(u64, if (draw_uploads) 0 else if (oversized) 6 else 7), renderer.frame_profile.storage_buffer_rename_reuses);
         try std.testing.expect(renderer.retired_storage_buffer_bytes <= renderer.storage_buffer_rename_budget_bytes);
-        if (oversized) {
+        if (oversized and !draw_uploads) {
             if (pass == 0) {
                 try std.testing.expect(renderer.retired_storage_buffer_bytes >= 2 * 1024 * 1024);
             } else {
@@ -6398,7 +6398,9 @@ fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool, 
     guest.word(0x1000, 0xfedcba98);
     _ = try renderer.stageGuestStorageBufferAt(0, 0x1000, 16);
     try std.testing.expectEqual(renames, renderer.frame_profile.storage_buffer_renames);
-    try std.testing.expect(renderer.submitted_tick > submitted);
+    if (draw_uploads) {
+        try std.testing.expectEqual(submitted, renderer.submitted_tick);
+    } else try std.testing.expect(renderer.submitted_tick > submitted);
     var result: [16]u8 = undefined;
     try renderer.readbackGuestStorageBuffer(0x2000, &result);
     try std.testing.expectEqual(@as(u32, 0x76543210), std.mem.readInt(u32, result[0..4], .little));
@@ -6466,7 +6468,9 @@ fn runStorageRenamePoolPressureProbe(allocator: std.mem.Allocator, byte_pressure
         _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
         try std.testing.expectEqual(submitted, renderer.submitted_tick);
         try std.testing.expectEqual(waits, renderer.frame_profile.storage_buffer_waits);
-        try std.testing.expectEqual(index + 1, renderer.pending_command_buffers.items.len);
+        // Dispatches may share the open command buffer. They still have to
+        // remain queued until readback, with every original input preserved.
+        try std.testing.expect(renderer.recording_command_buffer != null or renderer.pending_command_buffers.items.len != 0);
         try std.testing.expectEqual(@as(u64, @intCast(index)), renderer.frame_profile.storage_buffer_renames);
         try std.testing.expect(renderer.retired_storage_buffers.items.len <= 256);
         if (index != 0) try std.testing.expect(renderer.retired_storage_buffer_bytes <= renderer.storage_buffer_rename_budget_bytes);

@@ -1464,7 +1464,11 @@ pub const AddressSpace = struct {
             if (mapping.end() <= cursor) continue;
             if (mapping.address > cursor) return false;
             const allowed = switch (required) {
-                .read => mapping.protection.read,
+                // Match the permissions installed by Protection.host():
+                // x86 write access also permits reads. Testing only the
+                // requested READ bit sent every GPU descriptor load from a
+                // write-only guest allocation through VirtualQuery instead.
+                .read => mapping.protection.read or mapping.protection.write,
                 .write => mapping.protection.write,
             };
             if (!allowed) return false;
@@ -2362,6 +2366,34 @@ test "fixed pages are identity mapped, protected, and decommitted" {
     try testing.expect(!space.isMapped(address, page_size));
 }
 
+test "write-only guest pages retain effective host readability and GPU write tracking" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var space = try AddressSpace.init(testing.allocator);
+    defer space.deinit();
+    const address = system_managed.start;
+    try space.mapFixed(address, page_size, .{ .write = true }, .private, null);
+    try space.write(address, "first");
+    try testing.expect(space.isReadable(address, page_size));
+    try testing.expect(isHostRangeReadable(address, page_size));
+    try testing.expectEqual(@as(i32, 2), space.query(address, false).?.protection_bits);
+    space.enableGpuMemoryTracking();
+    const generation = try space.trackGpuRead(address, 5);
+    try testing.expect(generation != 0);
+    var bytes: [5]u8 = undefined;
+    try space.read(address, &bytes);
+    try testing.expectEqualStrings("first", &bytes);
+    try testing.expect(space.handleGpuTrackedWriteFault(address));
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, bytes.len));
+    @memcpy(@as([*]u8, @ptrFromInt(address))[0..5], "after");
+    try space.read(address, &bytes);
+    try testing.expectEqualStrings("after", &bytes);
+    try space.protect(address, page_size, .none);
+    try testing.expect(!space.isReadable(address, 1));
+    try testing.expect(!isHostRangeReadable(address, 1));
+    try space.unmap(address, page_size);
+    try testing.expect(!space.isReadable(address, 1));
+}
+
 test "pinned direct memory preserves physical identity across remapping" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     var space = try AddressSpace.initWithDirectMemory(testing.allocator, 256 * 1024);
@@ -2606,7 +2638,7 @@ test "permission lookup preserves gaps boundaries and adjacent protections" {
     inline for (.{ AddressSpace.RequiredPermission.read, AddressSpace.RequiredPermission.write }) |permission| {
         var permitted = [_]bool{false} ** 128;
         for (mappings) |mapping| {
-            const allowed = if (permission == .read) mapping.protection.read else mapping.protection.write;
+            const allowed = if (permission == .read) mapping.protection.read or mapping.protection.write else mapping.protection.write;
             for (mapping.address - 0x1000..mapping.end() - 0x1000) |index| permitted[index] = allowed;
         }
         for (0..64) |start| {

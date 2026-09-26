@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 
 var submit_ns: u64 = 0;
 var submit_calls: u64 = 0;
+var counter_frequency: std.atomic.Value(u64) = .init(0);
 
 pub const Split = struct {
     submit_ns: u64,
@@ -29,12 +30,25 @@ pub fn timestampNs() u64 {
         return timer.read();
     }
     var counter: std.os.windows.LARGE_INTEGER = 0;
-    var frequency: std.os.windows.LARGE_INTEGER = 0;
-    if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or
-        !std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency).toBool() or
-        frequency <= 0) return 0;
-    const ticks: u128 = @intCast(@max(counter, 0));
-    return @intCast(ticks * std.time.ns_per_s / @as(u128, @intCast(frequency)));
+    if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or counter < 0) return 0;
+    var frequency = counter_frequency.load(.monotonic);
+    if (frequency == 0) {
+        var queried: std.os.windows.LARGE_INTEGER = 0;
+        if (!std.os.windows.ntdll.RtlQueryPerformanceFrequency(&queried).toBool() or queried <= 0) return 0;
+        frequency = @intCast(queried);
+        counter_frequency.store(frequency, .monotonic);
+    }
+    return counterNanoseconds(@intCast(counter), frequency);
+}
+
+fn counterNanoseconds(ticks: u64, frequency: u64) u64 {
+    // Windows commonly exposes a 10 MHz counter. Avoid a 128-bit divide at
+    // every resource timer when the conversion is an exact multiplication.
+    if (std.time.ns_per_s % frequency == 0) {
+        const product = @mulWithOverflow(ticks, std.time.ns_per_s / frequency);
+        if (product[1] == 0) return product[0];
+    }
+    return @intCast(@min(std.math.maxInt(u64), @as(u128, ticks) * std.time.ns_per_s / frequency));
 }
 
 pub fn elapsedNs(started: u64) u64 {
@@ -69,4 +83,13 @@ test "submit accounting accumulates and resets" {
     try std.testing.expectEqual(@as(u64, 0), cleared.submit_ns);
     try std.testing.expectEqual(@as(u64, 0), cleared.submit_calls);
     try std.testing.expectEqual(@as(u64, 0), elapsedNs(0));
+}
+
+test "counter conversion preserves fractional frequencies and long uptimes" {
+    for ([_]u64{ 1, 3_579_545, 10_000_000, 1_000_000_000, 3_000_000_000 }) |frequency| {
+        for ([_]u64{ 0, 1, 123456789, std.math.maxInt(i64), std.math.maxInt(u64) }) |ticks| {
+            const expected: u64 = @intCast(@min(std.math.maxInt(u64), @as(u128, ticks) * std.time.ns_per_s / frequency));
+            try std.testing.expectEqual(expected, counterNanoseconds(ticks, frequency));
+        }
+    }
 }

@@ -74,16 +74,7 @@ const presentation_acquire_timeout_ns: u64 = 50 * std.time.ns_per_ms;
 
 fn hostTimestampNs() u64 {
     if (comptime builtin.os.tag != .windows) return 0;
-    var counter: std.os.windows.LARGE_INTEGER = 0;
-    var frequency: std.os.windows.LARGE_INTEGER = 0;
-    if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or
-        !std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency).toBool() or
-        counter < 0 or frequency <= 0)
-    {
-        return 0;
-    }
-    const scaled = @as(u128, @intCast(counter)) * std.time.ns_per_s;
-    return @intCast(scaled / @as(u128, @intCast(frequency)));
+    return gpu.frame_timing.timestampNs();
 }
 
 fn elapsedHostNanoseconds(started: u64) u64 {
@@ -4336,6 +4327,7 @@ pub const Renderer = struct {
     // an exact readback are harmless; completion resets them after publication.
     deferred_shader_metadata_start: u64 = std.math.maxInt(u64),
     deferred_shader_metadata_end: u64 = 0,
+    deferred_shader_metadata_slots: std.StaticBitSet(maximum_retained_buffer_entries) = .initEmpty(),
     deferred_shader_metadata_bounds_enabled: bool = true,
     depth_transfer_enabled: bool,
     image_state_optimization_enabled: bool,
@@ -6341,6 +6333,8 @@ pub const Renderer = struct {
             // swapRemove moves one retained allocation without changing its
             // descriptor handle. Preserve that slot's use tracking by index.
             const last_index = self.guest_buffers.items.len - 1;
+            self.deferred_shader_metadata_slots.setValue(index, self.deferred_shader_metadata_slots.isSet(last_index));
+            self.deferred_shader_metadata_slots.unset(last_index);
             for (&self.active_storage_cache_indices) |*bound| {
                 if (bound.* == index) bound.* = null else if (bound.* == last_index) bound.* = index;
             }
@@ -6564,7 +6558,7 @@ pub const Renderer = struct {
             if (recycle_index == null) {
                 try self.guest_buffers.ensureUnusedCapacity(self.allocator, 1);
                 const backing = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, null), guest_address, host_identity);
-                self.guest_buffer_address_index.invalidate();
+                self.guest_buffer_address_index.insert(self.guest_buffers.items.len, guest_address);
                 self.guest_buffers.appendAssumeCapacity(.{
                     .descriptor_index = descriptor_index,
                     .guest_address = guest_address,
@@ -6602,7 +6596,7 @@ pub const Renderer = struct {
                     victim.last_gpu_use = 0;
                 }
                 victim.descriptor_index = descriptor_index;
-                self.guest_buffer_address_index.invalidate();
+                self.guest_buffer_address_index.replace(victim_index, victim.guest_address, guest_address);
                 victim.guest_address = guest_address;
                 victim.size = size;
                 victim.last_used_sequence = self.guest_buffer_sequence;
@@ -6861,7 +6855,10 @@ pub const Renderer = struct {
             if (source.identity(source.context, entry.guest_address, entry_size) == view.identity) {
                 if (!source.publish(source.context, entry.guest_address, size)) return Error.GuestMemoryWriteFailed;
             }
-            if (size == entry_size) entry.gpu_dirty = false;
+            if (size == entry_size) {
+                entry.gpu_dirty = false;
+                self.deferred_shader_metadata_slots.unset(index);
+            }
             return;
         }
         const mapping = try self.mapStorageReadback(entry, size);
@@ -6872,6 +6869,7 @@ pub const Renderer = struct {
         self.frame_profile.storage_readback_bytes +%= size;
         if (size == entry_size) {
             entry.gpu_dirty = false;
+            self.deferred_shader_metadata_slots.unset(index);
             entry.page_generation = if (memory.gpu_generation) |generation|
                 generation(memory.context, entry.guest_address, entry_size)
             else
@@ -7012,8 +7010,10 @@ pub const Renderer = struct {
         if (self.defer_small_storage_writes_enabled and bytes.len != 0 and
             (!self.deferred_shader_metadata_bounds_enabled or overlaps_metadata))
         {
-            self.frame_profile.shader_metadata_candidates +|= self.guest_buffers.items.len;
-            for (self.guest_buffers.items, 0..) |entry, index| {
+            var pending = self.deferred_shader_metadata_slots.iterator(.{});
+            while (pending.next()) |index| {
+                self.frame_profile.shader_metadata_candidates +|= 1;
+                const entry = self.guest_buffers.items[index];
                 if (!entry.gpu_dirty or entry.size >= deferred_storage_write_min_bytes or
                     !byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) continue;
                 self.flushGuestStorageBuffer(index) catch |err| {
@@ -11168,6 +11168,8 @@ pub const Renderer = struct {
         entry.gpu_dirty = true;
         entry.content_hash = null;
         if (entry.size >= deferred_storage_write_min_bytes) return;
+        const index = (@intFromPtr(entry) - @intFromPtr(self.guest_buffers.items.ptr)) / @sizeOf(GuestBufferEntry);
+        self.deferred_shader_metadata_slots.set(index);
         self.deferred_shader_metadata_start = @min(self.deferred_shader_metadata_start, entry.guest_address);
         self.deferred_shader_metadata_end = @max(self.deferred_shader_metadata_end, entry.guest_address +| entry.size);
     }

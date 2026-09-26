@@ -49,6 +49,28 @@ pub fn Index(comptime capacity: usize) type {
             self.valid = false;
         }
 
+        /// Maintain a live index when one cache slot is appended or recycled.
+        /// Chains remain sorted so aliases keep the original scan precedence.
+        pub fn insert(self: *Self, slot: usize, address: u64) void {
+            if (!self.valid) return;
+            if (slot >= capacity) return self.invalidate();
+            var link = &self.heads[bucket(address)];
+            while (link.* != empty and link.* < slot) link = &self.links[link.*];
+            self.links[slot] = link.*;
+            link.* = @intCast(slot);
+        }
+
+        pub fn replace(self: *Self, slot: usize, previous: u64, address: u64) void {
+            if (!self.valid) return;
+            if (slot >= capacity) return self.invalidate();
+            if (bucket(previous) == bucket(address)) return;
+            var link = &self.heads[bucket(previous)];
+            while (link.* != empty and link.* != slot) link = &self.links[link.*];
+            if (link.* == empty) return self.invalidate();
+            link.* = self.links[slot];
+            self.insert(slot, address);
+        }
+
         pub fn candidates(self: *Self, items: anytype, address: u64) Iterator {
             return self.candidatesBy(items, address, struct {
                 fn get(item: @TypeOf(items[0])) u64 {
@@ -167,4 +189,31 @@ test "address buckets fall back for oversized caches and recover after invalidat
     candidates = index.candidates(entries[0..1], entries[0].guest_address);
     try std.testing.expectEqual(@as(?usize, 0), candidates.next());
     try std.testing.expectEqual(null, candidates.next());
+}
+
+test "incremental buffer replacements match a rebuilt index under cache churn" {
+    const Entry = struct { guest_address: u64 };
+    var entries: [64]Entry = undefined;
+    var index = Index(64){};
+    const empty_entries: []const Entry = entries[0..0];
+    _ = index.candidates(empty_entries, 0);
+    for (&entries, 0..) |*entry, slot| {
+        entry.* = .{ .guest_address = 0x1000 + (slot % 7) * 256 };
+        index.insert(slot, entry.guest_address);
+    }
+    for (0..256) |step| {
+        const slot = (step * 13) % entries.len;
+        const address = 0x1000 + (step % 19) * 256;
+        index.replace(slot, entries[slot].guest_address, address);
+        entries[slot].guest_address = address;
+        var rebuilt = Index(64){};
+        for (entries) |entry| {
+            var actual = index.candidates(&entries, entry.guest_address);
+            var expected = rebuilt.candidates(&entries, entry.guest_address);
+            while (expected.next()) |wanted| try std.testing.expectEqual(@as(?usize, wanted), actual.next());
+            try std.testing.expectEqual(null, actual.next());
+        }
+    }
+    index.insert(entries.len, 0x1000);
+    try std.testing.expect(!index.valid);
 }

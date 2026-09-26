@@ -285,6 +285,7 @@ pub const ScalarDefinitionCache = struct {
     graph: Graph,
     entries: std.AutoHashMapUnmanaged(Key, ?ScalarDefinition) = .empty,
     saved_origins: std.AutoHashMapUnmanaged(Key, ?ScalarOrigin) = .empty,
+    instruction_positions: std.AutoHashMapUnmanaged(u32, usize) = .empty,
     reachable: ?[maximum_blocks]bool = undefined,
     reachability_ready: bool = false,
     allocation_failed: bool = false,
@@ -300,9 +301,24 @@ pub const ScalarDefinitionCache = struct {
     pub fn deinit(self: *ScalarDefinitionCache) void {
         self.entries.deinit(self.allocator);
         self.saved_origins.deinit(self.allocator);
+        self.instruction_positions.deinit(self.allocator);
         self.bounds.deinit(self.allocator);
         self.lanes.deinit(self.allocator);
         self.vector_origins.deinit(self.allocator);
+    }
+
+    /// Resource recovery repeatedly asks for the same instruction boundary.
+    /// Cache positions only, never scalar values or guest memory contents.
+    pub fn instructionBefore(self: *ScalarDefinitionCache, pc: u32) usize {
+        if (self.instruction_positions.get(pc)) |position| return position;
+        var position: usize = 0;
+        while (position < self.instructions.len and self.instructions[position].pc < pc) : (position += 1) {}
+        if (!self.allocation_failed and self.instruction_positions.count() < maximum_entries) {
+            self.instruction_positions.put(self.allocator, pc, position) catch {
+                self.allocation_failed = true;
+            };
+        }
+        return position;
     }
 
     pub fn vectorEntryOrigins(self: *ScalarDefinitionCache, before: usize, register: u32) ?VectorEntryOrigins {
@@ -388,6 +404,26 @@ pub const ScalarDefinitionCache = struct {
         return .{ .value = value, .hit = false };
     }
 };
+
+test "cached resource boundaries preserve gaps and exhausted-cache fallbacks" {
+    const instructions = [_]Instruction{
+        .{ .pc = 4, .opcode = .s_nop },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 20, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var cache = ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+    defer cache.deinit();
+    const queries = [_]u32{ 0, 4, 5, 12, 13, 20, 21, 0xffffffff };
+    const expected = [_]usize{ 0, 0, 1, 1, 2, 2, 3, 3 };
+    for (0..2) |_| for (queries, expected) |pc, position| {
+        try std.testing.expectEqual(position, cache.instructionBefore(pc));
+    };
+    cache.allocation_failed = true;
+    try std.testing.expectEqual(@as(usize, 2), cache.instructionBefore(16));
+    try std.testing.expect(!cache.instruction_positions.contains(16));
+}
 
 /// Borrowed, immutable instructions and CFG for one resource-word recovery.
 /// Cache only static definitions, including ambiguity; never guest values.

@@ -107,8 +107,11 @@ pub const Resolver = struct {
                 _ = persistent_definition_cache_misses.fetchAdd(self.definition_batch.persistent_misses, .monotonic);
             }
         };
-        var before: usize = 0;
-        while (before < self.instructions.len and self.instructions[before].pc < before_pc) : (before += 1) {}
+        const before = if (self.definition_batch.persistent) |cache| cache.instructionBefore(before_pc) else position: {
+            var index: usize = 0;
+            while (index < self.instructions.len and self.instructions[index].pc < before_pc) : (index += 1) {}
+            break :position index;
+        };
         if (before == self.instructions.len) return false;
         for (output, 0..) |*value, component| value.* = (try self.word(register + @as(u32, @intCast(component)), before, 0)) orelse return false;
         return true;

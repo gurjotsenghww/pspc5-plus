@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Artur Strazewicz
 
 //! Launch-time output preferences shared by the launcher and game-run.
-//! These describe the display, not the dimensions of guest render targets.
+//! Used for the display and supported engine startup settings. Games may
+//! still change render-target dimensions after initialization.
 const std = @import("std");
 
 pub const environment_name = "PS5_OUTPUT_RESOLUTION";

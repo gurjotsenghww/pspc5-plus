@@ -4,6 +4,9 @@ Title: **PPSA02457, v1.022.125**. Host: Windows x64, NVIDIA GeForce RTX 3070 Ti.
 This development-build follow-up investigates the missing menu after the
 [startup file descriptor fix](subnautica-startup-2026-09-26.md).
 
+These are historical 4K results. See the [September 27 follow-up](1080p-buffer-reuse-2026-09-27.md)
+for native 1080p startup, shared buffer reuse and updated measurements.
+
 ## Missing interface
 
 The animated scene was running, but `PlatformUtils.main.services` remained
@@ -68,4 +71,4 @@ include an intermittent missing-label frame. Performance remains low.
 Final local runner SHA-256:
 `AFDBDD62EFE281BC5CDAC3F47059FEBA2B0F12C35D4458A08EA38190670A616E`.
 
-![Subnautica Below Zero main menu rendered by PS5PCEM](../images/subnautica-below-zero-menu.png)
+![Subnautica Below Zero main menu rendered by PS5PCEM on September 26](../images/subnautica-below-zero-menu-2026-09-26.png)

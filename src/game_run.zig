@@ -416,6 +416,10 @@ fn run(init: std.process.Init) !bool {
     };
     defer content.close(io);
     runtime.firmware.filesystem.attach(io, content);
+    if (try runtime.firmware.filesystem.configureDisplay(output_mode.width(), output_mode.height())) {
+        try out.print("  Unity startup render size {d}x{d} (virtual boot.config)\n", .{ output_mode.width(), output_mode.height() });
+        try out.flush();
+    }
     defer runtime.firmware.filesystem.detach();
 
     const rtc_day_offset: i32 = if (init.minimal.environ.getAlloc(
@@ -698,15 +702,15 @@ fn run(init: std.process.Init) !bool {
         const request = std.mem.trim(u8, text, " \t\r\n");
         break :enabled request.len != 0 and !std.mem.eql(u8, request, "0");
     } else |_| true;
-    // Quake's static arenas and small model views benefit from page-tracked
-    // retained buffers. Keep this measured profile local to the tested title;
-    // explicit zero values allow each optimization to be disabled separately.
+    // Native Windows writes are observed by the page-fault tracker. Retain
+    // unchanged buffers for every title; explicit zero values remain useful
+    // for comparisons. Vertex-fetch bounds still use the verified profile.
     const use_quake_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, quake_ii_title_id);
     const enable_gpu_page_tracker = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PAGE_TRACKER")) |text| enabled: {
         defer allocator.free(text);
         const request = std.mem.trim(u8, text, " \t\r\n");
         break :enabled request.len != 0 and !std.mem.eql(u8, request, "0");
-    } else |_| enable_gpu_experimental or use_quake_buffer_profile;
+    } else |_| builtin.os.tag == .windows or enable_gpu_experimental or use_quake_buffer_profile;
     const bound_vertex_fetches = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BOUND_VERTEX_FETCHES")) |text| enabled: {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
@@ -766,11 +770,10 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_graphics_translation_mib, 64, 1024);
     } else |_| default_graphics_translation_mib;
-    // Below Zero's repeated compute passes are dominated by reads from host
-    // memory. Device-local working buffers remove that PCIe traffic without
-    // changing the guest's rendering resolution or enabling content reuse.
-    const default_device_storage_mib: usize = if (use_quake_buffer_profile or
-        std.ascii.eqlIgnoreCase(title_identifier, subnautica_below_zero_title_id)) 512 else 0;
+    // Large working buffers should reside on the GPU regardless of title.
+    // This is an allocation budget, not an up-front VRAM reservation; small
+    // control buffers keep their directly readable host backing.
+    const default_device_storage_mib: usize = 512;
     const device_storage_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_STORAGE_MIB")) |text| parse: {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch default_device_storage_mib, 2048);
@@ -801,8 +804,8 @@ fn run(init: std.process.Init) !bool {
     } else |_| 4096;
     const storage_buffer_cache_entries = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_BUFFER_CACHE_ENTRIES")) |text| parse: {
         defer allocator.free(text);
-        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 2048, 64, 4096);
-    } else |_| 2048;
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 4096, 64, 4096);
+    } else |_| 4096;
 
     // What the rendering preset actually selects. Both of these trade a
     // little fidelity margin for throughput once the sampled cache is over

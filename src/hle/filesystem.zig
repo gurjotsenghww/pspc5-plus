@@ -14,6 +14,7 @@
 const std = @import("std");
 const audio_fs = @import("audio_fs.zig");
 const savedata = @import("savedata.zig");
+const boot_config = @import("boot_config.zig");
 
 /// Descriptors below this belong to the standard streams.
 pub const first_descriptor: i32 = 3;
@@ -425,6 +426,23 @@ var open_files: [maximum_open_files]?OpenFile = @splat(null);
 var next_descriptor: u32 = first_descriptor;
 var table_lock: Lock = .{};
 var virtual_socket_signal: std.atomic.Value(u8) = .init(0);
+var boot_override: [boot_config.maximum_bytes]u8 = undefined;
+var boot_override_length: usize = 0;
+
+/// Called before guest threads start. All reads/stat calls see one immutable
+/// launch document, including positional reads and independently opened FDs.
+pub fn configureDisplay(width: u32, height: u32) Error!bool {
+    const io = active_io orelse return Error.NotAttached;
+    const directory = root orelse return Error.NotAttached;
+    var original: [boot_config.maximum_bytes]u8 = undefined;
+    const source = directory.readFile(io, boot_config.path, &original) catch return false;
+    table_lock.lock();
+    defer table_lock.unlock();
+    boot_override_length = 0;
+    const replacement = boot_config.rewrite(source, &boot_override, width, height) catch return Error.IoFailed;
+    if (replacement) |bytes| boot_override_length = bytes.len;
+    return replacement != null;
+}
 
 /// Makes a host directory visible to the title as `/app0`.
 pub fn attach(io: std.Io, directory: std.Io.Dir) void {
@@ -432,6 +450,7 @@ pub fn attach(io: std.Io, directory: std.Io.Dir) void {
     defer table_lock.unlock();
     active_io = io;
     root = directory;
+    boot_override_length = 0;
     virtual_socket_signal.store(0, .release);
 }
 
@@ -735,6 +754,7 @@ pub fn detach() void {
             if (slot.*) |entry| {
                 if (entry.file) |file| file.close(io);
                 if (entry.directory) |directory| directory.close(io);
+                if (entry.memory) |bytes| std.heap.page_allocator.free(bytes);
             }
             slot.* = null;
         }
@@ -744,6 +764,7 @@ pub fn detach() void {
     active_io = null;
     next_descriptor = first_descriptor;
     root = null;
+    boot_override_length = 0;
     download_root = null;
     virtual_socket_signal.store(0, .release);
     audio_fs.reset();
@@ -849,6 +870,19 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     if (flags & O.directory != 0) return openDirectory(path, relative, io, directory);
 
     if (mount != .title) return openWritableFile(path, relative, flags, io, directory);
+
+    if (std.ascii.eqlIgnoreCase(relative, boot_config.path)) {
+        table_lock.lock();
+        defer table_lock.unlock();
+        if (boot_override_length != 0) {
+            const bytes = std.heap.page_allocator.dupe(u8, boot_override[0..boot_override_length]) catch return Error.IoFailed;
+            errdefer std.heap.page_allocator.free(bytes);
+            var entry = OpenFile{ .memory = bytes, .size = bytes.len };
+            entry.path_length = @min(path.len, maximum_path);
+            @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+            return insertFileLocked(entry);
+        }
+    }
 
     var alias_storage: [maximum_path]u8 = undefined;
     const file = directory.openFile(io, relative, .{}) catch |err| switch (err) {
@@ -1311,6 +1345,15 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
     var relative_storage: [maximum_path]u8 = undefined;
     const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
 
+    if (mountOf(path) == .title and std.ascii.eqlIgnoreCase(relative, boot_config.path)) {
+        table_lock.lock();
+        defer table_lock.unlock();
+        if (boot_override_length != 0) {
+            fillStat(out, boot_override_length, false);
+            return;
+        }
+    }
+
     const info = directory.statFile(io, relative, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.BadPathName => {
             if (audio_fs.virtualWavSize(relative, directory, io)) |size| {
@@ -1609,6 +1652,41 @@ const Fixture = struct {
         self.tmp.cleanup();
     }
 };
+
+test "display boot overlay has consistent reads and stat without modifying title content" {
+    var fixture = try Fixture.init("unchanged");
+    defer fixture.deinit();
+    try fixture.tmp.dir.createDirPath(testing.io, "Media");
+    const original = "platform-ps5-video-out-width=3840\nkeep=value\n";
+    const expected = "platform-ps5-video-out-width=1920\nkeep=value\n";
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = boot_config.path, .data = original });
+    try testing.expect(try configureDisplay(1920, 1080));
+    var info: Stat = undefined;
+    try stat("/app0/Media/boot.config", &info);
+    try testing.expectEqual(@as(i64, expected.len), info.size);
+    const fd = try open("/app0/Media/boot.config", O.rdonly);
+    defer close(fd) catch {};
+    try fstat(fd, &info);
+    try testing.expectEqual(@as(i64, expected.len), info.size);
+    var bytes: [128]u8 = undefined;
+    const head = try read(fd, bytes[0..11]);
+    const tail = try read(fd, bytes[head..]);
+    try testing.expectEqualStrings(expected, bytes[0 .. head + tail]);
+    try testing.expectEqual(@as(usize, 0), try read(fd, &bytes));
+    const second = try open("/app0/Media\\boot.config", O.rdonly);
+    defer close(second) catch {};
+    try testing.expectEqual(expected.len, try pread(second, &bytes, 0));
+    try testing.expectEqualStrings(expected, bytes[0..expected.len]);
+    const disk = try fixture.tmp.dir.readFile(testing.io, boot_config.path, &bytes);
+    try testing.expectEqualStrings(original, disk);
+    try testing.expectError(Error.ReadOnly, open("/app0/Media/boot.config", O.wronly));
+    detach();
+    attach(testing.io, fixture.tmp.dir);
+    const raw = try open("/app0/Media/boot.config", O.rdonly);
+    defer close(raw) catch {};
+    const length = try read(raw, &bytes);
+    try testing.expectEqualStrings(original, bytes[0..length]);
+}
 
 test "save-data search hides interrupted slots without payload" {
     var fixture = try Fixture.init("title data");
