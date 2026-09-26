@@ -1004,15 +1004,25 @@ fn executeSmem(
     }
 
     var loaded: [16]u32 = @splat(0);
-    for (loaded[0..inst.data_words], 0..) |*word, index| {
-        if (buffer_size) |size| {
-            if (displacement < 0 or (@as(u64, @intCast(displacement)) & ~@as(u64, 3)) + index * 4 + 4 > size) continue;
-        }
-        word.* = reader.readU32(address + index * 4) catch {
+    // A wide SMEM load is one contiguous read. Checking each dword separately
+    // repeats guest mapping queries and GPU metadata synchronization up to
+    // sixteen times for the same descriptor. Buffer OOB words remain zero;
+    // only the complete in-bounds dwords may reach the memory reader.
+    const readable_words: usize = if (buffer_size) |size| bounded: {
+        if (displacement < 0) break :bounded 0;
+        const byte_offset = @as(u64, @intCast(displacement)) & ~@as(u64, 3);
+        break :bounded @intCast(@min(inst.data_words, (size -| byte_offset) / 4));
+    } else inst.data_words;
+    if (readable_words != 0) {
+        var bytes: [16 * 4]u8 = undefined;
+        reader.read(address, bytes[0 .. readable_words * 4]) catch {
             invalidateDestination(result, inst.dst, inst.data_words);
             result.stop_reason = .inaccessible_memory;
             return false;
         };
+        for (loaded[0..readable_words], 0..) |*word, index| {
+            word.* = std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
+        }
     }
 
     const base_sources = Sources.merge(base_lo.sources, base_hi.sources);
@@ -1640,9 +1650,13 @@ fn addSigned(base: u64, offset: i64) ?u64 {
 const TestMemory = struct {
     base: u64,
     bytes: []u8,
+    read_count: usize = 0,
+    last_read_size: usize = 0,
 
     fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
         const self: *TestMemory = @ptrCast(@alignCast(context.?));
+        self.read_count += 1;
+        self.last_read_size = destination.len;
         if (address < self.base) return false;
         const offset: usize = @intCast(address - self.base);
         if (offset > self.bytes.len or destination.len > self.bytes.len - offset) return false;
@@ -2901,4 +2915,47 @@ test "scalar buffer loads honor overlapping SOFFSET and per-dword bounds" {
     bindings.user_data[2] = 0;
     result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
     for (4..8) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
+}
+
+test "wide scalar reads preserve bounds, byte order and failure invalidation" {
+    var storage: [64]u8 = undefined;
+    for (&storage, 0..) |*byte, index| byte.* = @intCast(index);
+    var memory = TestMemory{ .base = 0x2000, .bytes = &storage };
+    var bindings = testBindings(0x1000, 0x2000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .smem, .opcode = .s_load_dwordx16, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .null }, .data_words = 16, .word_count = 2 },
+        .{ .pc = 8, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), memory.read_count);
+    try std.testing.expectEqual(@as(usize, 64), memory.last_read_size);
+    try std.testing.expectEqual(@as(u32, 0x03020100), result.register(8).?.value);
+    try std.testing.expectEqual(@as(u32, 0x3f3e3d3c), result.register(23).?.value);
+    try std.testing.expectEqual(@as(usize, 1), result.load_count);
+
+    // A descriptor ending mid-dword permits only its complete prefix. The
+    // reader cannot access the rest, and the shader receives zero there.
+    instructions[0].opcode = .s_buffer_load_dwordx16;
+    bindings.user_data_count = 4;
+    bindings.user_data[2] = 7;
+    memory.bytes = storage[0..4];
+    memory.read_count = 0;
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), memory.read_count);
+    try std.testing.expectEqual(@as(usize, 4), memory.last_read_size);
+    try std.testing.expectEqual(@as(u32, 0x03020100), result.register(8).?.value);
+    for (9..24) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
+
+    bindings.user_data[2] = 64;
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, &instructions);
+    try std.testing.expect(result.memory_read_failed);
+    try std.testing.expectEqual(@as(usize, 0), result.load_count);
+    for (8..24) |reg| try std.testing.expect(result.register(@intCast(reg)) == null);
+
+    // Entirely OOB loads must not ask the reader to touch even the first byte.
+    instructions[0].memory_offset = -4;
+    memory.read_count = 0;
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(@as(usize, 0), memory.read_count);
+    for (8..24) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
 }

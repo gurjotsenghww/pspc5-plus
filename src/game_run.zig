@@ -68,6 +68,7 @@ const terminator_2d_title_id = "PPSA25872";
 const tetris_effect_connected_title_id = "PPSA07923";
 const yotei_title_id = "PPSA26344";
 const quake_ii_title_id = "PPSA09477";
+const subnautica_below_zero_title_id = "PPSA02457";
 const terminator_audio_latency_ms: u16 = 128;
 
 /// Compatibility stays the global default, while profiles enable only paths
@@ -159,6 +160,11 @@ fn appendUnityDeferredModules(
         "Media/Plugins/SaveData.prx",
         "Media/Plugins/PSN.prx",
         "Media/Plugins/PSNCore.prx",
+        // FMOD is resolved through IL2CPP P/Invoke, so it has no DT_NEEDED
+        // edge from the executable. A missing library aborts platform startup
+        // in titles that initialize audio before creating their main menu.
+        "Media/Plugins/libfmod.prx",
+        "Media/Plugins/libfmodstudio.prx",
     };
     for (candidates) |path| {
         _ = directory.statFile(io, path, .{}) catch continue;
@@ -760,7 +766,11 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_graphics_translation_mib, 64, 1024);
     } else |_| default_graphics_translation_mib;
-    const default_device_storage_mib: usize = if (use_quake_buffer_profile) 512 else 0;
+    // Below Zero's repeated compute passes are dominated by reads from host
+    // memory. Device-local working buffers remove that PCIe traffic without
+    // changing the guest's rendering resolution or enabling content reuse.
+    const default_device_storage_mib: usize = if (use_quake_buffer_profile or
+        std.ascii.eqlIgnoreCase(title_identifier, subnautica_below_zero_title_id)) 512 else 0;
     const device_storage_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_STORAGE_MIB")) |text| parse: {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch default_device_storage_mib, 2048);

@@ -3,6 +3,9 @@
 Title: **PPSA02457, v1.022.125**. Host: Windows x64, NVIDIA GeForce RTX 3070 Ti.
 This is a development-build result; the published 0.3.2 package predates the fix.
 
+Follow-up: [FMOD loading restores the main menu; performance investigation](subnautica-menu-2026-09-26.md).
+The observations below describe the earlier startup-only build.
+
 ## Failure and cause
 
 The original runner repeatedly stopped at guest RIP `0x55d36e`
