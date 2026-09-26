@@ -106,9 +106,12 @@ pub fn extractInnerTree(
     const ubuf: []u8 = allocator.alloc(u8, naps.ublock_size) catch return error.OutOfMemory;
     defer allocator.free(ubuf);
 
+    var progress = Progress{};
+    for (files) |file| progress.total += file.size;
+    progress.report();
     for (files) |file| {
         if (file.path.len == 0) continue;
-        writeFileFromBlocks(src, io, allocator, image_offset, image_size, blocks.items, ubuf, dest, file) catch |err| {
+        writeFileFromBlocks(src, io, allocator, image_offset, image_size, blocks.items, ubuf, dest, file, &progress) catch |err| {
             std.debug.print("  failed extracting {s}: {s}\n", .{ file.path, @errorName(err) });
             return err;
         };
@@ -119,6 +122,26 @@ pub fn extractInnerTree(
     }
     return stats;
 }
+
+/// Written bytes as `progress <done> <total>` lines, which the launcher
+/// turns into its progress bar. One line per half percent, or per 16 MiB
+/// when that is larger, keeps the stream small for very large images.
+const Progress = struct {
+    total: u64 = 0,
+    done: u64 = 0,
+    reported: u64 = 0,
+
+    fn advance(self: *Progress, bytes: u64) void {
+        self.done += bytes;
+        const step = @max(self.total / 200, 16 << 20);
+        if (self.done - self.reported >= step or self.done == self.total) self.report();
+    }
+
+    fn report(self: *Progress) void {
+        self.reported = self.done;
+        std.debug.print("progress {d} {d}\n", .{ self.done, self.total });
+    }
+};
 
 const MappedFile = struct {
     path: []const u8,
@@ -478,6 +501,7 @@ fn writeFileFromBlocks(
     ubuf: []u8,
     dest: std.Io.Dir,
     file: MappedFile,
+    progress: *Progress,
 ) Error!void {
     if (std.fs.path.dirname(file.path)) |parent| {
         dest.createDirPath(io, parent) catch |err| switch (err) {
@@ -498,6 +522,7 @@ fn writeFileFromBlocks(
         const avail = blk.uncomp - @as(u32, @intCast(into));
         const n: usize = @intCast(@min(remaining, avail));
         out.writeStreamingAll(io, ubuf[into .. into + n]) catch return error.Io;
+        progress.advance(n);
         remaining -= n;
         logical += n;
     }

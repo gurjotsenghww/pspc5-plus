@@ -120,6 +120,11 @@ const Phrase = enum {
     status_extracted,
     status_extracted_no_eboot,
     status_extract_retail,
+    extract_running,
+    extract_preparing,
+    extract_dismiss,
+    copy_log,
+    status_log_copied,
     status_runner_missing,
     status_launch_failed,
     status_launched,
@@ -190,6 +195,40 @@ var tracking_mouse_leave = false;
 /// by it, so without one there is no directory to show.
 var title_identifier: [32]u16 = @splat(0);
 var title_identifier_length: usize = 0;
+/// A package extraction runs in pkgextractor.exe while the window stays
+/// responsive. Its output arrives on a pipe read by a background thread; the
+/// window thread owns everything else here and repaints on a timer.
+const ExtractState = enum { idle, running, succeeded, failed };
+var extract_state: ExtractState = .idle;
+var extract_process: Win32.Handle = null;
+var extract_result: Phrase = .extract_running;
+var extract_name: [260]u16 = @splat(0);
+var extract_name_length: usize = 0;
+var extract_output: [1024]u16 = @splat(0);
+var extract_output_length: usize = 0;
+const extract_timer_id: usize = 3;
+const wm_extract_finished: u32 = Win32.wm_app + 1;
+const extract_log_capacity = 8;
+const extract_log_bytes = 200;
+/// Shared with the reader thread, under `extract_lock`.
+const ExtractFeed = struct {
+    done: u64 = 0,
+    total: u64 = 0,
+    log: [extract_log_capacity][extract_log_bytes]u8 = undefined,
+    log_lengths: [extract_log_capacity]u8 = @splat(0),
+    log_next: usize = 0,
+    log_count: usize = 0,
+};
+var extract_feed: ExtractFeed = .{};
+/// Every line the extractor printed except progress, for "Copy log". Also
+/// under `extract_lock`; capped so a runaway stream cannot exhaust memory.
+var extract_full_log: std.ArrayList(u8) = .empty;
+const extract_full_log_limit = 8 * 1024 * 1024;
+var extract_lock: std.atomic.Mutex = .unlocked;
+var extract_dirty: std.atomic.Value(bool) = .init(false);
+const extract_panel_rect = Rect{ .left = 282, .top = 158, .right = 1086, .bottom = 510 };
+const extract_copy_rect = Rect{ .left = 882, .top = 174, .right = 1062, .bottom = 208 };
+
 var status_text: [256]u16 = [_]u16{0} ** 256;
 var status_length: usize = 0;
 var status_error = false;
@@ -291,6 +330,11 @@ fn tr(phrase: Phrase) []const u8 {
             .status_extracted => "Package extracted · ready to launch",
             .status_extracted_no_eboot => "Metadata extracted · eboot.bin was not in the inner image",
             .status_extract_retail => "Retail packages cannot be extracted",
+            .extract_running => "Extracting package",
+            .extract_preparing => "Reading package…",
+            .extract_dismiss => "Click to close",
+            .copy_log => "Copy log",
+            .status_log_copied => "Log copied to the clipboard",
             .status_runner_missing => "game-run.exe was not found · run zig build first",
             .status_launch_failed => "Could not start game-run.exe",
             .status_launched => "Game launched in a separate process",
@@ -383,6 +427,11 @@ fn tr(phrase: Phrase) []const u8 {
             .status_extracted => "安装包已提取 · 可以启动",
             .status_extracted_no_eboot => "已提取元数据 · 内部镜像中没有 eboot.bin",
             .status_extract_retail => "无法解包零售版安装包",
+            .extract_running => "正在解包安装包",
+            .extract_preparing => "正在读取安装包…",
+            .extract_dismiss => "点击关闭",
+            .copy_log => "复制日志",
+            .status_log_copied => "日志已复制到剪贴板",
             .status_runner_missing => "未找到 game-run.exe · 请先运行 zig build",
             .status_launch_failed => "无法启动 game-run.exe",
             .status_launched => "游戏已在独立进程中启动",
@@ -475,6 +524,11 @@ fn tr(phrase: Phrase) []const u8 {
             .status_extracted => "Paquete extraído · listo para iniciar",
             .status_extracted_no_eboot => "Metadatos extraídos · eboot.bin no está en la imagen interna",
             .status_extract_retail => "Los paquetes retail no se pueden extraer",
+            .extract_running => "Extrayendo el paquete",
+            .extract_preparing => "Leyendo el paquete…",
+            .extract_dismiss => "Haz clic para cerrar",
+            .copy_log => "Copiar registro",
+            .status_log_copied => "Registro copiado al portapapeles",
             .status_runner_missing => "No se encontró game-run.exe · ejecuta zig build primero",
             .status_launch_failed => "No se pudo iniciar game-run.exe",
             .status_launched => "Juego iniciado en un proceso independiente",
@@ -567,6 +621,11 @@ fn tr(phrase: Phrase) []const u8 {
             .status_extracted => "تم استخراج الحزمة · جاهز للتشغيل",
             .status_extracted_no_eboot => "تم استخراج البيانات · eboot.bin غير موجود في الصورة الداخلية",
             .status_extract_retail => "لا يمكن استخراج الحزم التجارية",
+            .extract_running => "جارٍ استخراج الحزمة",
+            .extract_preparing => "جارٍ قراءة الحزمة…",
+            .extract_dismiss => "انقر للإغلاق",
+            .copy_log => "نسخ السجل",
+            .status_log_copied => "تم نسخ السجل إلى الحافظة",
             .status_runner_missing => "لم يتم العثور على game-run.exe · شغّل zig build أولًا",
             .status_launch_failed => "تعذّر تشغيل game-run.exe",
             .status_launched => "تم تشغيل اللعبة في عملية منفصلة",
@@ -659,6 +718,11 @@ fn tr(phrase: Phrase) []const u8 {
             .status_extracted => "Pacote extraído · pronto para iniciar",
             .status_extracted_no_eboot => "Metadados extraídos · eboot.bin não está na imagem interna",
             .status_extract_retail => "Pacotes de varejo não podem ser extraídos",
+            .extract_running => "Extraindo o pacote",
+            .extract_preparing => "Lendo o pacote…",
+            .extract_dismiss => "Clique para fechar",
+            .copy_log => "Copiar log",
+            .status_log_copied => "Log copiado para a área de transferência",
             .status_runner_missing => "game-run.exe não foi encontrado · execute zig build primeiro",
             .status_launch_failed => "Não foi possível iniciar game-run.exe",
             .status_launched => "Jogo iniciado em um processo separado",
@@ -751,6 +815,11 @@ fn tr(phrase: Phrase) []const u8 {
             .status_extracted => "Пакет распакован · можно запускать",
             .status_extracted_no_eboot => "Метаданные извлечены · eboot.bin нет во внутреннем образе",
             .status_extract_retail => "Розничные пакеты извлечь нельзя",
+            .extract_running => "Распаковка пакета",
+            .extract_preparing => "Чтение пакета…",
+            .extract_dismiss => "Нажмите, чтобы закрыть",
+            .copy_log => "Копировать лог",
+            .status_log_copied => "Лог скопирован в буфер обмена",
             .status_runner_missing => "Не найден game-run.exe · сначала выполните zig build",
             .status_launch_failed => "Не удалось запустить game-run.exe",
             .status_launched => "Игра запущена в отдельном процессе",
@@ -843,6 +912,11 @@ fn tr(phrase: Phrase) []const u8 {
             .status_extracted => "Paket entpackt · bereit zum Start",
             .status_extracted_no_eboot => "Metadaten entpackt · eboot.bin fehlt im inneren Image",
             .status_extract_retail => "Retail-Pakete können nicht entpackt werden",
+            .extract_running => "Paket wird entpackt",
+            .extract_preparing => "Paket wird gelesen…",
+            .extract_dismiss => "Zum Schließen klicken",
+            .copy_log => "Log kopieren",
+            .status_log_copied => "Log in die Zwischenablage kopiert",
             .status_runner_missing => "game-run.exe fehlt · zuerst zig build ausführen",
             .status_launch_failed => "game-run.exe konnte nicht gestartet werden",
             .status_launched => "Spiel in einem separaten Prozess gestartet",
@@ -935,6 +1009,11 @@ fn tr(phrase: Phrase) []const u8 {
             .status_extracted => "Paquet extrait · prêt à lancer",
             .status_extracted_no_eboot => "Métadonnées extraites · eboot.bin absent de l'image interne",
             .status_extract_retail => "Les paquets retail ne peuvent pas être extraits",
+            .extract_running => "Extraction du paquet",
+            .extract_preparing => "Lecture du paquet…",
+            .extract_dismiss => "Cliquez pour fermer",
+            .copy_log => "Copier le journal",
+            .status_log_copied => "Journal copié dans le presse-papiers",
             .status_runner_missing => "game-run.exe est introuvable · exécutez d'abord zig build",
             .status_launch_failed => "Impossible de lancer game-run.exe",
             .status_launched => "Jeu lancé dans un processus séparé",
@@ -1037,6 +1116,10 @@ fn windowProcedure(
         },
         Win32.wm_erase_background => return 1,
         Win32.wm_timer => {
+            if (word_parameter == extract_timer_id) {
+                if (extract_dirty.swap(false, .acq_rel)) invalidateExtractPanel(window);
+                return 0;
+            }
             if (word_parameter == pad_test_timer_id) {
                 if (!input.hid.advanceTest(pad_test_tick_ms)) {
                     _ = Win32.KillTimer(window, pad_test_timer_id);
@@ -1089,7 +1172,7 @@ fn windowProcedure(
             return 0;
         },
         Win32.wm_mouse_wheel => {
-            if (current_page == .library) {
+            if (current_page == .library and extract_state == .idle) {
                 const delta: i16 = @bitCast(@as(u16, @truncate(word_parameter >> 16)));
                 // Away from the user is back towards the first page, the
                 // direction a list scrolls under the same gesture everywhere
@@ -1147,7 +1230,14 @@ fn windowProcedure(
             _ = Win32.DestroyWindow(window);
             return 0;
         },
+        wm_extract_finished => {
+            finishExtraction(window, @truncate(word_parameter));
+            return 0;
+        },
         Win32.wm_destroy => {
+            // Closing the launcher abandons the extraction; the extractor has
+            // no window of its own to be stopped from.
+            if (extract_process != null) _ = Win32.TerminateProcess(extract_process, 1);
             input.hid.stopTest();
             Win32.PostQuitMessage(0);
             return 0;
@@ -1236,7 +1326,7 @@ fn libraryDotRect(page: usize) Rect {
 }
 
 fn libraryArrowAt(x: i32, y: i32) ?u1 {
-    if (libraryPageCount() < 2) return null;
+    if (extract_state != .idle or libraryPageCount() < 2) return null;
     if (library_prev_rect.contains(x, y)) return 0;
     if (library_next_rect.contains(x, y)) return 1;
     return null;
@@ -1244,7 +1334,7 @@ fn libraryArrowAt(x: i32, y: i32) ?u1 {
 
 fn libraryDotAt(x: i32, y: i32) ?usize {
     const pages = libraryPageCount();
-    if (pages < 2) return null;
+    if (extract_state != .idle or pages < 2) return null;
     for (0..pages) |page| {
         if (libraryDotRect(page).contains(x, y)) return page;
     }
@@ -1270,6 +1360,7 @@ fn showLibraryPage(page: usize) void {
 }
 
 fn recentGameAt(x: i32, y: i32) ?usize {
+    if (extract_state != .idle) return null;
     const first = library_page * library_page_size;
     for (0..library_page_size) |slot| {
         const index = first + slot;
@@ -1280,6 +1371,7 @@ fn recentGameAt(x: i32, y: i32) ?usize {
 }
 
 fn recentRemoveAt(x: i32, y: i32) ?usize {
+    if (extract_state != .idle) return null;
     const first = library_page * library_page_size;
     for (0..library_page_size) |slot| {
         const index = first + slot;
@@ -1362,7 +1454,9 @@ fn clickableAt(x: i32, y: i32) bool {
             libraryArrowAt(x, y) != null or
             libraryDotAt(x, y) != null or
             library_browse_rect.contains(x, y) or
-            library_extract_rect.contains(x, y) or
+            (extract_state != .running and library_extract_rect.contains(x, y)) or
+            (extractFinished() and extract_panel_rect.contains(x, y)) or
+            (extract_state != .idle and extract_copy_rect.contains(x, y)) or
             library_launch_rect.contains(x, y),
         .input => blk: {
             if (pad_presence.connected and pad_test_rect.contains(x, y)) break :blk true;
@@ -1408,6 +1502,14 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
 }
 
 fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
+    if (extract_state != .idle and extract_copy_rect.contains(x, y)) {
+        copyExtractLog(window);
+        return;
+    }
+    if (extractFinished() and extract_panel_rect.contains(x, y)) {
+        extract_state = .idle;
+        return;
+    }
     if (libraryArrowAt(x, y)) |arrow| {
         _ = stepLibraryPage(if (arrow == 0) -1 else 1);
         return;
@@ -1425,7 +1527,7 @@ fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
         return;
     }
     if (library_browse_rect.contains(x, y)) chooseGameFolder(window);
-    if (library_extract_rect.contains(x, y)) extractPackage(window);
+    if (library_extract_rect.contains(x, y) and extract_state != .running) extractPackage(window);
     if (library_launch_rect.contains(x, y)) launchGame(window);
 }
 
@@ -1597,7 +1699,9 @@ fn drawNavItem(dc: Win32.DeviceContext, page: Page, top: i32, label: Phrase, com
 fn drawLibrary(dc: Win32.DeviceContext) void {
     pageHeading(dc, .library_heading, .library_subtitle);
 
-    if (recent_game_count == 0) {
+    if (extract_state != .idle) {
+        drawExtractPanel(dc);
+    } else if (recent_game_count == 0) {
         card(dc, .{ .left = 282, .top = 158, .right = 1086, .bottom = 510 });
         localizedText(dc, .folder_prompt, .{ .left = 330, .top = 300, .right = 1038, .bottom = 332 }, 0x00f4f0ea, title_font, Win32.dt_center | Win32.dt_end_ellipsis);
         localizedText(dc, .folder_empty, .{ .left = 330, .top = 350, .right = 1038, .bottom = 376 }, 0x008b817a, regular_font, Win32.dt_center | Win32.dt_end_ellipsis);
@@ -1620,9 +1724,75 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
     }
 
     button(dc, library_browse_rect, .choose_folder, false);
-    button(dc, library_extract_rect, .extract_pkg, false);
+    button(dc, library_extract_rect, .extract_pkg, extract_state == .running);
     drawLegalNotice(dc);
     button(dc, library_launch_rect, .launch_game, game_folder_length == 0);
+}
+
+fn extractFinished() bool {
+    return extract_state == .succeeded or extract_state == .failed;
+}
+
+fn drawExtractPanel(dc: Win32.DeviceContext) void {
+    var feed: ExtractFeed = undefined;
+    lockExtractFeed();
+    feed = extract_feed;
+    extract_lock.unlock();
+
+    const panel = extract_panel_rect;
+    card(dc, panel);
+    const left = panel.left + 24;
+    const right = panel.right - 24;
+    const title_flags = Win32.dt_left | Win32.dt_end_ellipsis;
+    localizedText(dc, extract_result, .{ .left = left, .top = panel.top + 20, .right = extract_copy_rect.left - 16, .bottom = panel.top + 46 }, 0x00f4f0ea, medium_font, title_flags);
+    roundFill(dc, extract_copy_rect, 10, 0x00342a25);
+    localizedText(dc, .copy_log, .{ .left = extract_copy_rect.left + 8, .top = extract_copy_rect.top + 8, .right = extract_copy_rect.right - 8, .bottom = extract_copy_rect.bottom - 6 }, 0x00ffac64, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
+    text(dc, &extract_name, @intCast(extract_name_length), .{ .left = left, .top = panel.top + 50, .right = extract_copy_rect.left - 16, .bottom = panel.top + 70 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+
+    // The bar fills from the bytes the extractor has written. Before its
+    // first report it is still reading the package's metadata.
+    const track = Rect{ .left = left, .top = panel.top + 84, .right = right, .bottom = panel.top + 98 };
+    roundFill(dc, track, 14, 0x00342a25);
+    const fraction: f64 = if (extract_state == .succeeded)
+        1.0
+    else if (feed.total == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(@min(feed.done, feed.total))) / @as(f64, @floatFromInt(feed.total));
+    const width: i32 = @intFromFloat(@as(f64, @floatFromInt(track.right - track.left)) * fraction);
+    if (width >= 14) {
+        const colour: u32 = switch (extract_state) {
+            .failed => 0x006b77ff,
+            .succeeded => 0x0068d391,
+            else => 0x00ff9c3d,
+        };
+        roundFill(dc, .{ .left = track.left, .top = track.top, .right = track.left + width, .bottom = track.bottom }, 14, colour);
+    }
+    const detail_area = Rect{ .left = left, .top = panel.top + 106, .right = right - 240, .bottom = panel.top + 126 };
+    if (extractFinished()) {
+        localizedText(dc, .extract_dismiss, .{ .left = right - 240, .top = panel.top + 106, .right = right, .bottom = panel.top + 126 }, 0x007c716a, small_font, Win32.dt_right | Win32.dt_end_ellipsis);
+    }
+    if (feed.total == 0 and extract_state == .running) {
+        localizedText(dc, .extract_preparing, detail_area, 0x009b9088, small_font, Win32.dt_left);
+    } else if (feed.total != 0) {
+        var line: [96]u8 = undefined;
+        const gib = 1024.0 * 1024.0 * 1024.0;
+        const detail = std.fmt.bufPrint(&line, "{d}%  ·  {d:.2} / {d:.2} GB", .{
+            @as(u32, @intFromFloat(fraction * 100.0)),
+            @as(f64, @floatFromInt(@min(feed.done, feed.total))) / gib,
+            @as(f64, @floatFromInt(feed.total)) / gib,
+        }) catch "";
+        drawAscii(dc, detail, detail_area, 0x00d8d0c9, small_font, Win32.dt_left);
+    }
+
+    const log_area = Rect{ .left = left, .top = panel.top + 138, .right = right, .bottom = panel.bottom - 20 };
+    roundFill(dc, log_area, 10, 0x001c1714);
+    const first = (feed.log_next + extract_log_capacity - feed.log_count) % extract_log_capacity;
+    for (0..feed.log_count) |row| {
+        const slot = (first + row) % extract_log_capacity;
+        const top = log_area.top + 10 + @as(i32, @intCast(row)) * 22;
+        drawAscii(dc, feed.log[slot][0..feed.log_lengths[slot]], .{ .left = log_area.left + 14, .top = top, .right = log_area.right - 14, .bottom = top + 20 }, 0x00b9afa8, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    }
 }
 
 /// The notice the library has always carried, with the build's own version
@@ -2568,44 +2738,199 @@ fn extractPackage(owner: Win32.Window) void {
     appendWide(&command, &length, w("\""));
     command[length] = 0;
 
-    var startup = Win32.StartupInfoW{ .size = @sizeOf(Win32.StartupInfoW) };
+    // The extractor writes both streams into one pipe; only its end of the
+    // pipe is inheritable, so the child holds no other launcher handle.
+    var security = Win32.SecurityAttributes{ .inherit = 1 };
+    var read_end: Win32.Handle = null;
+    var write_end: Win32.Handle = null;
+    if (Win32.CreatePipe(&read_end, &write_end, &security, 0) == 0) {
+        setStatusPhrase(.status_extract_failed, true);
+        return;
+    }
+    _ = Win32.SetHandleInformation(read_end, Win32.handle_flag_inherit, 0);
+    var startup = Win32.StartupInfoW{
+        .size = @sizeOf(Win32.StartupInfoW),
+        .flags = Win32.startf_use_std_handles,
+        .std_output = write_end,
+        .std_error = write_end,
+    };
     var process: Win32.ProcessInformation = undefined;
-    if (Win32.CreateProcessW(
+    const started = Win32.CreateProcessW(
         @ptrCast(&extractor),
         @ptrCast(&command),
         null,
         null,
-        0,
-        Win32.create_new_console,
+        1,
+        Win32.create_no_window,
         null,
         null,
         &startup,
         &process,
-    ) == 0) {
+    );
+    // The child's copy keeps the pipe open; the reader sees its end when the
+    // extractor exits.
+    _ = Win32.CloseHandle(write_end);
+    if (started == 0) {
+        _ = Win32.CloseHandle(read_end);
         setStatusPhrase(.status_extract_failed, true);
         return;
     }
-    _ = Win32.WaitForSingleObject(process.process, Win32.infinite);
-    var exit_code: u32 = 1;
-    _ = Win32.GetExitCodeProcess(process.process, &exit_code);
     _ = Win32.CloseHandle(process.thread);
-    _ = Win32.CloseHandle(process.process);
-    if (exit_code != 0) {
-        setStatusPhrase(if (exit_code == 2) .status_extract_retail else .status_extract_failed, true);
+
+    extract_feed = .{};
+    extract_full_log.clearRetainingCapacity();
+    extract_dirty.store(false, .release);
+    @memcpy(extract_output[0..out_len], out_path[0..out_len]);
+    extract_output_length = out_len;
+    var name_start = pkg_len;
+    while (name_start > 0 and pkg_path[name_start - 1] != '\\' and pkg_path[name_start - 1] != '/') : (name_start -= 1) {}
+    extract_name_length = @min(pkg_len - name_start, extract_name.len);
+    @memcpy(extract_name[0..extract_name_length], pkg_path[name_start..][0..extract_name_length]);
+
+    const reader = std.Thread.spawn(.{}, readExtractorOutput, .{ owner, read_end, process.process }) catch {
+        _ = Win32.TerminateProcess(process.process, 1);
+        _ = Win32.CloseHandle(process.process);
+        _ = Win32.CloseHandle(read_end);
+        setStatusPhrase(.status_extract_failed, true);
+        return;
+    };
+    reader.detach();
+    extract_process = process.process;
+    extract_state = .running;
+    extract_result = .extract_running;
+    status_length = 0;
+    _ = Win32.SetTimer(owner, extract_timer_id, 100, null);
+}
+
+fn lockExtractFeed() void {
+    while (!extract_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
+/// Runs on its own thread until the extractor closes its output.
+fn readExtractorOutput(window: Win32.Window, pipe: Win32.Handle, process: Win32.Handle) void {
+    var chunk: [4096]u8 = undefined;
+    var line: [512]u8 = undefined;
+    var line_length: usize = 0;
+    while (true) {
+        var read: u32 = 0;
+        if (Win32.ReadFile(pipe, &chunk, chunk.len, &read, null) == 0 or read == 0) break;
+        for (chunk[0..read]) |byte| {
+            if (byte == '\n') {
+                acceptExtractorLine(line[0..line_length]);
+                line_length = 0;
+            } else if (byte != '\r' and line_length < line.len) {
+                line[line_length] = byte;
+                line_length += 1;
+            }
+        }
+    }
+    if (line_length != 0) acceptExtractorLine(line[0..line_length]);
+    _ = Win32.CloseHandle(pipe);
+    _ = Win32.WaitForSingleObject(process, Win32.infinite);
+    var exit_code: u32 = 1;
+    _ = Win32.GetExitCodeProcess(process, &exit_code);
+    _ = Win32.PostMessageW(window, wm_extract_finished, exit_code, 0);
+}
+
+fn acceptExtractorLine(raw: []const u8) void {
+    const value = std.mem.trim(u8, raw, " \t");
+    if (value.len == 0) return;
+    if (std.mem.startsWith(u8, value, "progress ")) {
+        var fields = std.mem.tokenizeScalar(u8, value["progress ".len..], ' ');
+        const done = std.fmt.parseInt(u64, fields.next() orelse return, 10) catch return;
+        const total = std.fmt.parseInt(u64, fields.next() orelse return, 10) catch return;
+        lockExtractFeed();
+        extract_feed.done = done;
+        extract_feed.total = total;
+        extract_lock.unlock();
+        extract_dirty.store(true, .release);
         return;
     }
-    @memcpy(game_folder[0..out_len], out_path[0..out_len]);
+    // Keep whole UTF-8 sequences; a cut one would make the line undrawable
+    // and the copied log unconvertible.
+    var length = value.len;
+    while (length > 0 and !std.unicode.utf8ValidateSlice(value[0..length])) length -= 1;
+    if (length == 0) return;
+    const drawn = shownLength(value[0..length]);
+    lockExtractFeed();
+    if (extract_full_log.items.len + length + 2 <= extract_full_log_limit) {
+        extract_full_log.appendSlice(std.heap.page_allocator, value[0..length]) catch {};
+        extract_full_log.appendSlice(std.heap.page_allocator, "\r\n") catch {};
+    }
+    const slot = extract_feed.log_next;
+    @memcpy(extract_feed.log[slot][0..drawn], value[0..drawn]);
+    extract_feed.log_lengths[slot] = @intCast(drawn);
+    extract_feed.log_next = (slot + 1) % extract_log_capacity;
+    extract_feed.log_count = @min(extract_feed.log_count + 1, extract_log_capacity);
+    extract_lock.unlock();
+    extract_dirty.store(true, .release);
+}
+
+/// The prefix of a valid UTF-8 line that fits a panel row, ending on a
+/// whole character.
+fn shownLength(value: []const u8) usize {
+    var length = @min(value.len, extract_log_bytes);
+    while (length > 0 and !std.unicode.utf8ValidateSlice(value[0..length])) length -= 1;
+    return length;
+}
+
+/// Puts the whole extractor log on the clipboard as Unicode text.
+fn copyExtractLog(window: Win32.Window) void {
+    lockExtractFeed();
+    defer extract_lock.unlock();
+    const log = extract_full_log.items;
+    const units = std.unicode.calcUtf16LeLen(log) catch return;
+    const memory = Win32.GlobalAlloc(Win32.gmem_moveable, (units + 1) * 2) orelse return;
+    const locked: [*]u16 = @ptrCast(@alignCast(Win32.GlobalLock(memory) orelse {
+        _ = Win32.GlobalFree(memory);
+        return;
+    }));
+    const written = std.unicode.utf8ToUtf16Le(locked[0..units], log) catch 0;
+    locked[written] = 0;
+    _ = Win32.GlobalUnlock(memory);
+    if (Win32.OpenClipboard(window) == 0) {
+        _ = Win32.GlobalFree(memory);
+        return;
+    }
+    defer _ = Win32.CloseClipboard();
+    _ = Win32.EmptyClipboard();
+    // The clipboard owns the memory once it accepts it.
+    if (Win32.SetClipboardData(Win32.cf_unicode_text, memory) == null) {
+        _ = Win32.GlobalFree(memory);
+        return;
+    }
+    setStatusPhrase(.status_log_copied, false);
+}
+
+fn invalidateExtractPanel(window: Win32.Window) void {
+    const panel = extract_panel_rect;
+    const native = Win32.NativeRect{ .left = panel.left, .top = panel.top, .right = panel.right, .bottom = panel.bottom };
+    _ = Win32.InvalidateRect(window, &native, 0);
+}
+
+fn finishExtraction(window: Win32.Window, exit_code: u32) void {
+    _ = Win32.KillTimer(window, extract_timer_id);
+    if (extract_process != null) _ = Win32.CloseHandle(extract_process);
+    extract_process = null;
+    defer _ = Win32.InvalidateRect(window, null, 0);
+    if (exit_code != 0) {
+        extract_state = .failed;
+        extract_result = if (exit_code == 2) .status_extract_retail else .status_extract_failed;
+        setStatusPhrase(extract_result, true);
+        return;
+    }
+    const out_len = extract_output_length;
+    @memcpy(game_folder[0..out_len], extract_output[0..out_len]);
     game_folder[out_len] = 0;
     game_folder_length = out_len;
     refreshTitleIdentifier();
     rememberGameFolder(game_folder[0..game_folder_length], true);
     saveSettings();
     var eboot: [1024]u16 = [_]u16{0} ** 1024;
-    if (findGameExecutable(&eboot)) {
-        setStatusPhrase(.status_extracted, false);
-    } else {
-        setStatusPhrase(.status_extracted_no_eboot, true);
-    }
+    const found = findGameExecutable(&eboot);
+    extract_state = if (found) .succeeded else .failed;
+    extract_result = if (found) .status_extracted else .status_extracted_no_eboot;
+    setStatusPhrase(extract_result, !found);
 }
 
 fn launchGame(owner: Win32.Window) void {
@@ -3141,6 +3466,11 @@ const Win32 = if (builtin.os.tag == .windows) struct {
         std_output: Handle = null,
         std_error: Handle = null,
     };
+    const SecurityAttributes = extern struct {
+        length: u32 = @sizeOf(SecurityAttributes),
+        descriptor: ?*anyopaque = null,
+        inherit: i32 = 0,
+    };
     const ProcessInformation = extern struct {
         process: Handle,
         thread: Handle,
@@ -3207,6 +3537,12 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const coinit_apartment_threaded: u32 = 0x0002;
     const invalid_file_attributes: u32 = 0xffff_ffff;
     const create_new_console: u32 = 0x0000_0010;
+    const create_no_window: u32 = 0x0800_0000;
+    const startf_use_std_handles: u32 = 0x0000_0100;
+    const handle_flag_inherit: u32 = 0x0000_0001;
+    const wm_app: u32 = 0x8000;
+    const gmem_moveable: u32 = 0x0002;
+    const cf_unicode_text: u32 = 13;
     const ofn_explorer: u32 = 0x0008_0000;
     const ofn_file_must_exist: u32 = 0x0000_1000;
     const ofn_path_must_exist: u32 = 0x0000_0800;
@@ -3228,6 +3564,18 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn WaitForSingleObject(handle: Handle, milliseconds: u32) callconv(.winapi) u32;
     extern "kernel32" fn GetExitCodeProcess(handle: Handle, exit_code: *u32) callconv(.winapi) i32;
     extern "kernel32" fn CloseHandle(handle: Handle) callconv(.winapi) i32;
+    extern "kernel32" fn CreatePipe(read: *Handle, write: *Handle, attributes: ?*SecurityAttributes, size: u32) callconv(.winapi) i32;
+    extern "kernel32" fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) callconv(.winapi) i32;
+    extern "kernel32" fn TerminateProcess(handle: Handle, exit_code: u32) callconv(.winapi) i32;
+    extern "user32" fn PostMessageW(Window, u32, usize, isize) callconv(.winapi) i32;
+    extern "user32" fn OpenClipboard(Window) callconv(.winapi) i32;
+    extern "user32" fn EmptyClipboard() callconv(.winapi) i32;
+    extern "user32" fn SetClipboardData(u32, Handle) callconv(.winapi) Handle;
+    extern "user32" fn CloseClipboard() callconv(.winapi) i32;
+    extern "kernel32" fn GlobalAlloc(u32, usize) callconv(.winapi) Handle;
+    extern "kernel32" fn GlobalLock(Handle) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GlobalUnlock(Handle) callconv(.winapi) i32;
+    extern "kernel32" fn GlobalFree(Handle) callconv(.winapi) Handle;
     extern "comdlg32" fn GetOpenFileNameW(ofn: *OpenFileNameW) callconv(.winapi) i32;
     extern "kernel32" fn CompareStringOrdinal([*]const u16, i32, [*]const u16, i32, i32) callconv(.winapi) i32;
     extern "kernel32" fn GetPrivateProfileStringW(section: [*:0]const u16, key: [*:0]const u16, default: [*:0]const u16, output: [*]u16, size: u32, file: [*:0]const u16) callconv(.winapi) u32;
