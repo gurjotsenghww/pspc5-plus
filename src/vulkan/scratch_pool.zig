@@ -4,7 +4,7 @@
 const std = @import("std");
 
 /// CPU-only temporary storage. Leases are removed from the pool until released,
-/// so nested image preparation cannot overwrite another operation's bytes.
+/// so nested preparation cannot overwrite another operation's bytes.
 /// All calls on one pool must use the same allocator and renderer thread.
 pub const Pool = struct {
     pub const minimum_bytes = 64 * 1024;
@@ -13,6 +13,10 @@ pub const Pool = struct {
 
     entries: [2][]u8 = @splat(&.{}),
     enabled: bool = true,
+    /// Configure before the first acquisition. The maximum bounds retained
+    /// capacity, including alignment, rather than just the requested length.
+    minimum_cache_bytes: usize = minimum_bytes,
+    maximum_cache_bytes: usize = maximum_entry_bytes,
 
     pub const Lease = struct {
         bytes: []u8,
@@ -41,7 +45,8 @@ pub const Pool = struct {
     };
 
     pub fn acquire(self: *Pool, allocator: std.mem.Allocator, size: usize) !Lease {
-        const cacheable = self.enabled and size >= minimum_bytes and size <= maximum_entry_bytes;
+        const limit = @min(self.maximum_cache_bytes, maximum_entry_bytes);
+        const cacheable = self.enabled and size != 0 and size >= self.minimum_cache_bytes and size <= limit;
         if (cacheable) {
             var best: ?usize = null;
             for (self.entries, 0..) |entry, index| {
@@ -54,7 +59,7 @@ pub const Pool = struct {
             }
         }
         // Avoid doubling commitment for a surface just above a power of two.
-        const capacity = if (cacheable) std.mem.alignForward(usize, size, minimum_bytes) else size;
+        const capacity = if (cacheable) @min(std.mem.alignForward(usize, size, minimum_bytes), limit) else size;
         const allocation = try allocator.alloc(u8, capacity);
         return .{ .bytes = allocation[0..size], .allocation = allocation, .pool = self, .allocator = allocator, .cacheable = cacheable };
     }
@@ -114,4 +119,34 @@ test "image scratch retention is bounded and disabling it preserves outstanding 
     var oversized = try pool.acquire(std.testing.allocator, Pool.maximum_entry_bytes + 1);
     try std.testing.expect(!oversized.cacheable);
     oversized.release();
+}
+
+test "small index scratch reuses storage within its configured retention limit" {
+    const limit = Pool.minimum_bytes + 7;
+    var pool = Pool{ .minimum_cache_bytes = 1, .maximum_cache_bytes = limit };
+    defer pool.deinit(std.testing.allocator);
+    var first = try pool.acquire(std.testing.allocator, 12);
+    const address = first.bytes.ptr;
+    try std.testing.expect(first.cacheable);
+    @memset(first.bytes, 0x12);
+    first.release();
+    var second = try pool.acquire(std.testing.allocator, 6);
+    try std.testing.expectEqual(address, second.bytes.ptr);
+    // Reusing an allocation does not reuse its contents: a new guest read
+    // replaces the requested span while nested operations own separate bytes.
+    @memset(second.bytes, 0x34);
+    var nested = try pool.acquire(std.testing.allocator, limit);
+    try std.testing.expectEqual(limit, nested.allocation.len);
+    try std.testing.expect(nested.bytes.ptr != second.bytes.ptr);
+    @memset(nested.bytes, 0x56);
+    try std.testing.expect(std.mem.allEqual(u8, second.bytes, 0x34));
+    nested.release();
+    second.release();
+    try std.testing.expect(pool.entries[0].len + pool.entries[1].len <= 2 * limit);
+    var oversized = try pool.acquire(std.testing.allocator, limit + 1);
+    try std.testing.expect(!oversized.cacheable);
+    oversized.release();
+    var empty = try pool.acquire(std.testing.allocator, 0);
+    try std.testing.expect(!empty.cacheable);
+    empty.release();
 }

@@ -4718,6 +4718,7 @@ pub const Renderer = struct {
     free_graphics_resource_count: usize = 0,
 
     image_scratch: @import("scratch_pool.zig").Pool = .{},
+    index_scratch: @import("scratch_pool.zig").Pool = .{ .minimum_cache_bytes = 1, .maximum_cache_bytes = 4 * 1024 * 1024 },
     checkpoint_scratch: gpu.resource_checkpoints.Pool = .{},
     resource_preparation: gpu.resource_preparation.Pool = .{},
     resource_preparation_in_use: bool = false,
@@ -4751,6 +4752,7 @@ pub const Renderer = struct {
     fn destroyResourcePools(self: *Renderer) void {
         self.resource_preparation.deinit();
         self.image_scratch.deinit(self.allocator);
+        self.index_scratch.deinit(self.allocator);
         self.checkpoint_scratch.deinit(self.allocator);
         for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| resource.destroy(self.allocator);
         self.free_compute_resource_count = 0;
@@ -9854,7 +9856,7 @@ pub const Renderer = struct {
             if (pointer_register + 1 >= 128) continue;
             if (hasScalarLoadAt(proven_pointer_loads, inst.pc)) continue;
             scalar.registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc).*;
-            const table = try scalarPointerTablePlan(bindings, reader, analysis, scalar, inst);
+            const table = try scalarPointerTablePlan(bindings, reader, analysis, scalar, candidate);
             var pointers = PointerCandidates{};
             var offset: u64 = 0;
             var span: u64 = @as(u64, inst.data_words) * 4;
@@ -9947,7 +9949,7 @@ pub const Renderer = struct {
             if (load_index != null and load_index.? != index) return false;
             load_index = index;
         }
-        const load = instructions[load_index.?];
+        const load = &instructions[load_index.?];
         if (load.dst.kind != .sgpr or access.src1.reg < load.dst.reg or access.src1.reg + 4 > load.dst.reg + load.data_words) return false;
         const plan = (try scalarPointerTablePlan(bindings, reader, analysis, scalar, load)) orelse return false;
         if (plan.count > 32 or result.mapping_count + plan.count > result.mappings.len) return false;
@@ -15000,8 +15002,11 @@ pub const Renderer = struct {
                 if (index_bytes == 0 or index_bytes > maximum_frame_bytes) return Error.GuestBufferTooLarge;
                 const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
                 const bytes: usize = @intCast(index_bytes);
-                const indices = try self.allocator.alloc(u8, bytes);
-                defer self.allocator.free(indices);
+                // Read before allocateDrawUpload, which can flush queued GPU
+                // work. Reuse storage, but refresh the guest bytes every draw.
+                var index_scratch = try self.index_scratch.acquire(self.allocator, bytes);
+                defer index_scratch.release();
+                const indices = index_scratch.bytes;
                 if (!memory.read(memory.context, draw.index_address, indices)) return Error.GuestMemoryReadFailed;
                 index_upload = try self.allocateDrawUpload(bytes);
                 const upload_mapping = try self.mapDrawUpload(index_upload.?);
@@ -15632,8 +15637,9 @@ pub const Renderer = struct {
                 }
                 const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
                 const bytes: usize = @intCast(index_bytes);
-                const indices = try self.allocator.alloc(u8, bytes);
-                defer self.allocator.free(indices);
+                var index_scratch = try self.index_scratch.acquire(self.allocator, bytes);
+                defer index_scratch.release();
+                const indices = index_scratch.bytes;
                 if (!memory.read(memory.context, draw.index_address, indices)) {
                     return Error.GuestMemoryReadFailed;
                 }
@@ -30429,7 +30435,7 @@ fn collectScalarLoadSpecializations(
     out: []gpu.ShaderSpirvScalarRegister,
 ) usize {
     var count: usize = 0;
-    for (scalar.loadSlice()) |load| {
+    for (scalar.loadSlice()) |*load| {
         for (load.values[0..load.word_count], 0..) |value, word_index| {
             if (count >= out.len) return count;
             out[count] = .{
@@ -30776,23 +30782,47 @@ fn mergeUserDataScalars(
     out: []gpu.ShaderSpirvScalarRegister,
     count: usize,
 ) usize {
+    if (count == out.len or bindings.user_data_count == 0 or base >= 128) return count;
     var n = count;
+    // Only entry values suppress USER_DATA. Producer-specific specializations
+    // for the same SGPR must coexist. Scan the load list once, not per word.
+    var entry_registers: u128 = 0;
+    for (out[0..count]) |*entry| {
+        if (entry.producer_pc == null and entry.register < 128)
+            entry_registers |= @as(u128, 1) << @intCast(entry.register);
+    }
     for (bindings.user_data[0..bindings.user_data_count], 0..) |word, index| {
         const reg: u32 = base + @as(u32, @intCast(index));
         if (reg >= 128) break;
-        var exists = false;
-        for (out[0..n]) |entry| {
-            if (entry.register == reg and entry.producer_pc == null) {
-                exists = true;
-                break;
-            }
-        }
-        if (exists) continue;
+        if (entry_registers & (@as(u128, 1) << @intCast(reg)) != 0) continue;
         if (n >= out.len) break;
         out[n] = .{ .register = reg, .value = word };
         n += 1;
     }
     return n;
+}
+
+test "USER_DATA merge preserves producer constants, entry precedence and SGPR bounds" {
+    var bindings = std.mem.zeroes(gpu.ShaderBindings);
+    bindings.user_data_count = 4;
+    @memcpy(bindings.user_data[0..4], &[_]u32{ 10, 20, 30, 40 });
+    var out: [7]gpu.ShaderSpirvScalarRegister = undefined;
+    out[0] = .{ .register = 125, .value = 81, .producer_pc = 0 };
+    out[1] = .{ .register = 126, .value = 91 };
+    out[2] = .{ .register = 200, .value = 101 };
+    const count = mergeUserDataScalars(&bindings, 125, &out, 3);
+    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual(@as(?u32, 0), out[0].producer_pc);
+    try std.testing.expectEqual(@as(u32, 81), out[0].value);
+    try std.testing.expectEqual(@as(u32, 91), out[1].value);
+    try std.testing.expectEqual(@as(u32, 125), out[3].register);
+    try std.testing.expectEqual(@as(u32, 10), out[3].value);
+    try std.testing.expectEqual(@as(?u32, null), out[3].producer_pc);
+    try std.testing.expectEqual(@as(u32, 127), out[4].register);
+    try std.testing.expectEqual(@as(u32, 30), out[4].value);
+    try std.testing.expectEqual(count, mergeUserDataScalars(&bindings, 125, &out, count));
+    try std.testing.expectEqual(@as(usize, 3), mergeUserDataScalars(&bindings, 125, out[0..3], 3));
+    try std.testing.expectEqual(@as(usize, 0), mergeUserDataScalars(&bindings, 128, &out, 0));
 }
 
 fn countNonzeroRgba(linear: []const u8) u32 {
@@ -32972,7 +33002,7 @@ fn scalarPointerTablePlan(
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
     scalar: *const gpu.ScalarEvaluation,
-    load: gpu.ShaderInstruction,
+    load: *const gpu.ShaderInstruction,
 ) anyerror!?ScalarPointerTablePlan {
     if (!isPointerScalarLoad(load.opcode) or load.memory_offset < 0) return null;
     const pointer_register = gpu.scalar_provenance.scalarRegisterIndex(load.src0) orelse return null;
@@ -32986,7 +33016,7 @@ fn scalarPointerTablePlan(
         .entry => return null,
         .instruction => |index| index,
     };
-    const multiply = instructions[multiply_index];
+    const multiply = &instructions[multiply_index];
     if (gpu.scalar_provenance.scalarRegisterIndex(multiply.dst) != offset_register) return null;
     const literal = switch (multiply.src1.kind) {
         .integer_inline_constant, .literal_constant => multiply.src1.value,
@@ -33042,7 +33072,7 @@ fn resolveScalarPointerImageCandidates(
         if (load_index != null and load_index.? != index) return null;
         load_index = index;
     }
-    const load = instructions[load_index.?];
+    const load = &instructions[load_index.?];
     if (load.dst.kind != .sgpr or sample.src1.reg < load.dst.reg or sample.src1.reg + sample.imageResourceWords() > load.dst.reg + load.data_words) return null;
     const plan = (try scalarPointerTablePlan(bindings, reader, analysis, scalar, load)) orelse return null;
     var result = BufferImageCandidates{};
@@ -37201,6 +37231,7 @@ test "prepared resource pools reset bindings and keep active loans distinct" {
     var renderer: Renderer = undefined;
     renderer.allocator = std.testing.allocator;
     renderer.image_scratch = .{};
+    renderer.index_scratch = .{};
     renderer.checkpoint_scratch = .{};
     renderer.resource_preparation = .{};
     renderer.free_compute_resource_count = 0;
