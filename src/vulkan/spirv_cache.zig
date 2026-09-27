@@ -27,6 +27,7 @@ const SharedModule = struct {
     allocator: std.mem.Allocator,
     module: rdna2.spirv.Module,
     references: usize = 1,
+    content_hash: ?u64 = null,
 
     fn release(self: *SharedModule) void {
         self.references -= 1;
@@ -78,6 +79,20 @@ pub const Lease = struct {
 
     pub fn sameModule(self: Lease, other: Lease) bool {
         return self.shared == other.shared;
+    }
+
+    /// Words are immutable for the lease's entire lifetime, so pipeline lookup
+    /// can reuse this hash even after the translation cache evicts the module.
+    pub fn contentHash(self: Lease) u64 {
+        if (self.shared.content_hash) |hash| return hash;
+        const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.shared.module.words));
+        self.shared.content_hash = hash;
+        return hash;
+    }
+
+    pub fn ownsWords(self: Lease, words: []const u32) bool {
+        const owned = self.shared.module.words;
+        return owned.ptr == words.ptr and owned.len == words.len;
     }
 };
 

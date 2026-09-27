@@ -1089,6 +1089,66 @@ test "graphics shader words share immutable storage and survive owner eviction" 
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 9 }, collision.view().words);
 }
 
+test "graphics pipeline lease identity preserves content verification and ownership" {
+    const allocator = std.testing.allocator;
+    const renderer = try allocator.create(Renderer);
+    defer allocator.destroy(renderer);
+    renderer.allocator = allocator;
+    renderer.graphics_pipeline_index = .{};
+    const vertex = try spirv_cache.Lease.fromOwned(allocator, .{ .words = try allocator.dupe(u32, &.{ 1, 2, 3 }) });
+    defer vertex.release();
+    const fragment = try spirv_cache.Lease.fromOwned(allocator, .{ .words = try allocator.dupe(u32, &.{ 4, 5 }) });
+    defer fragment.release();
+    const state = GraphicsPipelineState.default(64, 64);
+    var entries = [_]GraphicsPipelineEntry{.{
+        .hash = 17,
+        .state_hash = 0,
+        .vertex_hash = vertex.contentHash(),
+        .fragment_hash = fragment.contentHash(),
+        .state = state,
+        .vertex_words = vertex.view().words,
+        .fragment_words = fragment.view().words,
+        .vertex_module = vertex.retain(),
+        .fragment_module = fragment.retain(),
+        .pipeline = 123,
+        .last_used_sequence = 0,
+    }};
+    defer entries[0].releaseWords(allocator);
+    renderer.graphics_pipelines = .{ .items = &entries, .capacity = 1 };
+    const modules = GraphicsShaderModules{ .vertex = vertex, .fragment = fragment };
+    try std.testing.expectEqual(&entries[0], renderer.findGraphicsPipeline(17, state, vertex.view().words, fragment.view().words, modules).?);
+    try std.testing.expectEqual(std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(vertex.view().words)), vertex.contentHash());
+
+    // Same hash bucket and supplied lease must not bless different words, a
+    // truncated view, or a raw buffer whose address survives a content change.
+    var raw = [_]u32{ 1, 2, 3 };
+    try std.testing.expectEqual(&entries[0], renderer.findGraphicsPipeline(17, state, &raw, fragment.view().words, modules).?);
+    raw[2] = 9;
+    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(17, state, &raw, fragment.view().words, modules));
+    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(17, state, vertex.view().words[0..2], fragment.view().words, modules));
+    var changed = state;
+    changed.topology += 1;
+    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(17, changed, vertex.view().words, fragment.view().words, modules));
+    const different = try spirv_cache.Lease.fromOwned(allocator, .{ .words = try allocator.dupe(u32, &raw) });
+    defer different.release();
+    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(17, state, different.view().words, fragment.view().words, .{ .vertex = different, .fragment = fragment }));
+
+    // A newly translated, equal module can replace a retained lease only after
+    // full equality succeeds. The pipeline keeps it alive after its owner exits.
+    const equal = try spirv_cache.Lease.fromOwned(allocator, .{ .words = try allocator.dupe(u32, vertex.view().words) });
+    {
+        defer equal.release();
+        const replacement = GraphicsShaderModules{ .vertex = equal, .fragment = fragment };
+        const hit = renderer.findGraphicsPipeline(17, state, equal.view().words, fragment.view().words, replacement).?;
+        hit.adoptModules(allocator, replacement);
+        try std.testing.expect(hit.vertex_module.?.sameModule(equal));
+        try std.testing.expectEqual(vertex.contentHash(), equal.contentHash());
+        hit.adoptModules(allocator, replacement);
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, entries[0].vertex_words);
+    try std.testing.expect(!entries[0].vertex_module.?.sameModule(vertex));
+}
+
 test "graphics pipeline key excludes dynamic viewport and preserves static state" {
     const original = GraphicsPipelineState.default(64, 64);
     var changed = GraphicsPipelineState.default(128, 32);
@@ -1132,16 +1192,16 @@ test "graphics pipeline buckets verify colliding state and shaders after replace
     var renderer: Renderer = undefined;
     renderer.graphics_pipelines = .{ .items = &entries, .capacity = entries.len };
     renderer.graphics_pipeline_index = .{};
-    try std.testing.expectEqual(@as(vk.Pipeline, 3), renderer.findGraphicsPipeline(13, state, &vertex, &fragment).?.pipeline);
-    try std.testing.expectEqual(&entries[0], renderer.findGraphicsPipeline(13, entries[0].state, &vertex, &fragment).?);
-    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(13, state, &other_words, &fragment));
-    try std.testing.expectEqual(&entries[1], renderer.findGraphicsPipeline(13, state, &vertex, &other_words).?);
+    try std.testing.expectEqual(@as(vk.Pipeline, 3), renderer.findGraphicsPipeline(13, state, &vertex, &fragment, .{}).?.pipeline);
+    try std.testing.expectEqual(&entries[0], renderer.findGraphicsPipeline(13, entries[0].state, &vertex, &fragment, .{}).?);
+    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(13, state, &other_words, &fragment, .{}));
+    try std.testing.expectEqual(&entries[1], renderer.findGraphicsPipeline(13, state, &vertex, &other_words, .{}).?);
     // Replacing an LRU slot must remove its old key from lookup and expose
     // the new key even when the number of cached entries does not change.
     entries[2].hash = 99;
     renderer.graphics_pipeline_index.invalidate();
-    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(13, state, &vertex, &fragment));
-    try std.testing.expectEqual(&entries[2], renderer.findGraphicsPipeline(99, state, &vertex, &fragment).?);
+    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(13, state, &vertex, &fragment, .{}));
+    try std.testing.expectEqual(&entries[2], renderer.findGraphicsPipeline(99, state, &vertex, &fragment, .{}).?);
 }
 
 test "sampled descriptor lookup preserves physical slots across repeated instruction mappings" {
@@ -1394,7 +1454,40 @@ const GraphicsPipelineEntry = struct {
         if (self.vertex_module) |module| module.release() else allocator.free(self.vertex_words);
         if (self.fragment_module) |module| module.release() else allocator.free(self.fragment_words);
     }
+
+    /// Only after a complete cache-key match: adopt new translation leases so
+    /// later draws can verify identity without comparing all SPIR-V words.
+    fn adoptModules(self: *GraphicsPipelineEntry, allocator: std.mem.Allocator, modules: GraphicsShaderModules) void {
+        inline for (.{ "vertex", "fragment" }) |stage| {
+            if (@field(modules, stage)) |module| {
+                const previous = @field(self, stage ++ "_module");
+                if (previous == null or !previous.?.sameModule(module)) {
+                    const retained = module.retain();
+                    if (previous) |old| old.release() else allocator.free(@field(self, stage ++ "_words"));
+                    @field(self, stage ++ "_module") = retained;
+                    @field(self, stage ++ "_words") = retained.view().words;
+                }
+            }
+        }
+    }
 };
+
+const GraphicsShaderModules = struct {
+    vertex: ?spirv_cache.Lease = null,
+    fragment: ?spirv_cache.Lease = null,
+
+    fn forWords(self: GraphicsShaderModules, vertex_words: []const u32, fragment_words: []const u32) GraphicsShaderModules {
+        return .{
+            .vertex = if (self.vertex != null and self.vertex.?.ownsWords(vertex_words)) self.vertex else null,
+            .fragment = if (self.fragment != null and self.fragment.?.ownsWords(fragment_words)) self.fragment else null,
+        };
+    }
+};
+
+fn graphicsShaderMatches(stored_words: []const u32, stored_module: ?spirv_cache.Lease, words: []const u32, module: ?spirv_cache.Lease) bool {
+    if (stored_module != null and module != null and stored_module.?.sameModule(module.?)) return true;
+    return std.mem.eql(u32, stored_words, words);
+}
 
 const GraphicsPipelineState = extern struct {
     width: u32,
@@ -12351,7 +12444,9 @@ pub const Renderer = struct {
         pipeline_state: GraphicsPipelineState,
         vertex_words: []const u32,
         fragment_words: []const u32,
+        supplied_modules: GraphicsShaderModules,
     ) ?*GraphicsPipelineEntry {
+        const modules = supplied_modules.forWords(vertex_words, fragment_words);
         var candidates = self.graphics_pipeline_index.candidatesBy(self.graphics_pipelines.items, hash, struct {
             fn key(entry: GraphicsPipelineEntry) u64 {
                 return entry.hash;
@@ -12361,8 +12456,8 @@ pub const Renderer = struct {
             const entry = &self.graphics_pipelines.items[slot];
             if (entry.hash == hash and
                 std.mem.eql(u8, std.mem.asBytes(&entry.state), std.mem.asBytes(&pipeline_state)) and
-                std.mem.eql(u32, entry.vertex_words, vertex_words) and
-                std.mem.eql(u32, entry.fragment_words, fragment_words)) return entry;
+                graphicsShaderMatches(entry.vertex_words, entry.vertex_module, vertex_words, modules.vertex) and
+                graphicsShaderMatches(entry.fragment_words, entry.fragment_module, fragment_words, modules.fragment)) return entry;
         }
         return null;
     }
@@ -12386,17 +12481,20 @@ pub const Renderer = struct {
         draw_state: GraphicsPipelineState,
         vertex_words: []const u32,
         fragment_words: []const u32,
+        supplied_modules: GraphicsShaderModules,
     ) (Error || std.mem.Allocator.Error)!vk.Pipeline {
+        const modules = supplied_modules.forWords(vertex_words, fragment_words);
         const pipeline_state = draw_state.pipelineKey();
         self.graphics_pipeline_sequence +%= 1;
         const state_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&pipeline_state));
-        const vertex_hash_only = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(vertex_words));
-        const fragment_hash_only = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(fragment_words));
-        // Hash each module once. Complete word comparison below still verifies
-        // a hit, including collisions in any of these component hashes.
+        const vertex_hash_only = if (modules.vertex) |module| module.contentHash() else std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(vertex_words));
+        const fragment_hash_only = if (modules.fragment) |module| module.contentHash() else std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(fragment_words));
+        // Retained immutable identity proves a hit; different modules and raw
+        // words still require full equality, including component-hash collisions.
         const key_parts = [3]u64{ state_hash, vertex_hash_only, fragment_hash_only };
         const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&key_parts));
-        if (self.findGraphicsPipeline(hash, pipeline_state, vertex_words, fragment_words)) |entry| {
+        if (self.findGraphicsPipeline(hash, pipeline_state, vertex_words, fragment_words, modules)) |entry| {
+            entry.adoptModules(self.allocator, modules);
             self.graphics_pipeline_cache_hits += 1;
             self.frame_profile.graphics_pipeline_hits += 1;
             entry.last_used_sequence = self.graphics_pipeline_sequence;
@@ -12420,7 +12518,7 @@ pub const Renderer = struct {
         };
         const asynchronous = self.async_pipeline_compilation_enabled and pipeline_state.rectangle_completion == 0;
         if (asynchronous) self.pipeline_compile_queue.submit(&work.job);
-        const owned_vertex = self.retainGraphicsWords(true, vertex_hash_only, vertex_words) catch |err| {
+        const owned_vertex = if (modules.vertex) |module| module.retain() else self.retainGraphicsWords(true, vertex_hash_only, vertex_words) catch |err| {
             if (asynchronous) {
                 work.job.wait();
                 if (work.pipeline != 0) self.device_functions.destroy_pipeline(self.device, work.pipeline, null);
@@ -12428,7 +12526,7 @@ pub const Renderer = struct {
             return err;
         };
         errdefer owned_vertex.release();
-        const owned_fragment = self.retainGraphicsWords(false, fragment_hash_only, fragment_words) catch |err| {
+        const owned_fragment = if (modules.fragment) |module| module.retain() else self.retainGraphicsWords(false, fragment_hash_only, fragment_words) catch |err| {
             if (asynchronous) {
                 work.job.wait();
                 if (work.pipeline != 0) self.device_functions.destroy_pipeline(self.device, work.pipeline, null);
@@ -14856,6 +14954,7 @@ pub const Renderer = struct {
         depth_clear_requested: bool,
         bind_graphics_descriptors: bool,
         draw: GuestDraw,
+        modules: GraphicsShaderModules,
     ) anyerror!void {
         const setup_started = hostTimestampNs();
         if (target.layout.layers > 1 and depth != null) return Error.UnsupportedGraphicsState;
@@ -15012,6 +15111,7 @@ pub const Renderer = struct {
             pipeline_state,
             vertex_words,
             fragment_words,
+            modules,
         );
         self.frame_profile.graphics_pipeline_lookup_ns +|= elapsedHostNanoseconds(pipeline_lookup_started);
         const scalar_upload_started = hostTimestampNs();
@@ -15212,6 +15312,7 @@ pub const Renderer = struct {
         depth_clear_requested: bool,
         bind_graphics_descriptors: bool,
         draw: GuestDraw,
+        modules: GraphicsShaderModules,
     ) anyerror!void {
         const depth_index = try self.acquireDepthTarget(depth);
         const pass = try self.acquireColorPass(
@@ -15229,7 +15330,7 @@ pub const Renderer = struct {
         state.color_attachment_count = 0;
         state.color_attachment_formats = @splat(0);
         state.color_write_masks = @splat(0);
-        const pipeline = try self.getGraphicsPipeline(pass.render_pass, state, vertex_words, fragment_words);
+        const pipeline = try self.getGraphicsPipeline(pass.render_pass, state, vertex_words, fragment_words, modules);
         try self.writeGraphicsScalarValues(vertex_scalars, fragment_scalars);
 
         // Reserve before recording commands: a ring wrap may submit and wait.
@@ -15310,6 +15411,25 @@ pub const Renderer = struct {
         validate_diagnostic_color: bool,
         draw: GuestDraw,
     ) anyerror!void {
+        return self.drawGraphicsShadersWithModules(vertex_words, fragment_words, vertex_scalars, fragment_scalars, pipeline_state, guest_target, extra_colors, depth, depth_clear_requested, bind_graphics_descriptors, validate_diagnostic_color, draw, .{});
+    }
+
+    fn drawGraphicsShadersWithModules(
+        self: *Renderer,
+        vertex_words: []const u32,
+        fragment_words: []const u32,
+        vertex_scalars: []const gpu.ShaderSpirvScalarRegister,
+        fragment_scalars: []const gpu.ShaderSpirvScalarRegister,
+        pipeline_state: GraphicsPipelineState,
+        guest_target: ?GuestColorTarget,
+        extra_colors: []const GuestColorTarget,
+        depth: ?GuestDepthTarget,
+        depth_clear_requested: bool,
+        bind_graphics_descriptors: bool,
+        validate_diagnostic_color: bool,
+        draw: GuestDraw,
+        modules: GraphicsShaderModules,
+    ) anyerror!void {
         if (guest_target) |target| {
             return self.drawPersistentGraphicsShaders(
                 vertex_words,
@@ -15323,6 +15443,7 @@ pub const Renderer = struct {
                 depth_clear_requested,
                 bind_graphics_descriptors,
                 draw,
+                modules,
             );
         }
         if (depth) |plane| {
@@ -15330,7 +15451,7 @@ pub const Renderer = struct {
                 pipeline_state.rasterization_samples == vk.sample_count_1_bit and
                 pipeline_state.width <= plane.width and pipeline_state.height <= plane.height)
             {
-                return self.drawPersistentDepthShaders(vertex_words, fragment_words, vertex_scalars, fragment_scalars, pipeline_state, plane, depth_clear_requested, bind_graphics_descriptors, draw);
+                return self.drawPersistentDepthShaders(vertex_words, fragment_words, vertex_scalars, fragment_scalars, pipeline_state, plane, depth_clear_requested, bind_graphics_descriptors, draw, modules);
             }
         }
         const width = pipeline_state.width;
@@ -15411,7 +15532,7 @@ pub const Renderer = struct {
         }
         defer self.destroyFramebuffer(framebuffer);
 
-        const pipeline = try self.getGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
+        const pipeline = try self.getGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words, modules);
         try self.writeGraphicsScalarValues(vertex_scalars, fragment_scalars);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
@@ -18389,7 +18510,7 @@ pub const Renderer = struct {
             reused_state.depth_bias_slope_bits = pipeline_state.depth_bias_slope_bits;
             const reused_vertex = (self.draw_reuse_vertex orelse return Error.MissingGraphicsProgram).view();
             const reused_fragment = (self.draw_reuse_fragment orelse return Error.MissingGraphicsProgram).view();
-            try self.drawGraphicsShaders(
+            try self.drawGraphicsShadersWithModules(
                 reused_vertex.words,
                 reused_fragment.words,
                 self.draw_reuse_vertex_scalars[0..self.draw_reuse_vertex_scalar_count],
@@ -18402,6 +18523,7 @@ pub const Renderer = struct {
                 self.draw_reuse_bind_descriptors,
                 false,
                 draw,
+                .{ .vertex = self.draw_reuse_vertex, .fragment = self.draw_reuse_fragment },
             );
             return;
         }
@@ -18429,7 +18551,7 @@ pub const Renderer = struct {
             self.replayDrawDescriptors();
             const reused_vertex = (self.draw_reuse_vertex orelse return Error.MissingGraphicsProgram).view();
             const reused_fragment = (self.draw_reuse_fragment orelse return Error.MissingGraphicsProgram).view();
-            try self.drawGraphicsShaders(
+            try self.drawGraphicsShadersWithModules(
                 reused_vertex.words,
                 reused_fragment.words,
                 self.draw_reuse_vertex_scalars[0..self.draw_reuse_vertex_scalar_count],
@@ -18442,6 +18564,7 @@ pub const Renderer = struct {
                 self.draw_reuse_bind_descriptors,
                 false,
                 draw,
+                .{ .vertex = self.draw_reuse_vertex, .fragment = self.draw_reuse_fragment },
             );
             self.draw_reuse_key = draw_key;
             self.draw_reuse_epoch = draw_epoch;
@@ -19764,7 +19887,7 @@ pub const Renderer = struct {
                     vertex_storage,
                     fragment_storage,
                 );
-                try self.drawGraphicsShaders(
+                try self.drawGraphicsShadersWithModules(
                     vertex_module.words,
                     fragment_words,
                     vertex_scalar_regs[0..vertex_scalar_count],
@@ -19778,6 +19901,7 @@ pub const Renderer = struct {
                     bind_descriptors,
                     false,
                     draw,
+                    .{ .vertex = vertex_lease, .fragment = fragment_lease },
                 );
                 try self.checkFlatMemoryFault(fragment_storage, fragment_address, vk.pipeline_stage_fragment_shader_bit);
                 try self.commitStorageImages(memory, fragment_storage);

@@ -237,7 +237,12 @@ const SubmissionBatch = struct {
     pending_notes: usize = 0,
     failed: bool = false,
 };
-const completion_allocator = std.heap.page_allocator;
+// Small indirect-register snapshots and completion records recur every submit.
+// Reuse allocator size classes instead of mapping/unmapping host pages for each
+// record. This allocator also supports producer and completion worker threads;
+// each submission still owns its copied bytes until the queue releases them.
+const submission_allocator = std.heap.smp_allocator;
+const completion_allocator = submission_allocator;
 var submission_batches: [64]SubmissionBatch = @splat(.{});
 var submission_batch_head: usize = 0;
 var submission_batch_count: usize = 0;
@@ -809,8 +814,8 @@ fn drainQuietBuilderArenas() void {
 
     const pointer: [*]const u32 = @ptrFromInt(start);
     const available = pointer[0..@intCast(byte_length / @sizeOf(u32))];
-    const snapshot = std.heap.page_allocator.dupe(u32, available) catch return;
-    defer std.heap.page_allocator.free(snapshot);
+    const snapshot = submission_allocator.dupe(u32, available) catch return;
+    defer submission_allocator.free(snapshot);
     const commands = submittedCommandPrefixForArena(snapshot, start);
     if (commands.len == 0 or commands.len != snapshot.len or
         !streamIsRecoverableOrphan(commands))
@@ -864,8 +869,8 @@ fn reportPendingBuilderArenasAtFlip() void {
             !memory.isGuestRangeAccessible(arena.executed_end, byte_length)) continue;
         const pointer: [*]const u32 = @ptrFromInt(arena.executed_end);
         const live = pointer[0..@intCast(byte_length / @sizeOf(u32))];
-        const frozen = std.heap.page_allocator.dupe(u32, live) catch continue;
-        defer std.heap.page_allocator.free(frozen);
+        const frozen = submission_allocator.dupe(u32, live) catch continue;
+        defer submission_allocator.free(frozen);
         const commands = submittedCommandPrefixForArena(frozen, arena.executed_end);
         const summary = summarize(commands);
         std.debug.print(
@@ -2067,8 +2072,8 @@ fn submitConstructedGraphicsStream(submission: Submission) bool {
     };
     constructed_flip_lock.unlock();
     const tail = constructedFlipTail(pending, submission) orelse return false;
-    const snapshot = std.heap.page_allocator.dupe(u32, tail) catch return false;
-    defer std.heap.page_allocator.free(snapshot);
+    const snapshot = submission_allocator.dupe(u32, tail) catch return false;
+    defer submission_allocator.free(snapshot);
     const commands = submittedCommandPrefixForRange(snapshot, @intFromPtr(tail.ptr), false);
     if (commands.len != snapshot.len) return false;
     if (recovered_constructed_flip_reports < 16) {
@@ -2138,7 +2143,7 @@ const executor_backend = gpu.DcbBackend{
     .vtable = &executor_backend_vtable,
 };
 
-var submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, executor_backend);
+var submission_scheduler = gpu.QueueScheduler.init(submission_allocator, executor_backend);
 var parallel_command_execution: bool = false;
 
 pub fn setParallelCommandExecution(enabled: bool) void {
@@ -2191,7 +2196,7 @@ pub fn reset() void {
     deferred_release_note_count = 0;
     next_deferred_release_id = 0;
     submission_scheduler.deinit();
-    submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, executor_backend);
+    submission_scheduler = gpu.QueueScheduler.init(submission_allocator, executor_backend);
     submission_scheduler.parallel_commands = parallel_command_execution;
     traced_draw_states = 0;
     traced_shader_program_count = 0;
@@ -2762,11 +2767,11 @@ fn executeAcceptedStream(
     // HLE call is waiting for the serialized command processor. Validating the
     // live words and copying them later allowed a Type-0 descriptor tail to
     // replace the final packet and reach the executor as a truncated root.
-    const snapshot = std.heap.page_allocator.dupe(u32, stream) catch {
+    const snapshot = submission_allocator.dupe(u32, stream) catch {
         std.debug.print("[{s}] could not snapshot {d}-word submission; accepting as no-op\n", .{ label, stream.len });
         return .{ .accepted = true, .completed = true };
     };
-    defer std.heap.page_allocator.free(snapshot);
+    defer submission_allocator.free(snapshot);
     const commands = submittedCommandPrefixForArena(snapshot, @intFromPtr(stream.ptr));
 
     if (commands.len != stream.len) {
@@ -2845,8 +2850,8 @@ fn flushPendingGraphicsSegment() void {
 
     const pointer: [*]const u32 = @ptrFromInt(start);
     const available = pointer[0..@intCast(byte_length / @sizeOf(u32))];
-    const snapshot = std.heap.page_allocator.dupe(u32, available) catch return;
-    defer std.heap.page_allocator.free(snapshot);
+    const snapshot = submission_allocator.dupe(u32, available) catch return;
+    defer submission_allocator.free(snapshot);
     const commands = submittedCommandPrefixForRange(snapshot, start, false);
     if (commands.len == 0) return;
     if (pending_graphics_reports < 32) {
