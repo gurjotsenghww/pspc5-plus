@@ -15,32 +15,44 @@ pub const Plan = struct {
     instructions: []const rdna2.Instruction,
     resource: []const u32,
     sampled: []const u32,
+    resource_indices: []const u32,
+    sampled_indices: []const u32,
     /// Indices, not program counters: the storage-image pass needs the
     /// instruction itself, and these never reach the checkpoint evaluator.
     storage_images: []const u32,
     /// Instruction indices the scalar checkpoint walk must execute. Vector
     /// opcodes that cannot change a scalar register or a checkpoint are absent.
     scalar_steps: []const u32,
+    reads_only_resources: bool,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
         errdefer allocator.free(resource);
         const sampled = try collect(allocator, instructions, .sampled);
         errdefer allocator.free(sampled);
+        const resource_indices = try collectIndices(allocator, instructions, .resource, resource.len);
+        errdefer allocator.free(resource_indices);
+        const sampled_indices = try collectIndices(allocator, instructions, .sampled, sampled.len);
+        errdefer allocator.free(sampled_indices);
         const storage_images = try collectStorageImages(allocator, instructions);
         errdefer allocator.free(storage_images);
         return .{
             .instructions = instructions,
             .resource = resource,
             .sampled = sampled,
+            .resource_indices = resource_indices,
+            .sampled_indices = sampled_indices,
             .storage_images = storage_images,
             .scalar_steps = try collectScalarSteps(allocator, instructions, resource, sampled),
+            .reads_only_resources = readsOnlyResources(instructions),
         };
     }
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.resource);
         allocator.free(self.sampled);
+        allocator.free(self.resource_indices);
+        allocator.free(self.sampled_indices);
         allocator.free(self.storage_images);
         allocator.free(self.scalar_steps);
         self.* = undefined;
@@ -66,15 +78,76 @@ pub const Plan = struct {
     }
 };
 
+/// Borrow immutable resource locations when they belong to this exact program.
+/// Pruned or replaced instruction allocations use the same opcode filter directly.
+pub const Iterator = struct {
+    instructions: []const rdna2.Instruction,
+    kind: Kind,
+    indices: ?[]const u32,
+    cursor: usize = 0,
+
+    pub fn init(instructions: []const rdna2.Instruction, plan: ?*const Plan, kind: Kind) Iterator {
+        return .{
+            .instructions = instructions,
+            .kind = kind,
+            .indices = if (plan != null and plan.?.matches(instructions)) switch (kind) {
+                .resource => plan.?.resource_indices,
+                .sampled => plan.?.sampled_indices,
+            } else null,
+        };
+    }
+
+    pub fn next(self: *Iterator) ?usize {
+        if (self.indices) |indices| {
+            if (self.cursor == indices.len) return null;
+            const index = indices[self.cursor];
+            self.cursor += 1;
+            return index;
+        }
+        while (self.cursor < self.instructions.len) {
+            const index = self.cursor;
+            self.cursor += 1;
+            if (needsCheckpoint(self.instructions[index].opcode, self.kind)) return index;
+        }
+        return null;
+    }
+};
+
+fn collectIndices(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction, kind: Kind, count: usize) ![]const u32 {
+    const indices = try allocator.alloc(u32, count);
+    var destination: usize = 0;
+    for (instructions, 0..) |*inst, index| {
+        if (!needsCheckpoint(inst.opcode, kind)) continue;
+        indices[destination] = @intCast(index);
+        destination += 1;
+    }
+    return indices;
+}
+
+/// Static eligibility for resource reuse. Unknown or flat-memory operations
+/// cannot prove that a draw leaves every guest resource unchanged.
+pub fn readsOnlyResources(instructions: []const rdna2.Instruction) bool {
+    for (instructions) |inst| {
+        if (inst.opcode == .unknown or inst.family == .flat) return false;
+        const name = @tagName(inst.opcode);
+        if (std.mem.startsWith(u8, name, "buffer_store") or std.mem.startsWith(u8, name, "tbuffer_store") or
+            std.mem.startsWith(u8, name, "buffer_atomic") or std.mem.startsWith(u8, name, "image_store") or
+            std.mem.startsWith(u8, name, "image_atomic") or std.mem.startsWith(u8, name, "s_store") or
+            std.mem.startsWith(u8, name, "s_buffer_store") or std.mem.startsWith(u8, name, "s_atomic") or
+            std.mem.startsWith(u8, name, "s_buffer_atomic")) return false;
+    }
+    return true;
+}
+
 fn collect(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction, kind: Kind) ![]const u32 {
     var count: usize = 0;
-    for (instructions) |inst| if (needsCheckpoint(inst, kind)) {
+    for (instructions) |*inst| if (needsCheckpoint(inst.opcode, kind)) {
         count += 1;
     };
     const result = try allocator.alloc(u32, count);
     var index: usize = 0;
-    for (instructions) |inst| {
-        if (!needsCheckpoint(inst, kind)) continue;
+    for (instructions) |*inst| {
+        if (!needsCheckpoint(inst.opcode, kind)) continue;
         result[index] = inst.pc;
         index += 1;
     }
@@ -258,16 +331,16 @@ pub const Pool = struct {
     }
 };
 
-pub fn needsCheckpoint(inst: rdna2.Instruction, kind: Kind) bool {
+pub fn needsCheckpoint(opcode: rdna2.Opcode, kind: Kind) bool {
     return switch (kind) {
-        .resource => needsResource(inst),
-        .sampled => inst.opcode == .image_load or inst.opcode == .image_load_mip or
-            inst.opcode == .image_sample or inst.opcode == .image_gather4 or inst.opcode == .image_get_lod,
+        .resource => needsResource(opcode),
+        .sampled => opcode == .image_load or opcode == .image_load_mip or
+            opcode == .image_sample or opcode == .image_gather4 or opcode == .image_get_lod,
     };
 }
 
-fn needsResource(inst: rdna2.Instruction) bool {
-    return switch (inst.opcode) {
+fn needsResource(opcode: rdna2.Opcode) bool {
+    return switch (opcode) {
         .s_load_dword,
         .s_load_dwordx2,
         .s_load_dwordx4,
@@ -372,6 +445,38 @@ const TestMemory = struct {
         return .{ .context = self, .read_fn = read };
     }
 };
+
+test "resource iterators preserve program order and reject a replaced allocation" {
+    const a = std.testing.allocator;
+    const original = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_load_dwordx4 },
+        .{ .pc = 8, .opcode = .v_add_f32 },
+        .{ .pc = 12, .opcode = .image_get_lod },
+        .{ .pc = 20, .opcode = .buffer_store_dword },
+        .{ .pc = 28, .opcode = .image_sample },
+        .{ .pc = 36, .opcode = .s_endpgm },
+    };
+    var plan = try Plan.init(a, &original);
+    defer plan.deinit(a);
+    try std.testing.expect(!plan.reads_only_resources);
+    const replacement = try a.dupe(rdna2.Instruction, &original);
+    defer a.free(replacement);
+    replacement[3].opcode = .s_nop;
+    replacement[4].opcode = .v_mov_b32;
+    try std.testing.expect(readsOnlyResources(replacement));
+    for ([_]Kind{ .resource, .sampled }) |kind| {
+        for ([_][]const rdna2.Instruction{ &original, replacement }) |instructions| {
+            var cached = Iterator.init(instructions, &plan, kind);
+            var full = Iterator.init(instructions, null, kind);
+            try std.testing.expectEqual(instructions.ptr == original[0..].ptr, cached.indices != null);
+            while (full.next()) |index| {
+                try std.testing.expectEqual(@as(?usize, index), cached.next());
+            }
+            try std.testing.expectEqual(@as(?usize, null), cached.next());
+            try std.testing.expectEqual(@as(?usize, null), cached.next());
+        }
+    }
+}
 
 test "checkpoint reuse keeps guest reads fresh and clears skipped or failed states" {
     const a = std.testing.allocator;
@@ -541,7 +646,7 @@ test "typed buffer accesses get a resource checkpoint like their untyped forms" 
         .tbuffer_store_format_xyz, .tbuffer_store_format_xyzw,
     };
     for (typed) |opcode| {
-        try std.testing.expect(needsCheckpoint(.{ .opcode = opcode }, .resource));
+        try std.testing.expect(needsCheckpoint(opcode, .resource));
     }
 }
 

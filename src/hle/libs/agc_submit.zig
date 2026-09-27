@@ -892,6 +892,80 @@ pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     return true;
 }
 
+/// Only ordinary, disjoint guest backing can combine word-copy
+/// callbacks. Command arenas and their labels retain the narrow-write guards
+/// and snapshot mirroring, and host-owned video labels never pass this proof.
+pub fn canBatchGuestCopy(context: ?*anyopaque, source: u64, destination: u64, size: usize) bool {
+    const space = addressSpaceFromContext(context) orelse return false;
+    if (size == 0) return false;
+    const source_mapping = space.query(source, false) orelse return false;
+    const destination_mapping = space.query(destination, false) orelse return false;
+    if (source_mapping.kind == .reserved or destination_mapping.kind == .reserved or
+        (!source_mapping.protection.read and !source_mapping.protection.write) or !destination_mapping.protection.write or
+        size > source_mapping.end() - source or size > destination_mapping.end() - destination) return false;
+    if (source < destination + size and destination < source + size) return false;
+    // Only direct-memory mappings can share physical backing across distinct
+    // guest VAs. Private, flexible, stack and module mappings own their pages.
+    if (source_mapping.kind == .direct_memory and destination_mapping.kind == .direct_memory) {
+        const source_offset = (source_mapping.backing_offset orelse return false) + (source - source_mapping.address);
+        const destination_offset = (destination_mapping.backing_offset orelse return false) + (destination - destination_mapping.address);
+        if (source_offset < destination_offset + size and destination_offset < source_offset + size) return false;
+    }
+    submission_alias_lock.lock();
+    const ordinary = copyAvoidsSubmissionRanges(source, destination, size, &submission_aliases);
+    submission_alias_lock.unlock();
+    // An indirect snapshot may outlive the bounded recent-arena alias ring.
+    return ordinary and !submission_scheduler.overlapsActiveSnapshot(destination, size);
+}
+
+fn copyAvoidsSubmissionRanges(source: u64, destination: u64, size: usize, aliases: []const SubmissionAlias) bool {
+    const source_end = std.math.add(u64, source, size) catch return false;
+    const destination_end = std.math.add(u64, destination, size) catch return false;
+    for (aliases) |alias| {
+        if (alias.byte_length == 0) continue;
+        const start = alias.cpu_address -| (if (alias.protect_header) submission_allocation_header_bytes else 0);
+        const end = std.math.add(u64, alias.cpu_address, alias.byte_length) catch return false;
+        if ((source < end and start < source_end) or (destination < end and start < destination_end)) return false;
+    }
+    return true;
+}
+
+test "batched copies exclude submission payload labels and guarded headers" {
+    const aliases = [_]SubmissionAlias{ .{}, .{ .cpu_address = 0x2000, .byte_length = 0x100 }, .{ .cpu_address = 0x4000, .byte_length = 0x80, .protect_header = false } };
+    try std.testing.expect(copyAvoidsSubmissionRanges(0x1000, 0x3000, 0x80, &aliases));
+    try std.testing.expect(!copyAvoidsSubmissionRanges(0x1ff0, 0x3000, 4, &aliases));
+    try std.testing.expect(!copyAvoidsSubmissionRanges(0x1000, 0x20fc, 8, &aliases));
+    try std.testing.expect(!copyAvoidsSubmissionRanges(0x2008, 0x3000, 16, &aliases));
+    try std.testing.expect(copyAvoidsSubmissionRanges(0x3ff0, 0x3000, 16, &aliases));
+    try std.testing.expect(!copyAvoidsSubmissionRanges(0x3ff0, 0x3000, 20, &aliases));
+    try std.testing.expect(!copyAvoidsSubmissionRanges(0x1000, std.math.maxInt(u64) - 2, 4, &aliases));
+    try std.testing.expect(!canBatchGuestCopy(null, 0x1000, 0x3000, 16));
+}
+
+test "batched guest copies require disjoint physical backing and ordinary buffers" {
+    reset();
+    defer reset();
+    const page = guest_address_space.page_size;
+    const base = guest_address_space.user.start;
+    var space = try guest_address_space.AddressSpace.initWithDirectMemory(testing.allocator, 4 * page);
+    defer space.deinit();
+    try space.mapFixed(base, 2 * page, .read_write, .direct_memory, 0);
+    try space.mapFixed(base + 2 * page, page, .read_write, .direct_memory, 0);
+    try space.mapFixed(base + 3 * page, page, .read_write, .private, null);
+    try testing.expect(canBatchGuestCopy(&space, base, base + page, 64));
+    try testing.expect(!canBatchGuestCopy(&space, base, base + 2 * page, 64));
+    try testing.expect(canBatchGuestCopy(&space, base, base + 3 * page, 64));
+    try testing.expect(canBatchGuestCopy(&space, base + 3 * page, base + 3 * page + 128, 64));
+    try testing.expect(!canBatchGuestCopy(&space, base + 3 * page, base + 3 * page + 32, 64));
+    try testing.expect(!canBatchGuestCopy(&space, base, base + 4 * page, 64));
+    try testing.expect(!canBatchGuestCopy(&space, base, base + page, page + 4));
+    const arena: [*]const u32 = @ptrFromInt(base + page + 32);
+    rememberSubmissionAlias(arena[0..16]);
+    try testing.expect(!canBatchGuestCopy(&space, base, base + page + 16, 64));
+    try testing.expect(!canBatchGuestCopy(&space, base + page + 32, base, 64));
+    try testing.expect(canBatchGuestCopy(&space, base, base + page + 128, 64));
+}
+
 pub fn fingerprintGuestMemory(_: ?*anyopaque, address: u64, size: usize) ?u64 {
     const resolved = resolveGuestMemoryAddress(address, size) orelse return null;
     const source: [*]const u8 = @ptrFromInt(resolved);

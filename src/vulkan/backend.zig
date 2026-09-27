@@ -462,6 +462,9 @@ pub const GuestMemory = struct {
     context: ?*anyopaque,
     read: *const fn (?*anyopaque, u64, []u8) bool,
     write: *const fn (?*anyopaque, u64, []const u8) bool,
+    /// Proves that bulk read/write callbacks preserve individual word-copy
+    /// effects for this ordinary range (no control labels or backing alias).
+    can_batch_copy: ?*const fn (?*anyopaque, u64, u64, usize) bool = null,
     /// Arms write tracking for the guest pages backing this GPU read and
     /// returns their combined generation. A later CPU/native write changes
     /// the generation before making the page writable again.
@@ -2544,6 +2547,8 @@ const FrameProfile = struct {
     compute_pipeline_misses: u64 = 0,
     compute_pipeline_build_ns: u64 = 0,
     compute_emulation_ns: u64 = 0,
+    emulated_copy_words: u64 = 0,
+    batched_copy_words: u64 = 0,
     compute_resource_ns: u64 = 0,
     compute_buffer_scan_ns: u64 = 0,
     compute_image_scan_ns: u64 = 0,
@@ -3751,16 +3756,14 @@ const DrawFetchBounds = struct {
 };
 
 fn vertexFetchesAreReadOnly(instructions: []const gpu.ShaderInstruction) bool {
-    for (instructions) |inst| {
-        if (inst.opcode == .unknown or inst.family == .flat) return false;
-        const name = @tagName(inst.opcode);
-        if (std.mem.startsWith(u8, name, "buffer_store") or std.mem.startsWith(u8, name, "tbuffer_store") or
-            std.mem.startsWith(u8, name, "buffer_atomic") or std.mem.startsWith(u8, name, "image_store") or
-            std.mem.startsWith(u8, name, "image_atomic") or std.mem.startsWith(u8, name, "s_store") or
-            std.mem.startsWith(u8, name, "s_buffer_store") or std.mem.startsWith(u8, name, "s_atomic") or
-            std.mem.startsWith(u8, name, "s_buffer_atomic")) return false;
+    return gpu.resource_checkpoints.readsOnlyResources(instructions);
+}
+
+fn shaderResourcesAreReadOnly(analysis: *const gpu.ShaderAnalysis, instructions: []const gpu.ShaderInstruction) bool {
+    if (analysis.resource_checkpoints) |*plan| {
+        if (plan.matches(instructions)) return plan.reads_only_resources;
     }
-    return true;
+    return vertexFetchesAreReadOnly(instructions);
 }
 
 fn vertexBufferFetchExtent(
@@ -8440,10 +8443,11 @@ pub const Renderer = struct {
         const src_stride = if (source_desc.stride == 0) 4 else source_desc.stride;
         const dest_stride = if (dest_desc.stride == 0) 4 else dest_desc.stride;
 
-        for (0..copies) |i| {
-            const value = try readGuestU32(memory, source_desc.address + (src_offset + i) * src_stride);
-            try writeGuestU32(memory, dest_desc.address + (dest_offset + i) * dest_stride, value);
-        }
+        const source_start = std.math.add(u64, source_desc.address, @as(u64, src_offset) * src_stride) catch return Error.GuestBufferTooLarge;
+        const destination_start = std.math.add(u64, dest_desc.address, @as(u64, dest_offset) * dest_stride) catch return Error.GuestBufferTooLarge;
+        const batched = try copyGuestWords(memory, source_start, destination_start, src_stride, dest_stride, copies);
+        self.frame_profile.emulated_copy_words +|= copies;
+        self.frame_profile.batched_copy_words +|= batched;
 
         self.emulated_dispatches += 1;
         if (log_verbose_gpu) std.debug.print(
@@ -9745,8 +9749,11 @@ pub const Renderer = struct {
         // instead of reinitializing its 512 records for every instruction.
         const scalar = &result.scalar_scratch;
         scalar.reset();
-        for (instructions) |inst| {
-            if (!isPointerScalarLoad(inst.opcode)) continue;
+        var pointer_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .resource);
+        while (pointer_instructions.next()) |instruction_index| {
+            const candidate = &instructions[instruction_index];
+            if (!isPointerScalarLoad(candidate.opcode)) continue;
+            const inst = candidate.*;
             const pointer_register = gpu.scalar_provenance.scalarRegisterIndex(inst.src0) orelse continue;
             if (pointer_register + 1 >= 128) continue;
             if (hasScalarLoadAt(proven_pointer_loads, inst.pc)) continue;
@@ -9801,8 +9808,11 @@ pub const Renderer = struct {
         // All pointer loads can consult this captured address space, including
         // a dynamic offset into a page discovered by a neighbouring load.
         // The shader checks both address halves and each word's buffer range.
-        for (instructions) |inst| {
-            if (!isPointerScalarLoad(inst.opcode)) continue;
+        pointer_instructions.cursor = 0;
+        while (pointer_instructions.next()) |instruction_index| {
+            const candidate = &instructions[instruction_index];
+            if (!isPointerScalarLoad(candidate.opcode)) continue;
+            const inst = candidate.*;
             const pointer_register = gpu.scalar_provenance.scalarRegisterIndex(inst.src0) orelse continue;
             if (pointer_register + 1 >= 128) continue;
             if (hasScalarLoadAt(proven_pointer_loads, inst.pc)) continue;
@@ -10339,6 +10349,7 @@ pub const Renderer = struct {
                 instructions,
                 &analysis.graph,
                 analysis.scalar_definitions,
+                if (analysis.resource_checkpoints) |*plan| plan else null,
                 &result.scalar_registers,
                 result.scalar_count,
                 specialized_scalar_prefix_end,
@@ -10364,8 +10375,10 @@ pub const Renderer = struct {
         const instruction_scalar = &result.scalar_scratch;
         instruction_scalar.reset();
         const buffer_scan_started = hostTimestampNs();
-        for (instructions, 0..) |inst, instruction_index| {
-            const is_store = switch (inst.opcode) {
+        var buffer_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .resource);
+        while (buffer_instructions.next()) |instruction_index| {
+            const candidate = &instructions[instruction_index];
+            const is_store = switch (candidate.opcode) {
                 .buffer_load_ubyte,
                 .buffer_load_sbyte,
                 .buffer_load_ushort,
@@ -10438,6 +10451,7 @@ pub const Renderer = struct {
                 => true,
                 else => continue,
             };
+            const inst = candidate.*;
             const resource_operand = if (inst.family == .smem) inst.src0 else inst.src1;
             if (resource_operand.kind != .sgpr) {
                 if (log_verbose_gpu) std.debug.print(
@@ -18655,7 +18669,7 @@ pub const Renderer = struct {
         // same storage-descriptor array as compute. Missing V#s are non-fatal:
         // translate without storage and skip MUBUF rather than abort the draw.
         const vertex_storage_started = hostTimestampNs();
-        const vertex_range: ?DrawVertexRange = if (self.bound_vertex_fetches and tessellation == null and vertexFetchesAreReadOnly(vertex_instructions)) range: {
+        const vertex_range: ?DrawVertexRange = if (self.bound_vertex_fetches and tessellation == null and shaderResourcesAreReadOnly(vertex_analysis, vertex_instructions)) range: {
             const recording = self.draw_reuse_recording;
             self.draw_reuse_recording = false;
             defer self.draw_reuse_recording = recording;
@@ -19639,8 +19653,8 @@ pub const Renderer = struct {
                     &fragment_scalar,
                     tessellation == null and vertex_instruction_storage.items.len == 0 and fragment_specialization == null and
                         drawReuseShapeSafe(vertex_stage, render_state.primitive_type, draw) and
-                        fragment_words.ptr == fragment_module.words.ptr and vertexFetchesAreReadOnly(vertex_instructions) and
-                        vertexFetchesAreReadOnly(fragment_analysis.program.instructions.items),
+                        fragment_words.ptr == fragment_module.words.ptr and shaderResourcesAreReadOnly(vertex_analysis, vertex_instructions) and
+                        shaderResourcesAreReadOnly(fragment_analysis, fragment_analysis.program.instructions.items),
                     drawBindingKey(vertex_address, fragment_address, &vertex_bindings, &fragment_bindings, target.descriptor.address, if (depth_plane) |plane| plane.address else 0, extra_colors, vertex_reuse_mask, fragment_reuse_mask, draw_epoch),
                     draw_epoch,
                     vertex_reuse_mask,
@@ -20635,9 +20649,10 @@ pub const Renderer = struct {
         sampled_scalar.reset();
         const sampled_scan_started = hostTimestampNs();
         defer self.frame_profile.graphics_sampled_scan_ns +|= elapsedHostNanoseconds(sampled_scan_started);
-        for (instructions) |inst| {
+        var sampled_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .sampled);
+        while (sampled_instructions.next()) |instruction_index| {
+            const inst = instructions[instruction_index];
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
-            if (!gpu.resource_checkpoints.needsCheckpoint(inst, .sampled)) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] image_sample resource kinds t#={s} s#={s}\n",
@@ -27375,6 +27390,9 @@ pub const Renderer = struct {
                 self.flip_callbacks,                                                                                 profile.buffer_cache_hits, profile.buffer_cache_misses, profile.buffer_cache_evictions,
                 if (self.retain_clean_storage_buffers) self.storage_buffer_cache_entries else maximum_guest_buffers,
             });
+            std.debug.print("[gpu emulated copies] flip={d} words={d} batched={d}\n", .{
+                self.flip_callbacks, profile.emulated_copy_words, profile.batched_copy_words,
+            });
             std.debug.print(
                 "[gpu compute scan] flip={d} buffers_ms={d}(stage={d},ptr={d}) images_ms={d} resolve_ms={d} stage_ms={d} probe={d}ms/{d} dedup={d}ms/{d} tail_ms={d}(loop={d}/stage={d}ms/{d},desc={d},flat={d},blk={d},slk={d}) dispatches={d} walked={d} images={d} distinct_buf={d}/{d} distinct_img={d}/{d}\n",
                 .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_buffer_stage_ns / std.time.ns_per_ms, profile.compute_pointer_memory_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.compute_sampled_probe_ns / std.time.ns_per_ms, profile.compute_sampled_probe_steps, profile.compute_image_dedup_ns / std.time.ns_per_ms, profile.compute_image_dedup_steps, profile.compute_tail_ns / std.time.ns_per_ms, profile.compute_sampled_loop_ns / std.time.ns_per_ms, profile.compute_sampled_stage_ns / std.time.ns_per_ms, profile.compute_sampled_stages, profile.compute_descriptor_update_ns / std.time.ns_per_ms, profile.compute_flat_memory_ns / std.time.ns_per_ms, profile.compute_buffer_lookup_ns / std.time.ns_per_ms, profile.compute_sampled_lookup_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved, profile.staged_buffers.distinct, profile.staged_buffers.total, profile.staged_images.distinct, profile.staged_images.total },
@@ -29721,6 +29739,121 @@ fn writeGuestU32(memory: GuestMemory, address: u64, value: u32) Error!void {
     var bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &bytes, value, .little);
     if (!memory.write(memory.context, address, &bytes)) return Error.GuestMemoryWriteFailed;
+}
+
+/// Batch the existing CPU copy through the normal guest callbacks, retaining
+/// page invalidation and submission-label publication. Overlap and strides keep
+/// the original forward word order. A declined span falls back to word reads so
+/// an inaccessible tail preserves the completed prefix and the original error.
+fn copyGuestWords(memory: GuestMemory, source: u64, destination: u64, source_stride: u64, destination_stride: u64, count: usize) Error!usize {
+    if (count == 0) return 0;
+    const source_extent = std.math.mul(u64, count - 1, source_stride) catch return Error.GuestBufferTooLarge;
+    const destination_extent = std.math.mul(u64, count - 1, destination_stride) catch return Error.GuestBufferTooLarge;
+    const source_end = std.math.add(u64, std.math.add(u64, source, source_extent) catch return Error.GuestBufferTooLarge, 4) catch return Error.GuestBufferTooLarge;
+    const destination_end = std.math.add(u64, std.math.add(u64, destination, destination_extent) catch return Error.GuestBufferTooLarge, 4) catch return Error.GuestBufferTooLarge;
+    const contiguous = count > 1 and source_stride == 4 and destination_stride == 4 and
+        (source_end <= destination or destination_end <= source) and
+        if (memory.can_batch_copy) |can_batch| can_batch(memory.context, source, destination, @intCast(source_end - source)) else false;
+    var scratch: [4096]u8 = undefined;
+    var index: usize = 0;
+    var batched: usize = 0;
+    while (index < count) {
+        const words: usize = if (contiguous) @min(count - index, scratch.len / 4) else 1;
+        const source_address = source + index * source_stride;
+        const destination_address = destination + index * destination_stride;
+        const bytes = scratch[0 .. words * 4];
+        if (words > 1 and memory.read(memory.context, source_address, bytes) and
+            memory.write(memory.context, destination_address, bytes))
+        {
+            index += words;
+            batched += words;
+            continue;
+        }
+        for (0..words) |word| {
+            const value = try readGuestU32(memory, source_address + word * source_stride);
+            try writeGuestU32(memory, destination_address + word * destination_stride, value);
+        }
+        index += words;
+    }
+    return batched;
+}
+
+test "batched guest copies preserve strides overlap untouched tails and partial faults" {
+    const Memory = struct {
+        bytes: [24 * 1024]u8 = undefined,
+        reads: usize = 0,
+        writes: usize = 0,
+        read_limit: usize = 24 * 1024,
+        write_limit: usize = 24 * 1024,
+        decline_spans: bool = false,
+
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.reads += 1;
+            if (address + bytes.len > self.read_limit or (self.decline_spans and bytes.len > 4)) return false;
+            @memcpy(bytes, self.bytes[@intCast(address)..][0..bytes.len]);
+            return true;
+        }
+        fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.writes += 1;
+            if (address + bytes.len > self.write_limit or (self.decline_spans and bytes.len > 4)) return false;
+            @memcpy(self.bytes[@intCast(address)..][0..bytes.len], bytes);
+            return true;
+        }
+        fn interface(self: *@This()) GuestMemory {
+            return .{ .context = self, .read = read, .write = write, .can_batch_copy = canBatch };
+        }
+        fn canBatch(_: ?*anyopaque, _: u64, _: u64, _: usize) bool {
+            return true;
+        }
+    };
+    for (0..10) |variant| {
+        var memory = Memory{};
+        for (&memory.bytes, 0..) |*byte, index| byte.* = @truncate(index * 31 + index / 256);
+        var expected = memory.bytes;
+        const source: usize = if (variant == 3) 8 else 0;
+        const destination: usize = switch (variant) {
+            2 => 8,
+            3, 4 => 0,
+            else => 12 * 1024,
+        };
+        const source_stride: usize = if (variant == 1) 8 else 4;
+        const destination_stride: usize = if (variant == 1) 12 else 4;
+        const count: usize = if (variant == 8) 0 else if (variant == 1) 512 else 2051;
+        if (variant == 5) memory.read_limit = 4104;
+        if (variant == 6) memory.write_limit = destination + 4104;
+        if (variant == 7) memory.decline_spans = true;
+        var failure: ?Error = null;
+        for (0..count) |index| {
+            const src = source + index * source_stride;
+            const dst = destination + index * destination_stride;
+            if (src + 4 > memory.read_limit) {
+                failure = Error.GuestMemoryReadFailed;
+                break;
+            }
+            if (dst + 4 > memory.write_limit) {
+                failure = Error.GuestMemoryWriteFailed;
+                break;
+            }
+            const value = std.mem.readInt(u32, expected[src..][0..4], .little);
+            std.mem.writeInt(u32, expected[dst..][0..4], value, .little);
+        }
+        var callbacks = memory.interface();
+        if (variant == 9) callbacks.can_batch_copy = null;
+        const result = copyGuestWords(callbacks, source, destination, source_stride, destination_stride, count);
+        if (failure) |err| try std.testing.expectError(err, result) else _ = try result;
+        try std.testing.expectEqualSlices(u8, &expected, &memory.bytes);
+        if (variant == 0) {
+            try std.testing.expectEqual(@as(usize, 3), memory.reads);
+            try std.testing.expectEqual(@as(usize, 3), memory.writes);
+        }
+        if (variant == 8) try std.testing.expectEqual(@as(usize, 0), memory.reads + memory.writes);
+        if (variant == 9) try std.testing.expectEqual(count, memory.writes);
+    }
+    var memory = Memory{};
+    try std.testing.expectError(Error.GuestBufferTooLarge, copyGuestWords(memory.interface(), std.math.maxInt(u64) - 2, 0, 4, 4, 1));
+    try std.testing.expectEqual(@as(usize, 0), memory.reads + memory.writes);
 }
 
 fn computeLocalSize(state: *const gpu.State, register: u32) u32 {

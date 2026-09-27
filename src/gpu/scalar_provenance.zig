@@ -111,7 +111,7 @@ const LaneSpills = struct {
         invalidateDestination(result, inst.dst, 1);
     }
 
-    fn invalidateInstruction(self: *LaneSpills, inst: rdna2.Instruction) void {
+    fn invalidateInstruction(self: *LaneSpills, inst: *const rdna2.Instruction) void {
         if (self.occupied == 0) return;
         const name = @tagName(inst.opcode);
         const wide = std.mem.indexOf(u8, name, "64") != null;
@@ -259,9 +259,9 @@ pub fn pruneUniformBranches(
                 const clobbers = uniformClobbers(inst);
                 switch (inst.opcode) {
                     .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {
-                        _ = executeSmem(&local, reader, bindings, inst);
+                        _ = executeSmem(&local, reader, bindings, &inst);
                     },
-                    .s_mov_b32, .s_mov_b64, .s_movk_i32, .s_cselect_b32, .s_cselect_b64 => executeScalar(&local, bindings.program_address, inst, &scc),
+                    .s_mov_b32, .s_mov_b64, .s_movk_i32, .s_cselect_b32, .s_cselect_b64 => executeScalar(&local, bindings.program_address, &inst, &scc),
                     .s_cmp_eq_i32,
                     .s_cmp_lg_i32,
                     .s_cmp_gt_i32,
@@ -286,7 +286,7 @@ pub fn pruneUniformBranches(
                     .s_xnor_b32,
                     .s_not_b32,
                     .s_wqm_b32,
-                    => executeScalar(&local, bindings.program_address, inst, &scc),
+                    => executeScalar(&local, bindings.program_address, &inst, &scc),
                     .s_nop, .s_waitcnt, .s_inst_prefetch, .s_branch, .s_endpgm, .s_code_end => {},
                     .s_cbranch_scc0, .s_cbranch_scc1 => if (scc) |value| {
                         decisions[block.index] = value == (inst.opcode == .s_cbranch_scc1);
@@ -750,9 +750,9 @@ fn evaluateInto(
         };
         result.instruction_count += 1;
 
-        recordResourceUserData(result, inst.*);
+        recordResourceUserData(result, inst);
 
-        if (inst.opcode != .v_writelane_b32) lane_spills.invalidateInstruction(inst.*);
+        if (inst.opcode != .v_writelane_b32) lane_spills.invalidateInstruction(inst);
 
         if (inst.opcode == .unsupported) {
             // Skip unknown opcodes inside a known family; do not abort the prolog.
@@ -761,7 +761,7 @@ fn evaluateInto(
             continue;
         }
         if (inst.family == .smem) {
-            if (!executeSmem(result, reader, bindings, inst.*)) {
+            if (!executeSmem(result, reader, bindings, inst)) {
                 result.memory_read_failed = true;
                 if (!follow_lane_mask_fallthrough) {
                     if (result.stop_reason == .instruction_limit) result.stop_reason = .inaccessible_memory;
@@ -813,7 +813,7 @@ fn evaluateInto(
                             for (instructions[loop_begin..]) |loop_inst| {
                                 if (loop_inst.pc >= inst.pc) break;
                                 invalidateDestination(result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
-                                lane_spills.invalidateInstruction(loop_inst);
+                                lane_spills.invalidateInstruction(&loop_inst);
                             }
                             scc = null;
                             if (inst.pc / 4 < revisited_loop_edges.capacity() and !revisited_loop_edges.isSet(inst.pc / 4)) {
@@ -866,7 +866,7 @@ fn evaluateInto(
             .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => {},
             .v_writelane_b32 => lane_spills.store(result, inst.*),
             .v_readlane_b32 => lane_spills.restore(result, inst.*),
-            else => executeScalar(result, bindings.program_address, inst.*, &scc),
+            else => executeScalar(result, bindings.program_address, inst, &scc),
         }
         if (steps != null and !dense_walk) {
             if (lane_spills.occupied != 0) {
@@ -925,7 +925,7 @@ fn executeSmem(
     result: *Evaluation,
     reader: shaders.MemoryReader,
     bindings: *const shaders.StageBindings,
-    inst: rdna2.Instruction,
+    inst: *const rdna2.Instruction,
 ) bool {
     const base_lo = source(result, inst.src0) orelse {
         invalidateDestination(result, inst.dst, inst.data_words);
@@ -1081,7 +1081,7 @@ fn recordUserDataOperand(result: *Evaluation, operand: rdna2.Operand, count: usi
     for (result.registers[first..end]) |value| result.address_user_data_mask |= value.user_bits;
 }
 
-fn recordResourceUserData(result: *Evaluation, inst: rdna2.Instruction) void {
+fn recordResourceUserData(result: *Evaluation, inst: *const rdna2.Instruction) void {
     switch (inst.family) {
         // Pin comparisons and carry producers as well as the eventual pointer.
         // A selected pointer's value alone omits the condition that chose it.
@@ -1112,7 +1112,7 @@ fn recordResourceUserData(result: *Evaluation, inst: rdna2.Instruction) void {
         result.address_user_data_mask = std.math.maxInt(u64);
 }
 
-fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruction, scc: *?bool) void {
+fn executeScalar(result: *Evaluation, program_address: u64, inst: *const rdna2.Instruction, scc: *?bool) void {
     if (inst.opcode == .s_wqm_b32 or inst.opcode == .s_not_b32) {
         const a = source(result, inst.src0) orelse {
             invalidateDestination(result, inst.dst, 1);
@@ -1363,7 +1363,7 @@ test "whole quad mode preserves neighbouring registers and updates SCC" {
         result.registers[106] = .{ .known = true, .value = 0x1234_5678 };
         result.registers[108] = .{ .known = true, .value = 0x8765_4321 };
         var scc: ?bool = input == 0;
-        executeScalar(&result, 0, inst, &scc);
+        executeScalar(&result, 0, &inst, &scc);
         var expected: u32 = 0;
         for (0..32) |bit| {
             const quad: u5 = @intCast(bit & ~@as(usize, 3));
@@ -1377,14 +1377,14 @@ test "whole quad mode preserves neighbouring registers and updates SCC" {
     var unknown = Evaluation{};
     unknown.registers[107] = .{ .known = true, .value = 1 };
     var scc: ?bool = true;
-    executeScalar(&unknown, 0, inst, &scc);
+    executeScalar(&unknown, 0, &inst, &scc);
     try std.testing.expect(unknown.register(107) == null);
     try std.testing.expect(scc == null);
 }
 
 fn executeScalar64(
     result: *Evaluation,
-    inst: rdna2.Instruction,
+    inst: *const rdna2.Instruction,
     a: ScalarValue,
     b: ?ScalarValue,
     sources: Sources,
@@ -1466,14 +1466,14 @@ test "64-bit BFE takes one control SGPR and retains both data words" {
         .src1 = .{ .kind = .vcc_hi },
         .src_count = 2,
     };
-    executeScalar(&result, 0, inst, &scc);
+    executeScalar(&result, 0, &inst, &scc);
     try std.testing.expectEqual(@as(u32, 0x3ac), result.register(26).?.value);
     try std.testing.expectEqual(@as(u32, 0), result.register(27).?.value);
     result.registers[108] = .{ .known = true, .value = 0xffffffff };
-    executeScalar(&result, 0, inst, &scc);
+    executeScalar(&result, 0, &inst, &scc);
     try std.testing.expectEqual(@as(u32, 0x3ac), result.register(26).?.value);
     result.registers[15] = .{};
-    executeScalar(&result, 0, inst, &scc);
+    executeScalar(&result, 0, &inst, &scc);
     try std.testing.expect(result.register(26) == null);
     try std.testing.expect(result.register(27) == null);
 }
@@ -1904,17 +1904,17 @@ test "scalar logical results update SCC and forget unknown operands" {
         var state = Evaluation{};
         var scc: ?bool = c.value == 0;
         var inst = rdna2.Instruction{ .opcode = c.opcode, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .literal_constant, .value = c.a }, .src1 = .{ .kind = .literal_constant, .value = c.b }, .src_count = 2 };
-        executeScalar(&state, 0, inst, &scc);
+        executeScalar(&state, 0, &inst, &scc);
         try std.testing.expectEqual(c.value, state.register(8).?.value);
         try std.testing.expectEqual(@as(?bool, c.value != 0), scc);
         inst.src1 = .{ .kind = .sgpr, .reg = 9 };
-        executeScalar(&state, 0, inst, &scc);
+        executeScalar(&state, 0, &inst, &scc);
         try std.testing.expectEqual(@as(?bool, null), scc);
         try std.testing.expect(state.register(8) == null);
         inst.src1 = .{ .kind = .literal_constant, .value = c.b };
         inst.src0 = .{ .kind = .sgpr, .reg = 9 };
         scc = true;
-        executeScalar(&state, 0, inst, &scc);
+        executeScalar(&state, 0, &inst, &scc);
         try std.testing.expectEqual(@as(?bool, null), scc);
         try std.testing.expect(state.register(8) == null);
     }
@@ -1927,17 +1927,17 @@ test "scalar NOT replaces SCC for select consumers and unknown input" {
             var scc: ?bool = input == 0xffff_ffff;
             var inst = rdna2.Instruction{ .opcode = .s_not_b32, .dst = .{ .kind = destination_kind, .reg = 8 }, .src0 = .{ .kind = .literal_constant, .value = input }, .src_count = 1 };
             const select = rdna2.Instruction{ .opcode = .s_cselect_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .integer_inline_constant, .value = 11 }, .src1 = .{ .kind = .integer_inline_constant, .value = 22 }, .src_count = 2 };
-            executeScalar(&state, 0, inst, &scc);
+            executeScalar(&state, 0, &inst, &scc);
             try std.testing.expectEqual(@as(?bool, input != 0xffff_ffff), scc);
             if (destination_kind == .sgpr) try std.testing.expectEqual(~input, state.register(8).?.value);
-            executeScalar(&state, 0, select, &scc);
+            executeScalar(&state, 0, &select, &scc);
             try std.testing.expectEqual(@as(u32, if (input != 0xffff_ffff) 11 else 22), state.register(10).?.value);
 
             inst.src0 = .{ .kind = .sgpr, .reg = 9 };
-            executeScalar(&state, 0, inst, &scc);
+            executeScalar(&state, 0, &inst, &scc);
             try std.testing.expectEqual(@as(?bool, null), scc);
             try std.testing.expect(state.register(8) == null);
-            executeScalar(&state, 0, select, &scc);
+            executeScalar(&state, 0, &select, &scc);
             try std.testing.expect(state.register(10) == null);
         }
     }
@@ -1960,7 +1960,7 @@ test "64-bit bitwise operations replace SCC using both result words" {
         const words = [_]u32{ @truncate(case.a), @truncate(case.a >> 32), @truncate(case.b), @truncate(case.b >> 32) };
         for (words, 4..) |word, index| state.registers[index] = .{ .known = true, .value = word };
         var scc: ?bool = case.expected == 0;
-        executeScalar(&state, 0, inst, &scc);
+        executeScalar(&state, 0, &inst, &scc);
         try std.testing.expectEqual(@as(u32, @truncate(case.expected)), state.register(8).?.value);
         try std.testing.expectEqual(@as(u32, @truncate(case.expected >> 32)), state.register(9).?.value);
         try std.testing.expectEqual(@as(?bool, case.expected != 0), scc);
@@ -1968,7 +1968,7 @@ test "64-bit bitwise operations replace SCC using both result words" {
             var partial = state;
             partial.registers[unknown] = .{};
             scc = true;
-            executeScalar(&partial, 0, inst, &scc);
+            executeScalar(&partial, 0, &inst, &scc);
             try std.testing.expect(scc == null);
             try std.testing.expect(partial.register(8) == null and partial.register(9) == null);
         }
@@ -2179,16 +2179,16 @@ test "resource reuse pins scalar conditions, direct descriptors and SMEM bounds"
         .value = @intCast(index),
         .user_bits = @as(u64, 1) << @intCast(index),
     };
-    recordResourceUserData(&evaluation, .{ .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 2 });
+    recordResourceUserData(&evaluation, &.{ .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 2 });
     try std.testing.expect(evaluation.address_user_data_mask & (@as(u64, 1) << 20) != 0);
-    recordResourceUserData(&evaluation, .{ .family = .smem, .opcode = .s_buffer_load_dword, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src_count = 2 });
+    recordResourceUserData(&evaluation, &.{ .family = .smem, .opcode = .s_buffer_load_dword, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src_count = 2 });
     try std.testing.expect(evaluation.address_user_data_mask & 0x10f == 0x10f);
-    recordResourceUserData(&evaluation, .{ .family = .mimg, .opcode = .image_sample, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src2 = .{ .kind = .sgpr, .reg = 24 } });
+    recordResourceUserData(&evaluation, &.{ .family = .mimg, .opcode = .image_sample, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src2 = .{ .kind = .sgpr, .reg = 24 } });
     try std.testing.expect(evaluation.address_user_data_mask & 0x0f00_ff00 == 0x0f00_ff00);
     const protected = evaluation.address_user_data_mask;
-    recordResourceUserData(&evaluation, .{ .family = .vop2, .opcode = .v_mul_f32, .src0 = .{ .kind = .sgpr, .reg = 31 }, .src1 = .{ .kind = .vgpr, .reg = 0 }, .dst = .{ .kind = .vgpr, .reg = 1 }, .src_count = 2 });
+    recordResourceUserData(&evaluation, &.{ .family = .vop2, .opcode = .v_mul_f32, .src0 = .{ .kind = .sgpr, .reg = 31 }, .src1 = .{ .kind = .vgpr, .reg = 0 }, .dst = .{ .kind = .vgpr, .reg = 1 }, .src_count = 2 });
     try std.testing.expectEqual(protected, evaluation.address_user_data_mask);
-    recordResourceUserData(&evaluation, .{ .family = .vop1, .opcode = .v_readfirstlane_b32 });
+    recordResourceUserData(&evaluation, &.{ .family = .vop1, .opcode = .v_readfirstlane_b32 });
     try std.testing.expectEqual(std.math.maxInt(u64), evaluation.address_user_data_mask);
 }
 
@@ -2286,12 +2286,12 @@ test "invariant loop loads leave room for post-loop scalar specializations" {
     // available to consumers which reason about loop-varying loads.
     var late_load = program.instructions.items[program.instructions.items.len - 2];
     memory.write(0x4004, 0x3f800000);
-    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, late_load));
+    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, &late_load));
     try std.testing.expectEqual(@as(usize, 3), result.load_count);
     try std.testing.expectEqual(@as(u32, 0x3f800000), result.loads[2].values[0]);
     memory.write(0x4008, 0x3f800000);
     late_load.memory_offset = 8;
-    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, late_load));
+    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, &late_load));
     try std.testing.expectEqual(@as(usize, 4), result.load_count);
     try std.testing.expectEqual(@as(u64, 0x4008), result.loads[3].address);
 }
@@ -2618,7 +2618,7 @@ test "scalar conditional select preserves descriptor words" {
     result.registers[2] = .{ .known = true, .value = 0x2222_2222 };
 
     var scc: ?bool = true;
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x40,
         .opcode = .s_cselect_b32,
         .dst = .{ .kind = .sgpr, .reg = 3 },
@@ -2629,7 +2629,7 @@ test "scalar conditional select preserves descriptor words" {
     try std.testing.expectEqual(@as(u32, 0x1111_1111), result.register(3).?.value);
 
     scc = false;
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x44,
         .opcode = .s_cselect_b32,
         .dst = .{ .kind = .sgpr, .reg = 3 },
@@ -2647,7 +2647,7 @@ test "descriptor BFE comparison drives conditional select" {
     result.registers[106] = .{ .known = true, .value = 0x0003_8fac };
 
     var scc: ?bool = null;
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x10c,
         .opcode = .s_bfe_u32,
         .dst = .{ .kind = .sgpr, .reg = 14 },
@@ -2655,14 +2655,14 @@ test "descriptor BFE comparison drives conditional select" {
         .src1 = .{ .kind = .literal_constant, .value = 0x0007_0007 },
         .src_count = 2,
     }, &scc);
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x160,
         .opcode = .s_cmp_eq_u32,
         .src0 = .{ .kind = .sgpr, .reg = 14 },
         .src1 = .{ .kind = .integer_inline_constant, .value = 0 },
         .src_count = 2,
     }, &scc);
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x168,
         .opcode = .s_cselect_b32,
         .dst = .{ .kind = .sgpr, .reg = 7 },
@@ -2683,7 +2683,7 @@ test "a sampler assembled from immediates resolves to its descriptor words" {
     // every one of these four words unknown.
     var result = Evaluation{};
     var scc: ?bool = null;
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x8,
         .opcode = .s_bfm_b64,
         .dst = .{ .kind = .sgpr, .reg = 12 },
@@ -2691,7 +2691,7 @@ test "a sampler assembled from immediates resolves to its descriptor words" {
         .src1 = .{ .kind = .integer_inline_constant, .value = 0x2c },
         .src_count = 2,
     }, &scc);
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0xc,
         .opcode = .s_mov_b64,
         .dst = .{ .kind = .sgpr, .reg = 14 },
@@ -2710,7 +2710,7 @@ test "a sampler assembled from immediates resolves to its descriptor words" {
 test "an integer inline constant carries its sign into a 64-bit result" {
     var result = Evaluation{};
     var scc: ?bool = null;
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x0,
         .opcode = .s_mov_b64,
         .dst = .{ .kind = .sgpr, .reg = 2 },
@@ -2726,7 +2726,7 @@ test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
     var scc: ?bool = null;
     result.registers[0] = .{ .known = true, .value = 0xaaaa_1111, .sources = .{ .immediate = true } };
     result.registers[1] = .{ .known = true, .value = 0xbbbb_2222, .sources = .{ .immediate = true } };
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x0,
         .opcode = .s_pack_ll_b32_b16,
         .dst = .{ .kind = .sgpr, .reg = 2 },
@@ -2734,7 +2734,7 @@ test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
         .src1 = .{ .kind = .sgpr, .reg = 1 },
         .src_count = 2,
     }, &scc);
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x4,
         .opcode = .s_pack_lh_b32_b16,
         .dst = .{ .kind = .sgpr, .reg = 3 },
@@ -2742,7 +2742,7 @@ test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
         .src1 = .{ .kind = .sgpr, .reg = 1 },
         .src_count = 2,
     }, &scc);
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x8,
         .opcode = .s_pack_hh_b32_b16,
         .dst = .{ .kind = .sgpr, .reg = 4 },
@@ -2754,7 +2754,7 @@ test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
     try std.testing.expectEqual(@as(u32, 0xbbbb_1111), result.register(3).?.value);
     try std.testing.expectEqual(@as(u32, 0xbbbb_aaaa), result.register(4).?.value);
 
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0xc,
         .opcode = .s_bfm_b32,
         .dst = .{ .kind = .sgpr, .reg = 5 },
@@ -2765,7 +2765,7 @@ test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
     try std.testing.expectEqual(@as(u32, 0x0000_0ff0), result.register(5).?.value);
 
     result.registers[6] = .{ .known = true, .value = 0x0000_000f, .sources = .{ .immediate = true } };
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x10,
         .opcode = .s_bfe_i32,
         .dst = .{ .kind = .sgpr, .reg = 7 },
@@ -2777,7 +2777,7 @@ test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
 
     result.registers[8] = .{ .known = true, .value = 0, .sources = .{ .immediate = true } };
     result.registers[9] = .{ .known = true, .value = 1, .sources = .{ .immediate = true } };
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x18,
         .opcode = .s_ff1_i32_b64,
         .dst = .{ .kind = .sgpr, .reg = 10 },
@@ -2788,7 +2788,7 @@ test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
 
     result.registers[12] = .{ .known = true, .value = 0x0000_0001, .sources = .{ .immediate = true } };
     result.registers[13] = .{ .known = true, .value = 0, .sources = .{ .immediate = true } };
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x1c,
         .opcode = .s_quadmask_b64,
         .dst = .{ .kind = .sgpr, .reg = 14 },
@@ -2800,7 +2800,7 @@ test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
 
     result.registers[16] = .{ .known = true, .value = 0x0000_0005, .sources = .{ .immediate = true } };
     result.registers[17] = .{ .known = true, .value = 0, .sources = .{ .immediate = true } };
-    executeScalar(&result, 0, .{
+    executeScalar(&result, 0, &.{
         .pc = 0x20,
         .opcode = .s_bitreplicate_b64_b32,
         .dst = .{ .kind = .sgpr, .reg = 18 },

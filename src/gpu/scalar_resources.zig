@@ -8,6 +8,7 @@ const rdna2 = @import("rdna2");
 const shaders = @import("shaders.zig");
 const scalar = @import("scalar_provenance.zig");
 const definitions = @import("index_bounds.zig");
+const checkpoints = @import("resource_checkpoints.zig");
 
 /// Diagnostic switch sampled once per recovery, allowing same-process timing.
 pub var definition_cache_enabled = std.atomic.Value(bool).init(true);
@@ -28,6 +29,7 @@ pub fn appendMissingPointerLoads(
     instructions: []const rdna2.Instruction,
     graph: *const rdna2.control_flow.Graph,
     cache: ?*definitions.ScalarDefinitionCache,
+    plan: ?*const checkpoints.Plan,
     output: []rdna2.spirv.ScalarRegister,
     count: usize,
     prefix_end: u32,
@@ -38,11 +40,14 @@ pub fn appendMissingPointerLoads(
     };
     const empty = scalar.Evaluation{};
     var end = count;
-    for (instructions) |inst| {
-        switch (inst.opcode) {
+    var resource_instructions = checkpoints.Iterator.init(instructions, plan, .resource);
+    while (resource_instructions.next()) |instruction_index| {
+        const candidate = &instructions[instruction_index];
+        switch (candidate.opcode) {
             .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {},
             else => continue,
         }
+        const inst = candidate.*;
         if (inst.pc >= prefix_end or inst.pc / 4 >= seen.capacity() or seen.isSet(inst.pc / 4)) continue;
         const destination = scalar.scalarRegisterIndex(inst.dst) orelse continue;
         const pointer_register = scalar.scalarRegisterIndex(inst.src0) orelse continue;
@@ -290,13 +295,15 @@ test "missing pointer constants follow branch definitions and stay draw-local" {
             var output: [8]rdna2.spirv.ScalarRegister = undefined;
             output[0] = .{ .register = 106, .value = 123, .producer_pc = 8 };
             output[1] = .{ .register = 107, .value = 456, .producer_pc = 8 };
-            const end = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, &cache, output[0..if (variant == 5) 3 else 8], 2, if (variant == 6) 24 else 64);
+            var plan = try checkpoints.Plan.init(std.testing.allocator, &instructions);
+            defer plan.deinit(std.testing.allocator);
+            const end = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, &cache, if (draw == 0) &plan else null, output[0..if (variant == 5) 3 else 8], 2, if (variant == 6) 24 else 64);
             const recoverable = variant == 0 or variant == 3;
             try std.testing.expectEqual(@as(usize, if (recoverable) 4 else 2), end);
             try std.testing.expectEqual(@as(u32, 123), output[0].value);
             if (variant == 3) {
                 var loop_output: [8]rdna2.spirv.ScalarRegister = undefined;
-                const loop_end = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, &cache, &loop_output, 0, 64);
+                const loop_end = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, &cache, &plan, &loop_output, 0, 64);
                 try std.testing.expectEqual(@as(usize, 2), loop_end);
                 try std.testing.expectEqual(@as(?u32, 24), loop_output[0].producer_pc);
             }
@@ -341,7 +348,7 @@ test "missing VCC pointer loads use both reaching halves and reject clobbers" {
         var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
         defer graph.deinit(std.testing.allocator);
         var output: [2]rdna2.spirv.ScalarRegister = undefined;
-        const count = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, &output, 0, 24);
+        const count = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, null, &output, 0, 24);
         try std.testing.expectEqual(@as(usize, if (variant == 0) 2 else 0), count);
         if (variant == 0) {
             try std.testing.expectEqual(@as(u32, 0x3f800000), output[0].value);
@@ -374,7 +381,7 @@ test "missing pointer recovery preserves all sixteen words and rejects partial r
     var memory = M{};
     var output: [16]rdna2.spirv.ScalarRegister = undefined;
     const reader = shaders.MemoryReader{ .context = &memory, .read_fn = M.read };
-    const count = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, &output, 0, 16);
+    const count = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, null, &output, 0, 16);
     try std.testing.expectEqual(@as(usize, 16), count);
     for (output, 0..) |entry, index| {
         try std.testing.expectEqual(@as(u32, @intCast(32 + index)), entry.register);
@@ -382,7 +389,7 @@ test "missing pointer recovery preserves all sixteen words and rejects partial r
         try std.testing.expectEqual(@as(?u32, 0), entry.producer_pc);
     }
     memory.readable = 60;
-    try std.testing.expectEqual(@as(usize, 0), appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, &output, 0, 16));
+    try std.testing.expectEqual(@as(usize, 0), appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, null, &output, 0, 16));
 }
 
 test "empty scalar buffers resolve independently of dynamic offsets" {

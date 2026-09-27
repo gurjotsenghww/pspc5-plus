@@ -153,6 +153,23 @@ pub const Scheduler = struct {
         return self.queueForConst(kind).pending.items.len;
     }
 
+    /// Bulk memory writes must retain word publication for any active command
+    /// snapshot, even after its arena leaves the caller's recent-alias ring.
+    pub fn overlapsActiveSnapshot(self: *Scheduler, address: u64, size: usize) bool {
+        if (size == 0) return false;
+        const end = std.math.add(u64, address, size) catch return true;
+        self.snapshot_lock.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.snapshot_lock.unlock(std.Io.Threaded.global_single_threaded.io());
+        for ([_]QueueKind{ .graphics, .compute }) |kind| {
+            const active = if (self.queueFor(kind).active) |*submission| submission else continue;
+            for (active.snapshots.items) |snapshot| {
+                const snapshot_end = std.math.add(u64, snapshot.address, snapshot.words.len * @sizeOf(u32)) catch return true;
+                if (address < snapshot_end and snapshot.address < end) return true;
+            }
+        }
+        return false;
+    }
+
     /// Mirrors an explicit label write into the active submission's retained
     /// indirect-buffer snapshot. Command arenas may place synchronization
     /// labels beside PM4 packets; reading only the immutable snapshot after a
@@ -1241,6 +1258,10 @@ test "mirroring a snapshot alone does not publish a live synchronization label" 
         try testing.expect(scheduler.isBlocked(.graphics));
 
         var payload: [4]u8 = undefined;
+        try testing.expect(scheduler.overlapsActiveSnapshot(label_address, 4));
+        try testing.expect(scheduler.overlapsActiveSnapshot(0x10fc, 8));
+        try testing.expect(!scheduler.overlapsActiveSnapshot(0x10fc, 4));
+        try testing.expect(!scheduler.overlapsActiveSnapshot(0x1200, 64));
         std.mem.writeInt(u32, &payload, 1, .little);
         try testing.expect(scheduler.mirrorActiveWrite(.graphics, label_address, &payload));
         // Only the snapshot changed. The other queue must publish the real label
@@ -1249,6 +1270,7 @@ test "mirroring a snapshot alone does not publish a live synchronization label" 
         try testing.expect(FakeBackend.vtable.write(&host, label_address, &payload));
         try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
         try testing.expect(!scheduler.isBlocked(.graphics));
+        try testing.expect(!scheduler.overlapsActiveSnapshot(label_address, 4));
         try testing.expectEqualSlices(u8, &.{0x20}, host.events[0..host.event_count]);
     }
 }

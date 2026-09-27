@@ -943,6 +943,7 @@ fn run(init: std.process.Init) !bool {
             .context = if (enable_gpu_page_tracker) address_space else null,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
+            .can_batch_copy = runtime.firmware.libs.agc_submit.canBatchGuestCopy,
             // Images must detect native CPU writes even without page tracking.
             // Repeated full-buffer hashing is controlled separately by
             // cache_storage_buffer_contents: it can cost more than uploads.
