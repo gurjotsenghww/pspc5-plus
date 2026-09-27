@@ -17,7 +17,7 @@ supplied locally and is not included in this repository.
 
 | Title | Status | Notes |
 |---|---|---|
-| **Subnautica: Below Zero**<br><img src="images/subnautica-below-zero-menu-cpu.png" width="240" alt="Subnautica Below Zero main menu showing Play, Options and Credits in PS5PCEM"> | **Main menu renders · gameplay unverified** | Rechecked on September 27, 2026 with PPSA02457 v1.022.125. Enter opens Play, Options and Credits after the file descriptor and FMOD fixes. The default 1920×1080 setting reaches Unity's startup configuration without editing installed game files. Shared shader preparation and guest-copy improvements bring the final sampled menu frames to 87–129 ms, median 91.5 ms (about 10.9 FPS), down from the preceding 1080p median of 105.5 ms (9.5 FPS) on the RTX 3070 Ti host. The 30 FPS target remains unmet. Rendering artifacts and intermittent missing labels remain. One intermediate launch faulted during startup; the final measured run did not. Gameplay, audio correctness and longer-run stability are unverified. [Latest native capture](images/subnautica-below-zero-menu-cpu.png) · [CPU cost results](development/subnautica-cpu-costs-2026-09-27.md) · [Initial 1080p and buffer-reuse results](development/1080p-buffer-reuse-2026-09-27.md) · [Menu investigation](development/subnautica-menu-2026-09-26.md) · [Startup investigation](development/subnautica-startup-2026-09-26.md) |
+| **Subnautica: Below Zero**<br><img src="images/subnautica-below-zero-menu-async.png" width="240" alt="Subnautica Below Zero main menu showing Play, Options and Credits in PS5PCEM"> | **Main menu renders · gameplay unverified** | Rechecked on September 27, 2026 with PPSA02457 v1.022.125. Enter opens Play, Options and Credits. The default 1920×1080 setting reaches Unity's startup configuration without editing installed game files. Deferred AGC completion, proven short fragment loops and scalar-resource lookup improvements bring the sampled menu frames to 68–86 ms, median 73 ms (about 13.7 FPS), versus the preceding 91.5 ms (10.9 FPS) result on the RTX 3070 Ti host. Median GPU waits are about 2.4 ms; CPU preparation and command handling now dominate. The 30 FPS target remains unmet. Rendering artifacts and intermittent missing labels remain unresolved. The measured run had no reported guest fault or device loss; an earlier startup fault has not been isolated. Gameplay, audio correctness and longer-run stability are unverified. [Latest native capture](images/subnautica-below-zero-menu-async.png) · [Completion and shader results](development/subnautica-async-completion-2026-09-27.md) · [Earlier CPU cost results](development/subnautica-cpu-costs-2026-09-27.md) · [Initial 1080p results](development/1080p-buffer-reuse-2026-09-27.md) · [Menu investigation](development/subnautica-menu-2026-09-26.md) |
 | **Terminator 2D: No Fate**<br><img src="images/live-gameplay.png" width="240" alt="Terminator 2D gameplay with the player character, HUD and desert scene"> | **Playable · Completable** | Completed without reported problems. Correct backgrounds, characters, HUD, textures and colors; warmed-up startup frames measure 22–65 ms on the current test host. [Gameplay capture](images/live-gameplay.png) |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
@@ -36,13 +36,13 @@ supplied locally and is not included in this repository.
 
 ## Screenshots
 
-![Subnautica Below Zero main menu showing Play, Options and Credits in PS5PCEM](images/subnautica-below-zero-menu-cpu.png)
+![Subnautica Below Zero main menu showing Play, Options and Credits in PS5PCEM](images/subnautica-below-zero-menu-async.png)
 
-*Subnautica: Below Zero, PPSA02457 v1.022.125, September 27, 2026. Frame 768
-from the final development run, captured at native 1920×1080 after shared
-shader-preparation and guest-copy optimizations. Median menu performance is
-about 10.9 FPS; 30 FPS has not been reached. Rendering artifacts and intermittent
-missing labels remain; gameplay is unverified.*
+*Subnautica: Below Zero, PPSA02457 v1.022.125, September 27, 2026. Frame 512
+from the measured development run, captured at native 1920×1080 after deferred
+GPU completion and short fragment-loop improvements. Median menu performance is
+about 13.7 FPS; 30 FPS has not been reached. Rendering artifacts and intermittent
+missing labels remain unresolved; gameplay is unverified.*
 
 ![Big Helmet Heroes opening movie playing in PS5PCEM](images/big-helmet-heroes-intro.png)
 

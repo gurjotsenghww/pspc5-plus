@@ -32,6 +32,7 @@ pub const Error = pm4.Error || gpu_state.Error || std.mem.Allocator.Error || err
 /// it owns that operation so an asynchronous renderer can publish it at the
 /// correct point instead of receiving an eager host-memory write.
 pub const Backend = struct {
+    pub const CompletionStatus = enum { pending, complete, failed };
     context: ?*anyopaque,
     vtable: *const VTable,
 
@@ -56,6 +57,15 @@ pub const Backend = struct {
         /// Publish deferred internal release labels before the submission owner
         /// exposes its completion to the guest. Called on the renderer owner.
         drain_releases: ?*const fn (?*anyopaque) bool = null,
+        /// Seal all recorded work, returning an immutable completion ticket.
+        /// Failure leaves the caller on its synchronous drain path. Both
+        /// callbacks run under the same ownership lock as draw/dispatch.
+        seal_submission: ?*const fn (?*anyopaque, *u64) bool = null,
+        /// Complete means the ticket's work AND preceding release writes are
+        /// visible. A nonblocking poll must never wait for later GPU work.
+        /// With wait=true, finish the ticket or return failed. Release observer
+        /// callbacks must run before returning complete in either mode.
+        poll_submission: ?*const fn (?*anyopaque, u64, bool) CompletionStatus = null,
         wait: ?*const fn (?*anyopaque, gpu_state.WaitRegMem, bool) bool = null,
         write_data: ?*const fn (?*anyopaque, gpu_state.WriteData, []const u32) bool = null,
         dma_data: ?*const fn (?*anyopaque, gpu_state.DmaData) bool = null,

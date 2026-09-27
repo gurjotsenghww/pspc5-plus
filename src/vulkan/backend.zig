@@ -47,6 +47,9 @@ pub export var gpu_timestamp_profiling: bool = false;
 pub export var gpu_timestamp_min_us: u64 = 1000;
 /// Native comparison only; experimental CFG lowering is disabled by default.
 pub export var fragment_branch_loops: bool = false;
+/// Proven single short loop with forward diamonds or terminal arms; other
+/// shapes retain their established translation. Exported for native A/B runs.
+pub export var fragment_short_loops: bool = true;
 pub export var capture_graphics_target: u64 = 0;
 // Zero preserves synchronous retirement for baseline comparisons.
 pub export var sampled_retirement_slack_bytes: u64 = 0;
@@ -17346,7 +17349,98 @@ pub const Renderer = struct {
                 try std.testing.expect(colored > 100);
             }
         };
-        std.debug.print("Structured branch loops passed: loop exit, continue, shared nested merges, outer skip, guarded header stores and exact dispatcher image\n", .{});
+        try self.probeBranchDiamonds();
+        std.debug.print("Structured branch loops passed: loop exit, continue, shared nested merges, outer skip, guarded header stores, forward diamonds, terminal arms and exact dispatcher image\n", .{});
+    }
+
+    fn probeBranchDiamonds(self: *Renderer) anyerror!void {
+        const op = struct {
+            fn v(reg: u32) rdna2.Operand {
+                return .{ .kind = .vgpr, .reg = reg };
+            }
+            fn s(reg: u32) rdna2.Operand {
+                return .{ .kind = .sgpr, .reg = reg };
+            }
+            fn u(value: u32) rdna2.Operand {
+                return .{ .kind = .integer_inline_constant, .value = value };
+            }
+            fn f(value: f32) rdna2.Operand {
+                return .{ .kind = .literal_constant, .value = @bitCast(value) };
+            }
+        };
+        for (0..4) |choice| for ([_]u32{ 4, 12, 256 }) |budget| {
+            var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+            defer program.deinit(self.allocator);
+            try program.instructions.appendSlice(self.allocator, &.{
+                .{ .opcode = .s_mov_b32, .dst = op.s(1), .src0 = op.u(0) },
+                .{ .opcode = .v_mov_b32, .dst = op.v(0), .src0 = op.f(0.125) },
+                .{ .opcode = .s_cmp_eq_u32, .src0 = op.u(@intCast(choice)), .src1 = op.u(3) },
+                .{ .opcode = .s_cbranch_scc1, .branch_target = 18 * 8 },
+                .{ .opcode = .s_cmp_lt_u32, .src0 = op.s(1), .src1 = op.u(3) },
+                .{ .opcode = .s_cbranch_scc0, .branch_target = 11 * 8 },
+                .{ .opcode = .v_add_f32, .dst = op.v(0), .src0 = op.v(0), .src1 = op.f(0.125) },
+                .{ .opcode = .s_add_u32, .dst = op.s(1), .src0 = op.s(1), .src1 = op.u(1) },
+                .{ .opcode = .s_cmp_eq_u32, .src0 = op.s(1), .src1 = op.u(2) },
+                .{ .opcode = .s_cbranch_scc1, .branch_target = 11 * 8 },
+                .{ .opcode = .s_branch, .branch_target = 4 * 8 },
+                .{ .opcode = .s_cmp_eq_u32, .src0 = op.u(@intCast(choice % 2)), .src1 = op.u(0) },
+                .{ .opcode = .s_cbranch_scc0, .branch_target = 15 * 8 },
+                .{ .opcode = .v_mov_b32, .dst = op.v(1), .src0 = op.f(0.25) },
+                .{ .opcode = .s_branch, .branch_target = 16 * 8 },
+                .{ .opcode = .v_mov_b32, .dst = op.v(1), .src0 = op.f(0.75) },
+                .{ .opcode = .exp, .src0 = op.v(0), .src1 = op.v(1), .src2 = op.v(0), .src3 = op.v(1), .export_enable = 15, .export_done = true },
+                .{ .opcode = .s_endpgm },
+                .{ .opcode = .v_mov_b32, .dst = op.v(0), .src0 = op.f(0.875) },
+                .{ .opcode = .v_mov_b32, .dst = op.v(1), .src0 = op.f(0.875) },
+                .{ .opcode = .exp, .src0 = op.v(0), .src1 = op.v(1), .src2 = op.v(0), .src3 = op.v(1), .export_enable = 15, .export_done = true },
+                .{ .opcode = .s_endpgm },
+            });
+            // Budget exhaustion must have defined output on both paths.
+            // Export once before the first branch; later exports overwrite it.
+            for (program.instructions.items) |*inst| {
+                if (inst.opcode.isBranch()) inst.branch_target += 2 * 8;
+            }
+            try program.instructions.insertSlice(self.allocator, 2, &.{
+                .{ .opcode = .v_mov_b32, .dst = op.v(1), .src0 = op.f(0.5) },
+                .{ .opcode = .exp, .src0 = op.v(0), .src1 = op.v(1), .src2 = op.v(0), .src3 = op.v(1), .export_enable = 15 },
+            });
+            for (program.instructions.items, 0..) |*inst, i| {
+                inst.pc = @intCast(i * 8);
+                inst.word_count = 2;
+            }
+            var reference: @TypeOf(self.graphics_probe_frame) = undefined;
+            // Compare both eligible structured paths against the established
+            // dispatcher, including exhaustion before an ordinary exit.
+            for (0..3) |mode| {
+                var module = try rdna2.translateSpirv(self.allocator, &program, .{
+                    .stage = .fragment,
+                    .structure_branch_loops = mode == 1,
+                    .structure_short_fragment_loops = mode == 2,
+                    .maximum_dispatcher_iterations = budget,
+                });
+                defer module.deinit(self.allocator);
+                try std.testing.expect(!module.used_control_flow_fallback);
+                try std.testing.expectEqual(mode == 0, module.used_dispatcher);
+                try self.beginFrameDraw();
+                try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, module.words, &.{}, &.{}, GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height), null, &.{}, null, false, false, false, .{ .vertex_count = 3 });
+                if (mode == 0) {
+                    reference = self.graphics_probe_frame;
+                } else if (!std.mem.eql(u8, &reference, &self.graphics_probe_frame)) {
+                    std.debug.print("Branch diamond mismatch: choice={d} budget={d} mode={d}\n", .{ choice, budget, mode });
+                    return error.BranchDiamondMismatch;
+                }
+                if (budget != 256) continue;
+                const expected: [4]u8 = if (choice == 3) .{ 223, 223, 223, 223 } else if (choice % 2 == 0) .{ 96, 64, 96, 64 } else .{ 96, 191, 96, 191 };
+                var colored: usize = 0;
+                for (0..graphics_probe_width * graphics_probe_height) |pixel| {
+                    const rgba = self.graphics_probe_frame[pixel * 4 ..][0..4];
+                    if (rgba[1] == 0) continue;
+                    for (rgba, expected) |actual, want| try std.testing.expect(@abs(@as(i32, actual) - want) <= 1);
+                    colored += 1;
+                }
+                try std.testing.expect(colored > 100);
+            }
+        };
     }
 
     pub fn probeFragmentQuadBroadcasts(self: *Renderer) anyerror!void {
@@ -19217,6 +19311,7 @@ pub const Renderer = struct {
         const fragment_lease = self.graphics_translations.acquirePrepared(self.allocator, &fragment_analysis.program, .{
             .stage = .fragment,
             .structure_branch_loops = @atomicLoad(bool, &fragment_branch_loops, .monotonic),
+            .structure_short_fragment_loops = @atomicLoad(bool, &fragment_short_loops, .monotonic),
             .normalize_fragment_min = self.device_info.subgroup_size == 32 and self.device_info.fragment_subgroup_arithmetic,
             .fragment_quad_broadcasts = self.device_info.fragment_subgroup_quad,
             .layered_rendering = target.layout.layers > 1,
@@ -26010,6 +26105,8 @@ pub const Renderer = struct {
         .release = dcbRelease,
         .release_queued = dcbReleaseWasQueued,
         .drain_releases = dcbDrainReleases,
+        .seal_submission = dcbSealSubmission,
+        .poll_submission = dcbPollSubmission,
         .wait = dcbWait,
         .write_data = dcbWriteData,
         .dma_data = dcbDmaData,
@@ -26439,6 +26536,55 @@ pub const Renderer = struct {
             return false;
         };
         return true;
+    }
+
+    fn dcbSealSubmission(context: ?*anyopaque, ticket: *u64) bool {
+        const self = fromContext(context);
+        // Imported host pages need the synchronous lifetime contract.
+        if (!self.timeline_scheduler_enabled or self.imported_allocations.items.len != 0) return false;
+        self.finishDrawBatchRecording(false) catch |err| {
+            self.last_sync_error = err;
+            return false;
+        };
+        self.flushQueuedCommands() catch |err| {
+            self.last_sync_error = err;
+            return false;
+        };
+        ticket.* = self.submitted_tick;
+        return true;
+    }
+
+    fn dcbPollSubmission(context: ?*anyopaque, ticket: u64, wait: bool) gpu.DcbBackend.CompletionStatus {
+        const self = fromContext(context);
+        return self.pollSubmission(ticket, wait) catch |err| {
+            self.last_sync_error = err;
+            return .failed;
+        };
+    }
+
+    fn pollSubmission(self: *Renderer, ticket: u64, wait: bool) Error!gpu.DcbBackend.CompletionStatus {
+        if (wait) {
+            try self.waitForTick(ticket);
+        } else {
+            try self.refreshGpuProgress();
+        }
+        if (ticket > self.completed_tick) return .pending;
+        var count: usize = 0;
+        for (self.deferred_internal_releases[0..self.deferred_internal_release_count]) |release| {
+            if (release.tick > ticket) break;
+            count += 1;
+        }
+        if (count != 0) {
+            // Small storage output must precede its CPU completion label. A
+            // newer use can extend its lifetime beyond this ticket; polling
+            // must leave it pending instead of accidentally blocking on it.
+            if (!wait) for (self.guest_buffers.items) |entry| {
+                if (entry.gpu_dirty and entry.size < deferred_storage_write_min_bytes and
+                    entry.last_gpu_use > self.completed_tick) return .pending;
+            };
+            try self.drainInternalReleases(count);
+        }
+        return .complete;
     }
 
     fn drainSubmissionReleases(self: *Renderer) Error!void {
@@ -35544,6 +35690,47 @@ test "wait projection handles 64-bit release halves and ordered overwrites witho
     resident.size = 32;
     renderer.guest_buffers = .{ .items = @as(*[1]GuestBufferEntry, @ptrCast(&resident)), .capacity = 1 };
     try std.testing.expect(!renderer.readProjectedReleases(0x1000, &bytes));
+}
+
+test "submission polling preserves unfinished tickets and never waits for later storage output" {
+    const Mock = struct {
+        var tick: u64 = 6;
+        fn progress(_: vk.Device, _: vk.Semaphore, value: *u64) callconv(vk.call) vk.Result {
+            value.* = tick;
+            return vk.success;
+        }
+    };
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.device = @ptrFromInt(1);
+    renderer.device_functions.get_semaphore_counter_value = Mock.progress;
+    renderer.device_lost = false;
+    renderer.timeline_semaphore = 1;
+    renderer.submitted_tick = 9;
+    renderer.completed_tick = 0;
+    renderer.flat_memory_fault_failed = false;
+    renderer.pending_flat_fault_checks = .initEmpty();
+    renderer.sampled_fault_failed = false;
+    renderer.pending_sampled_fault_checks = .initEmpty();
+    renderer.deferred_vulkan_objects = .empty;
+    renderer.guest_buffers = .empty;
+    renderer.deferred_internal_release_count = 0;
+    Mock.tick = 6;
+    try std.testing.expectEqual(gpu.DcbBackend.CompletionStatus.pending, try renderer.pollSubmission(7, false));
+    Mock.tick = 7;
+    try std.testing.expectEqual(gpu.DcbBackend.CompletionStatus.complete, try renderer.pollSubmission(7, false));
+    // Publishing an earlier label also publishes small CPU-consumed output.
+    // A later writer must keep the poll pending instead of entering readback.
+    renderer.deferred_internal_releases[0] = .{ .tick = 7, .release = std.mem.zeroes(gpu.state.ReleaseMem) };
+    renderer.deferred_internal_release_count = 1;
+    var entry: GuestBufferEntry = undefined;
+    entry.gpu_dirty = true;
+    entry.size = 16;
+    entry.last_gpu_use = 9;
+    renderer.guest_buffers = .{ .items = @as(*[1]GuestBufferEntry, @ptrCast(&entry)), .capacity = 1 };
+    try std.testing.expectEqual(gpu.DcbBackend.CompletionStatus.pending, try renderer.pollSubmission(7, false));
+    try std.testing.expectEqual(@as(usize, 1), renderer.deferred_internal_release_count);
+    try std.testing.expectEqual(@as(u64, 7), renderer.completed_tick);
 }
 
 test "a descriptor reused after an intermediate flush remains reserved by queued draws" {

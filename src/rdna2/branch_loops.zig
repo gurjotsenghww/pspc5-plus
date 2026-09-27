@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Artur Strazewicz
 
 //! Proves a deliberately narrow structured CFG: disjoint natural loops with
-//! single latches and properly nested forward skips, breaks and continues.
+//! single latches, nested forward selections, terminal arms, breaks and continues.
 //! No shader instructions or SPIR-V IDs are changed while checking eligibility.
 const std = @import("std");
 const instruction = @import("instruction.zig");
@@ -14,6 +14,7 @@ pub const Block = struct {
     loop_header: u32 = none,
     latch: u32 = none,
     target: u32 = none,
+    merge: u32 = none,
     kind: Kind = .ordinary,
 };
 
@@ -41,17 +42,28 @@ pub fn analyze(a: std.mem.Allocator, instructions: []const instruction.Instructi
         const last = instructions[block.first_instruction + block.instruction_count - 1];
         if (last.opcode == .s_setpc_b64) return null;
         if (last.opcode.isProgramEnd()) {
-            if (index + 1 != blocks.len or blocks[index].loop_header != none) return null;
+            if (blocks[index].loop_header != none) return null;
         } else if (last.opcode.isBranch()) {
             const target = graph.blockForPc(last.branch_target) orelse return null;
             blocks[index].target = target;
             if (last.opcode == .s_branch) {
-                if (index != blocks[index].latch or target != blocks[index].loop_header) return null;
+                if (target <= index) {
+                    if (index != blocks[index].latch or target != blocks[index].loop_header) return null;
+                } else if (blocks[index].loop_header != none) return null;
             } else {
                 if (index == blocks[index].latch and target == blocks[index].loop_header) continue;
                 if (target <= index or index + 1 >= blocks.len) return null;
                 const owner = blocks[index];
                 blocks[index].kind = if (owner.loop_header != none and (target == owner.latch or target == owner.latch + 1)) .loop_exit else .selection;
+                if (blocks[index].kind == .selection) {
+                    // Ordinary reachability can circle around the latch and
+                    // mistake the fallthrough for an inner selection's merge.
+                    const merge = if (owner.loop_header != none) target else if (graph.selectionForHeader(index)) |selection| selection.merge else @as(u32, @intCast(blocks.len));
+                    if (merge <= index or target > merge) return null;
+                    // Inside loops preserve the original forward-skip proof.
+                    if (owner.loop_header != none and merge != target) return null;
+                    blocks[index].merge = merge;
+                }
             }
         } else if (index + 1 == blocks.len) return null;
     }
@@ -75,10 +87,22 @@ pub fn analyze(a: std.mem.Allocator, instructions: []const instruction.Instructi
     for (blocks, 0..) |block, i| {
         if (block.kind != .selection) continue;
         for (blocks, 0..) |other, j| {
-            if (other.kind == .selection and i < j and j < block.target and block.target < other.target) return null;
+            if (other.kind == .selection and i < j and j < block.merge and block.merge < other.merge) return null;
             if (other.loop_header != j) continue;
-            if ((i < j and j < block.target and block.target <= other.latch) or
-                (j <= i and i <= other.latch and other.latch < block.target)) return null;
+            if ((i < j and j < block.merge and block.merge <= other.latch) or
+                (j <= i and i <= other.latch and other.latch < block.merge)) return null;
+        }
+        // No predecessor may enter a selection body without its header. A
+        // forward jump may leave only through this selection's merge (or a
+        // terminal return); crossing regions keep the dispatcher.
+        for (graph.edges.items) |edge| {
+            const inside_source = i < edge.from and edge.from < block.merge;
+            const inside_target = i < edge.to and edge.to < block.merge;
+            if (inside_target and !inside_source and edge.from != i) return null;
+            if (inside_source and !inside_target and edge.to != block.merge) {
+                const source = blocks[edge.from];
+                if (source.kind != .loop_exit or source.loop_header != block.loop_header) return null;
+            }
         }
     }
     // Canonical loop-only graphs already have a dedicated lowering path with
@@ -94,6 +118,21 @@ pub fn analyze(a: std.mem.Allocator, instructions: []const instruction.Instructi
     if (canonical) return null;
     accepted = true;
     return blocks;
+}
+
+/// The automatic graphics path is narrower than the diagnostic full proof:
+/// one short loop plus forward if/else or terminal arms. Long and nested loops
+/// retain the established dispatcher until separately validated.
+pub fn shortFragmentLoop(instructions: []const instruction.Instruction, graph: *const control_flow.Graph, blocks: []const Block) bool {
+    if (graph.back_edge_count != 1) return false;
+    var diamond = false;
+    for (blocks, 0..) |block, i| {
+        if (block.loop_header == i and block.latch - i >= 4) return false;
+        if (block.kind == .selection and block.target != block.merge) diamond = true;
+        const guest = graph.blocks.items[i];
+        if (instructions[guest.first_instruction + guest.instruction_count - 1].opcode.isProgramEnd() and i + 1 < blocks.len) diamond = true;
+    }
+    return diamond;
 }
 
 test "branch loop proof accepts forward selections and rejects unsafe boundaries" {
@@ -127,5 +166,37 @@ test "branch loop proof accepts forward selections and rejects unsafe boundaries
         const plan = try analyze(a, &inst, &graph);
         defer if (plan) |blocks| a.free(blocks);
         try std.testing.expectEqual(variant < 2, plan != null);
+    }
+}
+
+test "short fragment loop proof admits diamonds and terminal arms with single entry" {
+    const a = std.testing.allocator;
+    const original = [_]instruction.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_scc1, .branch_target = 36 },
+        .{ .pc = 4, .opcode = .s_cbranch_scc0, .branch_target = 16 },
+        .{ .pc = 8, .opcode = .s_cbranch_scc1, .branch_target = 16 },
+        .{ .pc = 12, .opcode = .s_branch, .branch_target = 4 },
+        .{ .pc = 16, .opcode = .s_cbranch_scc0, .branch_target = 28 },
+        .{ .pc = 20, .opcode = .s_nop },
+        .{ .pc = 24, .opcode = .s_branch, .branch_target = 32 },
+        .{ .pc = 28, .opcode = .s_nop },
+        .{ .pc = 32, .opcode = .s_endpgm },
+        .{ .pc = 36, .opcode = .s_endpgm },
+    };
+    for (0..4) |variant| {
+        var inst = original;
+        switch (variant) {
+            0 => {},
+            1 => inst[0].branch_target = 8, // enter loop after its header
+            2 => inst[6].branch_target = 36, // cross the inner selection
+            3 => inst[3].branch_target = 0, // terminal arm exits a loop
+            else => unreachable,
+        }
+        var graph = try control_flow.buildInstructions(a, &inst);
+        defer graph.deinit(a);
+        const plan = try analyze(a, &inst, &graph);
+        defer if (plan) |blocks| a.free(blocks);
+        try std.testing.expectEqual(variant == 0, plan != null);
+        if (plan) |blocks| try std.testing.expect(shortFragmentLoop(&inst, &graph, blocks));
     }
 }

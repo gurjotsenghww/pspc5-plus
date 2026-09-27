@@ -399,6 +399,9 @@ pub const Options = struct {
     /// GPU probes pass, but a large native fragment still causes DeviceLost;
     /// retain the established dispatcher until that regression is isolated.
     structure_branch_loops: bool = false,
+    /// Automatically structure a single short fragment loop surrounded by
+    /// proven acyclic diamonds. Other loop shapes keep their existing path.
+    structure_short_fragment_loops: bool = false,
     /// Avoid out-of-range READLANE 63 in a proven packed-index fragment
     /// minimum reduction when the host subgroup has fewer than 64 lanes.
     normalize_fragment_min: bool = false,
@@ -11280,7 +11283,7 @@ fn branchLoopForwardLabel(blocks: []const BranchLoopBlock, labels: []const u32, 
     var i: usize = source + 1;
     while (i != 0) {
         i -= 1;
-        if (blocks[i].kind == .selection and blocks[i].target == target) return merges[i];
+        if (blocks[i].kind == .selection and blocks[i].merge == target) return merges[i];
     }
     return branchLoopEntry(blocks, labels, headers, target);
 }
@@ -11341,7 +11344,7 @@ fn translateBranchLoops(builder: *Builder, instructions: []const instruction.Ins
         var j: usize = i;
         while (j != 0) {
             j -= 1;
-            if (blocks[j].kind != .selection or blocks[j].target != i) continue;
+            if (blocks[j].kind != .selection or blocks[j].merge != i) continue;
             try builder.emit(&builder.body, 248, &.{merges[j]});
             const next = if (j == 0) branchLoopEntry(blocks, labels, headers, i) else branchLoopForwardLabel(blocks, labels, headers, merges, @intCast(j - 1), i);
             try builder.emit(&builder.body, 249, &.{next});
@@ -11378,7 +11381,8 @@ fn translateBranchLoops(builder: *Builder, instructions: []const instruction.Ins
             try builder.returnFromShader();
         } else if (last.opcode == .s_branch) {
             try storeMutableControlState(builder);
-            try builder.emit(&builder.body, 249, &.{headers[plan.loop_header]});
+            const target = if (plan.target <= i) headers[plan.loop_header] else branchLoopForwardLabel(blocks, labels, headers, merges, i, plan.target);
+            try builder.emit(&builder.body, 249, &.{target});
         } else if (last.opcode.isBranch()) {
             const predicate = directBranchCondition(last.opcode) orelse return Error.UnsupportedControlFlow;
             var condition = try structuredCondition(builder, predicate[0]);
@@ -11396,8 +11400,10 @@ fn translateBranchLoops(builder: *Builder, instructions: []const instruction.Ins
             }
             const taken = if (plan.kind == .loop_exit)
                 (if (plan.target == plan.latch) labels[plan.latch] else loop_merges[plan.loop_header])
+            else if (plan.target == plan.merge)
+                merges[i]
             else
-                merges[i];
+                branchLoopForwardLabel(blocks, labels, headers, merges, i, plan.target);
             const fallthrough = if (plan.kind == .loop_exit) merges[i] else branchLoopForwardLabel(blocks, labels, headers, merges, i, i + 1);
             try builder.emit(&builder.body, 247, &.{ merges[i], 0 });
             try builder.emit(&builder.body, 250, &.{ condition, taken, fallthrough });
@@ -11405,6 +11411,13 @@ fn translateBranchLoops(builder: *Builder, instructions: []const instruction.Ins
             try storeMutableControlState(builder);
             try builder.emit(&builder.body, 249, &.{branchLoopForwardLabel(blocks, labels, headers, merges, i, i + 1)});
         }
+    }
+    // A selection whose arms terminate has no guest post-dominator. SPIR-V
+    // still requires a unique merge label, which is deliberately unreachable.
+    for (blocks, 0..) |plan, i| {
+        if (plan.kind != .selection or plan.merge != blocks.len) continue;
+        try builder.emit(&builder.body, 248, &.{merges[i]});
+        try builder.emit(&builder.body, 255, &.{}); // OpUnreachable
     }
 }
 
@@ -12264,10 +12277,17 @@ fn translateInstructions(
         for (instructions) |inst| try lowerDiagnosed(&builder, inst);
         try builder.returnFromShader();
     } else {
-        const branch_loop_plan = if (effective.structure_branch_loops and !effective.report_dispatcher_exhaustion)
+        var branch_loop_plan = if ((effective.structure_branch_loops or
+            (effective.structure_short_fragment_loops and effective.stage == .fragment)) and !effective.report_dispatcher_exhaustion)
             try @import("branch_loops.zig").analyze(allocator, instructions, &graph)
         else
             null;
+        if (branch_loop_plan) |plan| {
+            if (!effective.structure_branch_loops and !@import("branch_loops.zig").shortFragmentLoop(instructions, &graph, plan)) {
+                allocator.free(plan);
+                branch_loop_plan = null;
+            }
+        }
         defer if (branch_loop_plan) |plan| allocator.free(plan);
         const structured_result = if (branch_loop_plan) |plan|
             translateBranchLoops(&builder, instructions, &graph, plan)

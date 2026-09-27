@@ -224,6 +224,116 @@ var batched_release_count: usize = 0;
 threadlocal var sdk11_dcb_release_capture: bool = false;
 threadlocal var sdk11_dcb_release_candidate: ?gpu.state.ReleaseMem = null;
 
+// Renderer tickets belong to submissions, never to the next call that happens
+// to poll the device. Keep their notifications and captured driver sequences
+// together until the entire ticket (including commands after EOP) retires.
+const SubmissionBatch = struct {
+    id: u64 = 0,
+    ticket: ?u64 = null,
+    driver_label: u64 = 0,
+    notify_dcb: bool = false,
+    contexts: std.ArrayList(ReleaseContext) = .empty,
+    retirements: std.ArrayList(CapturedRetirement) = .empty,
+    pending_notes: usize = 0,
+    failed: bool = false,
+};
+const completion_allocator = std.heap.page_allocator;
+var submission_batches: [64]SubmissionBatch = @splat(.{});
+var submission_batch_head: usize = 0;
+var submission_batch_count: usize = 0;
+var next_submission_batch_id: u64 = 0;
+var active_submission_batch: ?usize = null;
+var completion_batch_async_allowed: bool = false;
+var asynchronous_submission_count: u64 = 0;
+var synchronous_submission_count: u64 = 0;
+pub var asynchronous_submissions: bool = true;
+
+fn submissionBatch(id: u64) ?*SubmissionBatch {
+    if (id == 0) return null;
+    for (0..submission_batch_count) |offset| {
+        const batch = &submission_batches[(submission_batch_head + offset) % submission_batches.len];
+        if (batch.id == id) return batch;
+    }
+    return null;
+}
+
+fn recordOwnedRelease(batch: *SubmissionBatch, value: gpu.state.ReleaseMem, event_id: u32, retirement: ?CapturedRetirement) void {
+    if (retirement) |captured| {
+        batch.retirements.append(completion_allocator, captured) catch {
+            batch.failed = true;
+        };
+    }
+    if (value.interrupt != 1 and value.interrupt != 2 and value.interrupt != 4) return;
+    const context = ReleaseContext{ .event_id = event_id, .context_id = value.interrupt_context_id };
+    for (batch.contexts.items) |previous| {
+        if (std.meta.eql(previous, context)) return;
+    }
+    batch.contexts.append(completion_allocator, context) catch {
+        batch.failed = true;
+    };
+}
+
+fn retireSubmissionBatch(publish: bool) void {
+    const batch = &submission_batches[submission_batch_head];
+    if (publish and !batch.failed and batch.pending_notes == 0) {
+        for (batch.retirements.items) |retirement| publishCapturedRetirement(retirement);
+        if (batch.driver_label != 0) {
+            if (batch.contexts.items.len != 0) publishDriverCompletionLabel(batch.driver_label) else enqueueCompletion(.{ .kind = .driver_label, .address = batch.driver_label });
+        }
+        for (batch.contexts.items) |context| {
+            _ = deliverCompletion(.{ .kind = .release, .event_id = context.event_id, .context_id = context.context_id });
+        }
+        if (batch.notify_dcb) enqueueCompletion(.{ .kind = .dcb });
+    }
+    // A failed/detached renderer must not leave notes that a later renderer
+    // could match to a reused address and accidentally publish.
+    var index: usize = 0;
+    while (index < deferred_release_note_count) {
+        const note = deferred_release_notes[index];
+        if (note.batch_id == batch.id) {
+            _ = removeDeferredRelease(note.id);
+        } else {
+            index += 1;
+        }
+    }
+    batch.contexts.clearRetainingCapacity();
+    batch.retirements.clearRetainingCapacity();
+    batch.id = 0;
+    submission_batch_head = (submission_batch_head + 1) % submission_batches.len;
+    submission_batch_count -= 1;
+}
+
+// Caller owns execution_lock. A nonblocking poll never advances an unfinished
+// head, even if a later submission uses the same event ID or label address.
+fn drainSubmissionBatches(wait: bool) void {
+    const backend = installed_backend orelse return;
+    const poll = backend.vtable.poll_submission orelse return;
+    while (submission_batch_count != 0) {
+        const batch = &submission_batches[submission_batch_head];
+        const ticket = batch.ticket orelse break; // the current open batch
+        switch (poll(backend.context, ticket, wait)) {
+            .pending => return,
+            .complete => {
+                if (batch.pending_notes != 0) return;
+                retireSubmissionBatch(true);
+            },
+            .failed => retireSubmissionBatch(false),
+        }
+    }
+}
+
+fn synchronizeSubmissionBatches() void {
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    drainSubmissionBatches(true);
+}
+
+fn pollSubmissionBatches() void {
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    drainSubmissionBatches(false);
+}
+
 fn sleepCompletionWorker() void {
     if (comptime builtin.os.tag == .windows) {
         var interval: i64 = -10_000; // one millisecond in relative 100-ns units
@@ -236,6 +346,7 @@ fn sleepCompletionWorker() void {
 fn completionWorkerMain() void {
     while (kernel_runtime.activeIo() != null and !kernel_runtime.guestStopRequested()) {
         sleepCompletionWorker();
+        pollSubmissionBatches();
         drainCompletionNotifications();
         // The thread waiting on a builder-written fence can be spinning in
         // guest code without making a single firmware call, so this is the
@@ -245,14 +356,15 @@ fn completionWorkerMain() void {
     completion_worker_started.store(false, .release);
 }
 
-fn ensureCompletionWorker() void {
-    if (kernel_runtime.activeIo() == null or
-        completion_worker_started.swap(true, .acq_rel)) return;
+fn ensureCompletionWorker() bool {
+    if (kernel_runtime.activeIo() == null) return false;
+    if (completion_worker_started.swap(true, .acq_rel)) return true;
     const thread = std.Thread.spawn(.{}, completionWorkerMain, .{}) catch {
         completion_worker_started.store(false, .release);
-        return;
+        return false;
     };
     thread.detach();
+    return true;
 }
 
 fn enqueueCompletion(completion: PendingCompletion) void {
@@ -275,11 +387,33 @@ fn enqueueCompletion(completion: PendingCompletion) void {
     pending_completions[tail] = deferred;
     pending_completion_count += 1;
     completion_lock.unlock();
-    ensureCompletionWorker();
+    _ = ensureCompletionWorker();
 }
 
 fn beginCompletionBatch() void {
     std.debug.assert(!completion_batch_active);
+    drainSubmissionBatches(false);
+    active_submission_batch = null;
+    completion_batch_async_allowed = false;
+    if (installed_backend) |backend| {
+        if (asynchronous_submissions and backend.vtable.seal_submission != null and backend.vtable.poll_submission != null) {
+            if (submission_batch_count == submission_batches.len) drainSubmissionBatches(true);
+            if (submission_batch_count < submission_batches.len) {
+                const index = (submission_batch_head + submission_batch_count) % submission_batches.len;
+                const batch = &submission_batches[index];
+                next_submission_batch_id +%= 1;
+                if (next_submission_batch_id == 0) next_submission_batch_id = 1;
+                batch.id = next_submission_batch_id;
+                batch.ticket = null;
+                batch.driver_label = 0;
+                batch.notify_dcb = false;
+                batch.pending_notes = 0;
+                batch.failed = false;
+                active_submission_batch = index;
+                submission_batch_count += 1;
+            }
+        }
+    }
     completion_batch_active = true;
     batched_driver_completion_label = 0;
     batched_release_count = 0;
@@ -288,6 +422,33 @@ fn beginCompletionBatch() void {
 fn finishCompletionBatch() void {
     std.debug.assert(completion_batch_active);
     completion_batch_active = false;
+    if (active_submission_batch) |index| {
+        active_submission_batch = null;
+        const batch = &submission_batches[index];
+        batch.driver_label = batched_driver_completion_label;
+        batched_driver_completion_label = 0;
+        batched_release_count = 0;
+        const backend = installed_backend.?;
+        var ticket: u64 = 0;
+        if (completion_batch_async_allowed and backend.vtable.seal_submission.?(backend.context, &ticket)) {
+            batch.ticket = ticket;
+            asynchronous_submission_count +|= 1;
+            if (asynchronous_submission_count <= 8) std.debug.print("[agc completion] async batch={d} ticket={d} labels={d} contexts={d}\n", .{
+                batch.id, ticket, batch.pending_notes, batch.contexts.items.len,
+            });
+            drainSubmissionBatches(false);
+            if (!ensureCompletionWorker() and !builtin.is_test) drainSubmissionBatches(true);
+            return;
+        }
+        // Unsupported ownership cases retain the synchronous contract. Drain
+        // older tickets first so this batch cannot overtake their interrupts.
+        synchronous_submission_count +|= 1;
+        drainSubmissionBatches(true);
+        const ok = drainBackendReleases();
+        std.debug.assert(submission_batch_head == index);
+        retireSubmissionBatch(ok);
+        return;
+    }
     if (!drainBackendReleases()) {
         batched_driver_completion_label = 0;
         batched_release_count = 0;
@@ -314,6 +475,16 @@ fn finishCompletionBatch() void {
 fn discardCompletionBatch() void {
     std.debug.assert(completion_batch_active);
     completion_batch_active = false;
+    if (active_submission_batch) |index| {
+        active_submission_batch = null;
+        drainSubmissionBatches(true);
+        _ = drainBackendReleases();
+        std.debug.assert(submission_batch_head == index);
+        retireSubmissionBatch(false);
+        batched_driver_completion_label = 0;
+        batched_release_count = 0;
+        return;
+    }
     _ = drainBackendReleases();
     batched_driver_completion_label = 0;
     batched_release_count = 0;
@@ -1406,6 +1577,8 @@ const DeferredReleaseNote = struct {
     id: u64,
     release: gpu.state.ReleaseMem,
     event_id: u32,
+    batch_id: u64,
+    retirement: ?CapturedRetirement,
 };
 var deferred_release_notes: [256]DeferredReleaseNote = undefined;
 var deferred_release_note_count: usize = 0;
@@ -1415,7 +1588,15 @@ fn noteDeferredRelease(value: gpu.state.ReleaseMem, event_id: u32) ?u64 {
     if (deferred_release_note_count == deferred_release_notes.len) return null;
     next_deferred_release_id +%= 1;
     const id = next_deferred_release_id;
-    deferred_release_notes[deferred_release_note_count] = .{ .id = id, .release = value, .event_id = event_id };
+    const batch = if (active_submission_batch) |index| &submission_batches[index] else null;
+    deferred_release_notes[deferred_release_note_count] = .{
+        .id = id,
+        .release = value,
+        .event_id = event_id,
+        .batch_id = if (batch) |owner| owner.id else 0,
+        .retirement = if (batch != null) captureRetirement(value) else null,
+    };
+    if (batch) |owner| owner.pending_notes += 1;
     deferred_release_note_count += 1;
     return id;
 }
@@ -1423,6 +1604,7 @@ fn noteDeferredRelease(value: gpu.state.ReleaseMem, event_id: u32) ?u64 {
 fn removeDeferredRelease(id: u64) bool {
     for (deferred_release_notes[0..deferred_release_note_count], 0..) |note, index| {
         if (note.id != id) continue;
+        if (submissionBatch(note.batch_id)) |batch| batch.pending_notes -= 1;
         deferred_release_note_count -= 1;
         std.mem.copyForwards(
             DeferredReleaseNote,
@@ -1442,6 +1624,10 @@ pub fn observeDeferredRelease(value: gpu.state.ReleaseMem) void {
         if (note.release.address != value.address or note.release.data != value.data or
             note.release.data_selection != value.data_selection) continue;
         _ = removeDeferredRelease(note.id);
+        if (note.batch_id != 0) {
+            if (submissionBatch(note.batch_id)) |batch| recordOwnedRelease(batch, note.release, note.event_id, note.retirement);
+            return;
+        }
         publishSynchronousRetirement(note.release);
         triggerReleaseInterrupt(note.release, note.event_id);
         return;
@@ -1450,6 +1636,10 @@ pub fn observeDeferredRelease(value: gpu.state.ReleaseMem) void {
 
 fn triggerReleaseInterrupt(value: gpu.state.ReleaseMem, event_id: u32) void {
     if (value.interrupt != 1 and value.interrupt != 2 and value.interrupt != 4) return;
+    if (active_submission_batch) |index| {
+        recordOwnedRelease(&submission_batches[index], value, event_id, null);
+        return;
+    }
     if (completion_batch_active) {
         // One interrupt handler pass retires every completed node in its ring.
         // Coalesce the many release packets emitted under one submission and
@@ -1463,18 +1653,52 @@ fn triggerReleaseInterrupt(value: gpu.state.ReleaseMem, event_id: u32) void {
     enqueueCompletion(.{ .kind = .release, .event_id = event_id, .context_id = value.interrupt_context_id });
 }
 
+const CapturedRetirement = struct {
+    release: gpu.state.ReleaseMem,
+    issued: u64,
+};
+
+fn captureRetirement(value: gpu.state.ReleaseMem) ?CapturedRetirement {
+    if (value.data_selection != 2 or value.address < 0x40 or value.address & 0xf != 0 or value.address & 0xfff < 0x40) return null;
+    var state: [32]u8 = undefined;
+    var retired_bytes: [8]u8 = undefined;
+    if (!readGuestMemory(null, value.address - 0x20, &state) or !readGuestMemory(null, value.address - 0x40, &retired_bytes)) return null;
+    const issued = synchronousRetirementValue(
+        value.address,
+        value.data,
+        std.mem.readInt(u64, state[0..8], .little),
+        std.mem.readInt(u64, state[8..16], .little),
+        std.mem.readInt(u64, state[16..24], .little),
+        std.mem.readInt(u64, state[24..32], .little),
+        value.data, // the release has not reached memory yet
+        std.mem.readInt(u64, &retired_bytes, .little),
+    ) orelse return null;
+    return .{ .release = value, .issued = issued };
+}
+
+fn publishCapturedRetirement(captured: CapturedRetirement) void {
+    publishRetirement(captured.release, captured.issued);
+}
+
+fn completeRelease(value: gpu.state.ReleaseMem, event_id: u32) void {
+    if (active_submission_batch) |index| {
+        recordOwnedRelease(&submission_batches[index], value, event_id, captureRetirement(value));
+    } else {
+        publishSynchronousRetirement(value);
+        triggerReleaseInterrupt(value, event_id);
+    }
+}
+
 /// Some AGC runtimes keep a CPU retirement label immediately before their
 /// hardware EOP label. The real interrupt handler advances the former after
-/// observing the latter. Our renderer completes a submitted DCB synchronously,
-/// but the approximate interrupt path does not know this private driver
-/// structure, leaving the CPU label at zero. Unity then busy-polls it for the
-/// full three-second watchdog timeout before every frame.
+/// observing the latter. Leaving this private driver label at zero makes
+/// Unity busy-poll until its three-second watchdog timeout before every frame.
 ///
-/// Recognize the observed self-describing layout conservatively and publish
-/// the driver's issued sequence. This is valid for the synchronous backend:
-/// the submitting guest thread cannot regain control until the whole stream
-/// has completed. Unrelated release labels fail the signature, pointer,
-/// padding, and bounded-sequence checks and remain untouched.
+/// Recognize the self-describing layout conservatively. A synchronous caller
+/// may publish the current issued sequence after the stream completes. An
+/// asynchronous caller captures that sequence at submission and publishes it
+/// only after its ticket retires. Unrelated labels fail the signature, pointer,
+/// padding and bounded-sequence checks and remain untouched.
 fn synchronousRetirementValue(
     release_address: u64,
     release_data: u64,
@@ -1498,6 +1722,10 @@ fn synchronousRetirementValue(
 }
 
 fn publishSynchronousRetirement(value: gpu.state.ReleaseMem) void {
+    publishRetirement(value, null);
+}
+
+fn publishRetirement(value: gpu.state.ReleaseMem, captured_issued: ?u64) void {
     if (value.data_selection != 2 or
         value.address < 0x40 or
         value.address & 0xf != 0 or
@@ -1511,7 +1739,9 @@ fn publishSynchronousRetirement(value: gpu.state.ReleaseMem) void {
     if (!readGuestMemory(null, value.address - 0x20, &state)) return;
     const signature = std.mem.readInt(u64, state[0..8], .little);
     const retirement_address = std.mem.readInt(u64, state[8..16], .little);
-    const issued = std.mem.readInt(u64, state[16..24], .little);
+    const current_issued = std.mem.readInt(u64, state[16..24], .little);
+    const issued = captured_issued orelse current_issued;
+    if (issued > current_issued) return;
     const reserved = std.mem.readInt(u64, state[24..32], .little);
     const completed = std.mem.readInt(u64, state[32..40], .little);
     if (signature != 0x0000_0002_0000_0000 or
@@ -1630,8 +1860,7 @@ fn backendRelease(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
                 return true;
             }
             if (accepted and notification_pending) {
-                publishSynchronousRetirement(value);
-                triggerReleaseInterrupt(value, event_id);
+                completeRelease(value, event_id);
             }
             return accepted;
         }
@@ -1663,9 +1892,8 @@ fn backendRelease(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
         else => true,
     };
     if (ok) {
-        publishSynchronousRetirement(value);
+        completeRelease(value, event_id);
         kernel_runtime.wakeSyncAddress(value.address, std.math.maxInt(usize));
-        triggerReleaseInterrupt(value, event_id);
     }
     return ok;
 }
@@ -1927,7 +2155,10 @@ pub fn setParallelCommandExecution(enabled: bool) void {
 pub fn attachBackend(backend: ?gpu.DcbBackend) void {
     execution_lock.lock();
     defer execution_lock.unlock();
+    drainSubmissionBatches(true);
     _ = drainBackendReleases();
+    while (submission_batch_count != 0) retireSubmissionBatch(false);
+    deferred_release_note_count = 0;
     installed_backend = backend;
     if (backend == null) submission_scheduler.command_pool.deinit();
 }
@@ -1946,6 +2177,17 @@ pub fn reset() void {
     defer execution_lock.unlock();
     gpu.parallel_copy.guest_copy_pool.deinit();
     installed_backend = null;
+    for (&submission_batches) |*batch| {
+        batch.contexts.deinit(completion_allocator);
+        batch.retirements.deinit(completion_allocator);
+        batch.* = .{};
+    }
+    submission_batch_head = 0;
+    submission_batch_count = 0;
+    active_submission_batch = null;
+    completion_batch_async_allowed = false;
+    asynchronous_submission_count = 0;
+    synchronous_submission_count = 0;
     deferred_release_note_count = 0;
     next_deferred_release_id = 0;
     submission_scheduler.deinit();
@@ -2081,6 +2323,8 @@ pub const SubmitOutcome = struct {
     queued_interrupt: bool = false,
     presented: bool = false,
     last_release: ?gpu.state.ReleaseMem = null,
+    /// The renderer ticket owns the public call's synthetic completion too.
+    completion_owned: bool = false,
 };
 
 /// AGC emits its own graphics event for RELEASE_MEM packets that request an
@@ -2509,6 +2753,7 @@ fn executeAcceptedStream(
     stream: []const u32,
     driver_completion_label: ?u64,
     event_id: u32,
+    own_public_completion: bool,
 ) SubmitOutcome {
     rememberSubmissionAlias(stream);
     noteBuilderArenaExecuted(stream);
@@ -2569,6 +2814,16 @@ fn executeAcceptedStream(
     if (outcome.accepted) {
         batched_driver_completion_label = driver_completion_label orelse 0;
     }
+    if (active_submission_batch) |index| {
+        if (own_public_completion and outcome.accepted and std.mem.eql(u8, label, "dcb")) {
+            submission_batches[index].notify_dcb = !outcome.queued_interrupt;
+            outcome.completion_owned = true;
+        }
+    }
+    // Private SDK11 bridges synchronize before writing their generation.
+    // Synthetic DCB events remain delayed, but only start their grace period
+    // after the GPU ticket completes. Compute has no synthetic event.
+    completion_batch_async_allowed = outcome.completed and sdk11_acb_label_page.load(.acquire) == 0;
     return outcome;
 }
 
@@ -2622,7 +2877,7 @@ fn flushPendingGraphicsSegment() void {
 pub fn submitDeviceStream(stream: []const u32) SubmitOutcome {
     drainCompletionNotifications();
     announce("dcb", stream);
-    return executeAcceptedStream("dcb", stream, null, 0);
+    return executeAcceptedStream("dcb", stream, null, 0, false);
 }
 
 /// Advance both queues and soft-satisfy any permanent WAIT_REG_MEM heads.
@@ -2903,7 +3158,7 @@ fn acceptSubmitted(label: []const u8, stream: []const u32, driver_completion_lab
     else
         stream;
     announce(label, commands);
-    return executeAcceptedStream(label, commands, driver_completion_label, event_id);
+    return executeAcceptedStream(label, commands, driver_completion_label, event_id, true);
 }
 
 /// Includes the driver-owned EOP packet placed immediately before a DCB.
@@ -3367,6 +3622,10 @@ fn publishSdk11AcbDriverGeneration(
         target = label;
         generation = @truncate(packet.data);
     }
+    // The queue object has proved an SDK-private generation write. Preserve
+    // that synchronous bridge until its full metadata can be owned by a ticket.
+    synchronizeSubmissionBatches();
+    if (found) |queue| if (release) |packet| observeSdk11AcbLabelPage(owner, queue, submission, packet);
     var previous: [8]u8 = undefined;
     if (!readGuestMemory(null, target, &previous)) return;
     const old = std.mem.readInt(u64, &previous, .little);
@@ -3485,6 +3744,7 @@ fn publishSdk11DcbDriverGeneration(
     // bridge identifies, not in whatever page this packet's own fence occupies.
     const label_page = sdk11_acb_label_page.load(.acquire);
     if (label_page == 0) return;
+    synchronizeSubmissionBatches();
     const target = label_page + @as(u64, queue.label_index) * 0x20;
     const generation: u64 = queue.generation;
     var previous: [8]u8 = undefined;
@@ -3534,6 +3794,19 @@ fn publishSdk11AcbRetirement(release: gpu.state.ReleaseMem) void {
         release.address > std.math.maxInt(u64) - 0x68) return;
     var labels: [0x88]u8 = undefined;
     if (!readGuestMemory(null, release.address - 0x20, &labels)) return;
+    // Recognize the immutable slot topology before waiting. An unrelated EOP
+    // (the common path) must not turn every ACB back into a host fence wait.
+    _ = adjacentAcbRetirementValue(
+        release.address,
+        release.data,
+        std.mem.readInt(u64, labels[0x00..0x08], .little),
+        release.data,
+        std.mem.readInt(u64, labels[0x40..0x48], .little),
+        std.mem.readInt(u64, labels[0x60..0x68], .little),
+        std.mem.readInt(u64, labels[0x80..0x88], .little),
+    ) orelse return;
+    synchronizeSubmissionBatches();
+    if (!readGuestMemory(null, release.address - 0x20, &labels)) return;
     const previous = std.mem.readInt(u64, labels[0x00..0x08], .little);
     const completed = std.mem.readInt(u64, labels[0x20..0x28], .little);
     const next = std.mem.readInt(u64, labels[0x40..0x48], .little);
@@ -3570,7 +3843,8 @@ fn publishSdk11AcbRetirement(release: gpu.state.ReleaseMem) void {
 /// A public graphics submission without an explicit interrupt still needs the
 /// same AGC completion fanout that an interrupting RELEASE_MEM would publish.
 fn publishDcbCompletion(outcome: SubmitOutcome) void {
-    if (!outcome.accepted or outcome.queued_interrupt) return;
+    if (!outcome.accepted or outcome.queued_interrupt or outcome.completion_owned) return;
+    synchronizeSubmissionBatches();
     enqueueCompletion(.{ .kind = .dcb });
 }
 
@@ -4394,6 +4668,230 @@ test "indirect DCB payload supersedes a recycled submission header" {
     const outcome = submitDeviceStream(&root);
     try testing.expect(outcome.accepted and outcome.completed);
     try testing.expectEqual(value, allocation[62]);
+}
+
+const TicketAudit = struct {
+    issued: u64 = 0,
+    completed: u64 = 0,
+    waits: usize = 0,
+    failed: bool = false,
+    notes: std.ArrayList(struct { tick: u64, value: gpu.state.ReleaseMem }) = .empty,
+
+    fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+        return false;
+    }
+    fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+        return false;
+    }
+    fn release(raw: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.notes.append(testing.allocator, .{ .tick = self.issued + 1, .value = value }) catch return false;
+        return true;
+    }
+    fn queued(_: ?*anyopaque) bool {
+        return true;
+    }
+    fn seal(raw: ?*anyopaque, ticket: *u64) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.issued += 1;
+        ticket.* = self.issued;
+        return true;
+    }
+    fn poll(raw: ?*anyopaque, ticket: u64, wait: bool) gpu.DcbBackend.CompletionStatus {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.failed) return .failed;
+        if (wait) {
+            self.waits += 1;
+            self.completed = @max(ticket, self.completed);
+        }
+        if (ticket > self.completed) return .pending;
+        while (self.notes.items.len != 0 and self.notes.items[0].tick <= ticket) {
+            const note = self.notes.orderedRemove(0);
+            if (note.value.address != 0) {
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, note.value.data, .little);
+                if (!writeGuestMemory(null, note.value.address, &bytes)) return .failed;
+            }
+            observeDeferredRelease(note.value);
+        }
+        return .complete;
+    }
+    fn drain(raw: ?*anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        return poll(raw, self.issued + 1, true) == .complete;
+    }
+    const vtable = gpu.DcbBackend.VTable{
+        .read = read,
+        .write = write,
+        .release = release,
+        .release_queued = queued,
+        .drain_releases = drain,
+        .seal_submission = seal,
+        .poll_submission = poll,
+    };
+};
+
+test "submission tickets retain release ownership across later batches and backend failure" {
+    reset();
+    defer reset();
+    var address_space = try guest_address_space.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    memory.attachAddressSpace(&address_space);
+    defer memory.attachAddressSpace(null);
+    var audit = TicketAudit{};
+    defer audit.notes.deinit(testing.allocator);
+    attachBackend(.{ .context = &audit, .vtable = &TicketAudit.vtable });
+    var busy = [_]u64{ 17, 18, 19 };
+    var labels = [_]u64{ 0, 0, 0 };
+    var value = std.mem.zeroes(gpu.state.ReleaseMem);
+    value.data_selection = 2;
+    value.data = 123;
+    value.interrupt = 2;
+    value.interrupt_context_id = 38;
+    value.address = @intFromPtr(&labels[0]);
+    beginCompletionBatch();
+    completion_batch_async_allowed = true;
+    batched_driver_completion_label = @intFromPtr(&busy[0]);
+    try testing.expect(backendRelease(@ptrFromInt(0x52), value));
+    finishCompletionBatch();
+    try testing.expectEqual(@as(usize, 1), submission_batch_count);
+    try testing.expectEqual(@as(u64, 17), busy[0]);
+    try testing.expectEqual(@as(u64, 0), labels[0]);
+    try testing.expectEqual(@as(usize, 0), audit.waits);
+
+    beginCompletionBatch();
+    const second = active_submission_batch.?;
+    audit.completed = 1;
+    // An old label can publish from inside the next draw. Its context must
+    // remain attached to ticket 1, never to the currently recording ticket 2.
+    try testing.expectEqual(gpu.DcbBackend.CompletionStatus.complete, TicketAudit.poll(&audit, 1, false));
+    try testing.expectEqual(@as(usize, 0), submission_batches[second].contexts.items.len);
+    try testing.expectEqual(@as(u32, 0x52), submission_batches[submission_batch_head].contexts.items[0].event_id);
+    try testing.expectEqual(@as(u64, 17), busy[0]); // EOP alone does not retire the batch
+    completion_batch_async_allowed = true;
+    batched_driver_completion_label = @intFromPtr(&busy[1]);
+    value.address = @intFromPtr(&labels[1]);
+    value.interrupt_context_id = 39;
+    try testing.expect(backendRelease(@ptrFromInt(0x53), value));
+    finishCompletionBatch();
+    try testing.expectEqual(@as(u64, 0), busy[0]);
+    try testing.expectEqual(@as(u64, 18), busy[1]);
+    try testing.expectEqual(@as(usize, 1), submission_batch_count);
+    try testing.expectEqual(@as(usize, 1), deferred_release_note_count);
+    audit.completed = 2;
+    drainSubmissionBatches(false);
+    try testing.expectEqual(@as(u64, 0), busy[1]);
+    try testing.expectEqual(@as(u64, 123), labels[1]);
+    try testing.expectEqual(@as(usize, 0), deferred_release_note_count);
+    try testing.expectEqual(@as(usize, 0), submission_batch_count);
+    try testing.expectEqual(@as(usize, 0), audit.waits);
+
+    beginCompletionBatch();
+    completion_batch_async_allowed = true;
+    batched_driver_completion_label = @intFromPtr(&busy[2]);
+    value.address = @intFromPtr(&labels[2]);
+    try testing.expect(backendRelease(null, value));
+    finishCompletionBatch();
+    audit.failed = true;
+    drainSubmissionBatches(false);
+    try testing.expectEqual(@as(u64, 19), busy[2]);
+    try testing.expectEqual(@as(u64, 0), labels[2]);
+    try testing.expectEqual(@as(usize, 0), deferred_release_note_count);
+    try testing.expectEqual(@as(usize, 0), submission_batch_count);
+    observeDeferredRelease(value); // stale callbacks cannot resurrect a failed ticket
+    try testing.expectEqual(@as(usize, 0), pending_completion_count);
+}
+
+test "submission ticket capacity applies backpressure and detach drains remaining work" {
+    reset();
+    defer reset();
+    var audit = TicketAudit{};
+    defer audit.notes.deinit(testing.allocator);
+    attachBackend(.{ .context = &audit, .vtable = &TicketAudit.vtable });
+    for (0..submission_batches.len + 1) |_| {
+        beginCompletionBatch();
+        completion_batch_async_allowed = true;
+        finishCompletionBatch();
+    }
+    try testing.expectEqual(@as(usize, 1), submission_batch_count);
+    try testing.expectEqual(submission_batches.len, audit.waits);
+    attachBackend(null);
+    try testing.expectEqual(@as(usize, 0), submission_batch_count);
+    try testing.expect(audit.completed >= audit.issued);
+}
+
+test "silent graphics submissions defer their single synthetic event until the ticket retires" {
+    reset();
+    defer reset();
+    var audit = TicketAudit{};
+    defer audit.notes.deinit(testing.allocator);
+    attachBackend(.{ .context = &audit, .vtable = &TicketAudit.vtable });
+    const stream = [_]u32{ command(gpu.pm4.nop, 1), 0 };
+    try testing.expectEqual(errno.ok, submitCommandBuffer(0, &stream, stream.len));
+    try testing.expectEqual(@as(usize, 1), submission_batch_count);
+    try testing.expectEqual(@as(usize, 0), pending_completion_count);
+    try testing.expectEqual(@as(usize, 0), audit.waits);
+    audit.completed = audit.issued;
+    drainSubmissionBatches(false);
+    try testing.expectEqual(@as(usize, 0), submission_batch_count);
+    try testing.expectEqual(@as(usize, 1), pending_completion_count);
+    try testing.expectEqual(CompletionKind.dcb, pending_completions[pending_completion_head].kind);
+    drainSubmissionBatches(false);
+    try testing.expectEqual(@as(usize, 1), pending_completion_count);
+}
+
+test "ordinary compute submissions defer their completion without a synthetic graphics event" {
+    reset();
+    defer reset();
+    var address_space = try guest_address_space.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    memory.attachAddressSpace(&address_space);
+    defer memory.attachAddressSpace(null);
+    var audit = TicketAudit{};
+    defer audit.notes.deinit(testing.allocator);
+    attachBackend(.{ .context = &audit, .vtable = &TicketAudit.vtable });
+    var page: [512]u64 align(4096) = @splat(0);
+    const address = @intFromPtr(&page[16]);
+    const stream = [_]u32{
+        command(gpu.pm4.release_mem, 7),           0x28,
+        (@as(u32, 2) << 29) | (@as(u32, 1) << 16), @truncate(address),
+        @truncate(address >> 32),                  37,
+        0,                                         0,
+    };
+    const addresses = [_]?[*]const u32{&stream};
+    const lengths = [_]u32{stream.len};
+    try testing.expectEqual(errno.ok, submitMultiAcbs(0x52, &addresses, &lengths, 1));
+    try testing.expectEqual(@as(u64, 0), page[16]);
+    try testing.expectEqual(@as(usize, 1), submission_batch_count);
+    try testing.expectEqual(@as(usize, 0), audit.waits);
+    audit.completed = audit.issued;
+    drainSubmissionBatches(false);
+    try testing.expectEqual(@as(u64, 37), page[16]);
+    try testing.expectEqual(@as(usize, 0), pending_completion_count);
+}
+
+test "asynchronous retirement cannot advance to a later issued sequence" {
+    var address_space = try guest_address_space.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    memory.attachAddressSpace(&address_space);
+    defer memory.attachAddressSpace(null);
+    var page: [512]u64 align(4096) = @splat(0);
+    page[12] = 0x0000_0002_0000_0000;
+    page[13] = @intFromPtr(&page[8]);
+    page[14] = 88;
+    var value = std.mem.zeroes(gpu.state.ReleaseMem);
+    value.address = @intFromPtr(&page[16]);
+    value.data_selection = 2;
+    value.data = 84;
+    const captured = captureRetirement(value).?;
+    page[14] = 89; // another submission arrives before this GPU completion
+    publishCapturedRetirement(captured);
+    try testing.expectEqual(@as(u64, 0), page[8]); // hardware has not completed
+    page[16] = 84;
+    publishCapturedRetirement(captured);
+    try testing.expectEqual(@as(u64, 88), page[8]);
+    publishCapturedRetirement(captured);
+    try testing.expectEqual(@as(u64, 88), page[8]); // replay is idempotent
 }
 
 test "one completion batch coalesces duplicate release contexts" {

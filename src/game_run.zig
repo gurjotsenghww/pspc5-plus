@@ -963,6 +963,8 @@ fn run(init: std.process.Init) !bool {
                 null,
         };
         runtime.firmware.libs.agc_submit.setParallelCommandExecution(parallel_commands);
+        runtime.firmware.libs.agc_submit.asynchronous_submissions =
+            !(init.minimal.environ.containsUnempty(allocator, "PS5_SYNC_SUBMISSIONS") catch false);
         renderer.deferred_release_observer = runtime.firmware.libs.agc_submit.observeDeferredRelease;
         runtime.firmware.libs.agc_submit.attachBackend(renderer.dcbBackend(guest_memory));
         const video_sink = renderer.videoFrameSink();

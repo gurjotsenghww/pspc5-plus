@@ -465,14 +465,26 @@ const RegisterCheckpointCollector = struct {
     pcs: []const u32,
     snapshots: []ScalarRegisters,
     seen: std.StaticBitSet(maximum_resource_instructions) = .initEmpty(),
+    cursor: usize = 0,
+    previous_pc: u32 = 0,
 
     fn captureBefore(self: *RegisterCheckpointCollector, evaluation: *const Evaluation, pc: u32) void {
-        var low: usize = 0;
-        var high = self.pcs.len;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            if (self.pcs[middle] < pc) low = middle + 1 else high = middle;
+        // Most instructions move forward, often between the same two resource
+        // sites. Search only when control flow jumps backwards; revisited
+        // checkpoints still merge through the existing seen-bit semantics.
+        if (pc < self.previous_pc) {
+            var low: usize = 0;
+            var high = self.pcs.len;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                if (self.pcs[middle] < pc) low = middle + 1 else high = middle;
+            }
+            self.cursor = low;
+        } else {
+            while (self.cursor < self.pcs.len and self.pcs[self.cursor] < pc) self.cursor += 1;
         }
+        self.previous_pc = pc;
+        const low = self.cursor;
         // A forward branch did not execute the instructions it skipped.
         // Their registers must come from reaching definitions, never from
         // whichever unrelated scalar values preceded the branch.
@@ -661,7 +673,10 @@ fn evaluateInto(
             // resume the index. Backward branches binary-search it.
             if (dense_walk and lane_spills.occupied == 0) dense_walk = false;
             if (!dense_walk) {
-                const index = stepIndexAtOrAfter(instructions, list, pc);
+                const index = if (current_step < list.len and instructions[list[current_step]].pc == pc)
+                    current_step
+                else
+                    stepIndexAtOrAfter(instructions, list, pc);
                 if (index == list.len) {
                     result.stop_reason = .end_program;
                     return;
@@ -880,7 +895,8 @@ fn evaluateInto(
                     result.stop_reason = .end_program;
                     return;
                 }
-                pc = instructions[list[current_step + 1]].pc;
+                current_step += 1;
+                pc = instructions[list[current_step]].pc;
             }
         } else {
             pc +%= inst.word_count * 4;
