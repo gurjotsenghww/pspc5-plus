@@ -1,5 +1,9 @@
 # Big Helmet Heroes performance investigation — September 28, 2026
 
+The later [storage-image coherence follow-up](big-helmet-heroes-storage-coherence-2026-09-28.md)
+records the next development build and its separate comparison. Executable
+details and measurements below describe the buffer-budget accounting change.
+
 The main cost after startup is the host graphics backend: resource preparation,
 copies between guest memory and Vulkan resources, and synchronization. The
 stable menu does not repeatedly compile its pipelines. Entering the tutorial

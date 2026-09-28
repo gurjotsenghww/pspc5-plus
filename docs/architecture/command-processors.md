@@ -10,6 +10,13 @@ state. It can prepare up to four draw/dispatch snapshots ahead of the backend.
 Each snapshot owns the complete register state and packet payload; later
 register writes and indirect-buffer reuse cannot change an outstanding draw.
 Snapshot allocations are reused across submissions.
+The HLE submission bridge registers compact-address aliases after its immutable
+snapshot starts with a complete command or filler packet. A submitted span or
+recovered builder tail can begin inside an allocation, immediately after a label;
+its start does not establish a protected allocator header. Prefix validation
+therefore uses command-range semantics and permits writes to preceding labels.
+Valid spans register their alias before validation resolves compact wait-label
+addresses. Non-command data and truncated first packets create no aliases.
 Indirect register lists are read in blocks of at most 256 pairs. A backend
 that cannot read the block falls back to the original per-pair reads and
 preserves the valid prefix before a memory fault.
@@ -206,6 +213,14 @@ retain a multi-megabyte allocation and prematurely fill the cache budget.
 Storage images fingerprint clean native backing before copying it, and compare
 the selected view's texels before uploading changes confined to padding or
 other mip levels.
+For dirty storage images, an unchanged texel check can retain a page watch
+already rearmed by another binding. It observes the generation before hashing
+and retains it afterward; validation itself does not change page protections.
+A retired image whose texels have been replaced by the CPU can be invalidated
+before scheduling a readback when its pages are already watched. The same host
+copy is reused after waiting only if its page generation still matches.
+`[gpu storage coherence]` reports page-proof hits, checked allocation bytes and
+obsolete readbacks avoided.
 When the experimental device-storage budget is enabled,
 `PS5_GPU_DEVICE_STORAGE_MIN_KIB` (runner default 256) keeps small metadata and
 frequently read-back labels host-visible. The device-storage budget defaults to

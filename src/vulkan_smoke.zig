@@ -17,6 +17,36 @@ fn SizedGuestMemory(comptime size: usize) type {
     return struct {
         const Self = @This();
         bytes: [size]u8 = @splat(0),
+        watch_generation: u64 = 0,
+        watch_armed: bool = false,
+        write_after_fingerprint: ?usize = null,
+        write_on_generation: ?usize = null,
+        generation_reads_before_write: u32 = 0,
+
+        fn changed(self: *Self) void {
+            if (self.watch_generation == 0) return;
+            self.watch_generation += 1;
+            self.watch_armed = false;
+        }
+
+        fn track(context: ?*anyopaque, _: u64, _: usize) u64 {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            self.watch_armed = true;
+            return self.watch_generation;
+        }
+
+        fn generation(context: ?*anyopaque, _: u64, _: usize) u64 {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            if (self.write_on_generation) |destination| {
+                if (self.generation_reads_before_write != 0) {
+                    self.generation_reads_before_write -= 1;
+                } else {
+                    self.write_on_generation = null;
+                    self.word(destination, 0x1234_abcd);
+                }
+            }
+            return if (self.watch_armed) self.watch_generation else 0;
+        }
 
         fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
             const self: *Self = @ptrCast(@alignCast(context.?));
@@ -30,18 +60,27 @@ fn SizedGuestMemory(comptime size: usize) type {
             const self: *Self = @ptrCast(@alignCast(context.?));
             const start: usize = @intCast(address);
             if (start + source.len > self.bytes.len) return false;
+            self.changed();
             @memcpy(self.bytes[start..][0..source.len], source);
             return true;
         }
 
         fn word(self: *Self, address: usize, value: u32) void {
+            self.changed();
             std.mem.writeInt(u32, self.bytes[address..][0..4], value, .little);
         }
 
         fn fingerprint(context: ?*anyopaque, address: u64, length: usize) ?u64 {
             const self: *Self = @ptrCast(@alignCast(context.?));
             if (address > self.bytes.len or length > self.bytes.len - address) return null;
-            return gpu.parallel_copy.fingerprint(self.bytes[@intCast(address)..][0..length]);
+            const result = gpu.parallel_copy.fingerprint(self.bytes[@intCast(address)..][0..length]);
+            if (self.write_after_fingerprint) |destination| {
+                if (destination >= address and destination - address < length) {
+                    self.write_after_fingerprint = null;
+                    self.word(destination, 0x1234_abcd);
+                }
+            }
+            return result;
         }
 
         fn interface(self: *Self) vulkan.GuestMemory {
@@ -4860,17 +4899,23 @@ fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool, n
 }
 
 fn runStorageImageCpuReuseProbe(allocator: std.mem.Allocator) !void {
-    for ([_]bool{ false, true }) |fingerprint| try runStorageImageCpuReuseCase(allocator, fingerprint);
+    for ([_]bool{ false, true }) |fingerprint| try runStorageImageCpuReuseCase(allocator, fingerprint, false);
+    try runStorageImageCpuReuseCase(allocator, true, true);
     try runStorageImageCpuClearCase(allocator);
     std.debug.print("storage CPU reuse passed: deferred writes, CPU replacement, padding, and rebind\n", .{});
 }
 
-fn runStorageImageCpuReuseCase(allocator: std.mem.Allocator, fingerprint: bool) !void {
+fn runStorageImageCpuReuseCase(allocator: std.mem.Allocator, fingerprint: bool, tracked: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
+    if (tracked) guest.watch_generation = 1;
     var memory = guest.interface();
     if (fingerprint) memory.fingerprint = GuestMemory.fingerprint;
+    if (tracked) {
+        memory.track_gpu_read = GuestMemory.track;
+        memory.gpu_generation = GuestMemory.generation;
+    }
     const backend = renderer.dcbBackend(memory);
     const code = [_]u32{
         vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 8),
@@ -4883,7 +4928,7 @@ fn runStorageImageCpuReuseCase(allocator: std.mem.Allocator, fingerprint: bool) 
     try state.writeRegister(.shader, compute.programRegisterBase(), 1);
     try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
     try state.writeRegister(.shader, 0x213, 9 << 1);
-    for (0..4) |case| {
+    for (0..@as(usize, if (tracked) 8 else 6)) |case| {
         const address = 0x4000 + case * 0x1000;
         var descriptor = imageDescriptorWords(@intCast(address), 1, 2);
         descriptor[4] = 63; // Row padding must not count as a texel change.
@@ -4894,14 +4939,37 @@ fn runStorageImageCpuReuseCase(allocator: std.mem.Allocator, fingerprint: bool) 
         // Retire work without materializing images, just as a guest fence does.
         try std.testing.expect(backend.vtable.release.?(backend.context, std.mem.zeroes(gpu.state.ReleaseMem)));
         try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guest.bytes[address..][0..4], .little));
+        if (case == 7) {
+            // Change guest pixels between the preflight copy and the page
+            // proof after GPU completion. The old GPU result must be dropped.
+            guest.write_on_generation = address + 256;
+            guest.generation_reads_before_write = 1;
+            const copies_before = renderer.frame_profile.storage_image_readbacks;
+            try renderer.flushPendingGuestWrites();
+            try std.testing.expectEqual(copies_before + 1, renderer.frame_profile.storage_image_readbacks);
+            try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guest.bytes[address..][0..4], .little));
+            try std.testing.expectEqual(@as(u32, 0x1234_abcd), std.mem.readInt(u32, guest.bytes[address + 256 ..][0..4], .little));
+            continue;
+        }
         if (case == 1 or case == 3) {
             guest.word(address, 0xdead_beef); // CPU repurposes the allocation.
             guest.word(address + 256, 0x1234_abcd); // Second row, untouched by the shader.
         }
         if (case == 2) guest.word(address + 4, 0x1234_5678); // Only padding changes.
+        if (case == 4) guest.word(address, 0); // An identical write still disarms the page.
+        if (case == 5) guest.word(address + 4, 0x1234_5678);
+        if (case == 6) {
+            guest.word(address, 0);
+            guest.write_after_fingerprint = address + 256;
+        }
+        // An overlapping resource has rearmed this page since the CPU write.
+        // Image validation may reuse that watch, but must not create its own.
+        if (tracked and (case == 1 or case >= 4)) _ = GuestMemory.track(&guest, address, 512);
         // Case 3 rebinds CPU-updated memory directly, without a host readback.
-        if (case != 3) try renderer.flushPendingGuestWrites();
-        try std.testing.expectEqual(@as(u32, if (case == 1 or case == 3) 0xdead_beef else 42), std.mem.readInt(u32, guest.bytes[address..][0..4], .little));
+        const readbacks_before = renderer.frame_profile.storage_image_readbacks;
+        if (case < 3) try renderer.flushPendingGuestWrites();
+        if (case == 1 and tracked) try std.testing.expectEqual(readbacks_before, renderer.frame_profile.storage_image_readbacks);
+        try std.testing.expectEqual(@as(u32, if (case == 1 or case == 3) 0xdead_beef else if (case >= 4) 0 else 42), std.mem.readInt(u32, guest.bytes[address..][0..4], .little));
         if (case == 2) try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, guest.bytes[address + 4 ..][0..4], .little));
         // Reusing the image after either publication or invalidation must allow
         // a new GPU write to become visible again.
@@ -4910,11 +4978,26 @@ fn runStorageImageCpuReuseCase(allocator: std.mem.Allocator, fingerprint: bool) 
         try state.writeRegister(.shader, compute.userDataBase() + 8, 43);
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
         if (case == 2) try std.testing.expectEqual(uploaded_before, renderer.frame_profile.texture_upload_bytes);
+        if (tracked and case >= 4) {
+            try std.testing.expect(backend.vtable.release.?(backend.context, std.mem.zeroes(gpu.state.ReleaseMem)));
+            const checked_before = renderer.frame_profile.storage_guest_hash_bytes;
+            const hits_before = renderer.frame_profile.storage_guest_page_hits;
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            if (case == 6) {
+                // A write after hashing must invalidate the earlier proof,
+                // upload the CPU replacement and preserve its untouched row.
+                try std.testing.expect(renderer.frame_profile.storage_guest_hash_bytes > checked_before);
+            } else {
+                try std.testing.expectEqual(checked_before, renderer.frame_profile.storage_guest_hash_bytes);
+                try std.testing.expect(renderer.frame_profile.storage_guest_page_hits > hits_before);
+            }
+        }
         try renderer.flushPendingGuestWrites();
         try std.testing.expectEqual(@as(u32, 43), std.mem.readInt(u32, guest.bytes[address..][0..4], .little));
-        if (case == 1 or case == 3) try std.testing.expectEqual(@as(u32, 0x1234_abcd), std.mem.readInt(u32, guest.bytes[address + 256 ..][0..4], .little));
+        if (case == 1 or case == 3 or case == 6) try std.testing.expectEqual(@as(u32, 0x1234_abcd), std.mem.readInt(u32, guest.bytes[address + 256 ..][0..4], .little));
     }
-    try std.testing.expectEqual(@as(u64, 2), renderer.storage_cpu_invalidations);
+    try std.testing.expectEqual(@as(u64, if (tracked) 4 else 2), renderer.storage_cpu_invalidations);
+    try std.testing.expectEqual(@as(u64, if (tracked) 1 else 0), renderer.frame_profile.storage_discarded_readbacks);
 }
 
 fn runStorageImageCpuClearCase(allocator: std.mem.Allocator) !void {

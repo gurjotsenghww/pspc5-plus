@@ -2601,6 +2601,12 @@ const FrameProfile = struct {
     readback_bytes: u64 = 0,
     storage_upload_bytes: u64 = 0,
     storage_readback_bytes: u64 = 0,
+    storage_image_readbacks: u64 = 0,
+    storage_discarded_readbacks: u64 = 0,
+    storage_discarded_readback_bytes: u64 = 0,
+    storage_guest_checks: u64 = 0,
+    storage_guest_page_hits: u64 = 0,
+    storage_guest_hash_bytes: u64 = 0,
     target_upload_bytes: u64 = 0,
     target_readback_bytes: u64 = 0,
     texture_upload_bytes: u64 = 0,
@@ -21555,26 +21561,54 @@ pub const Renderer = struct {
     fn storageGuestContentsChanged(self: *Renderer, memory: GuestMemory, cache_index: usize) (Error || std.mem.Allocator.Error)!bool {
         const cached = &self.storage_image_cache.items[cache_index];
         const uploaded_hash = cached.guest_texel_hash orelse return false;
-        if (cached.guest_page_generation != 0) {
-            if (memory.gpu_generation) |generation| {
-                if (generation(memory.context, cached.descriptor.address, cached.allocation_bytes) == cached.guest_page_generation) return false;
-            }
+        self.frame_profile.storage_guest_checks +|= 1;
+        // Another binding may have rearmed these shared pages. Observe its
+        // generation before hashing, so a racing write still invalidates the
+        // proof. Do not rearm here: infrequently rebound images cannot repay
+        // thousands of page-protection calls with a single avoided hash.
+        const page_generation = if (memory.gpu_generation) |generation|
+            generation(memory.context, cached.descriptor.address, cached.allocation_bytes)
+        else
+            0;
+        if (page_generation != 0 and page_generation == cached.guest_page_generation) {
+            self.frame_profile.storage_guest_page_hits +|= 1;
+            return false;
         }
         // Native memory can fingerprint the backing without copying or detiling
         // it. Only a changed allocation needs the more expensive texel check.
+        self.frame_profile.storage_guest_hash_bytes +|= cached.allocation_bytes;
         const current_hash = if (memory.fingerprint) |fingerprint|
             fingerprint(memory.context, cached.descriptor.address, cached.allocation_bytes)
         else
             null;
-        if (current_hash != null and current_hash == cached.guest_backing_hash) return false;
+        if (current_hash != null and current_hash == cached.guest_backing_hash) {
+            cached.guest_page_generation = page_generation;
+            return false;
+        }
         var scratch = try self.image_scratch.acquire(self.allocator, cached.allocation_bytes);
         defer scratch.release();
         if (!memory.read(memory.context, cached.descriptor.address, scratch.bytes)) return Error.GuestMemoryReadFailed;
         const backing_hash = gpu.parallel_copy.fingerprint(scratch.bytes);
-        if (backing_hash == cached.guest_backing_hash) return false;
+        if (backing_hash == cached.guest_backing_hash) {
+            cached.guest_page_generation = page_generation;
+            return false;
+        }
         if (try self.storageGuestTexelHash(cached.subresource, cached.staging_bytes, scratch.bytes) != uploaded_hash) return true;
         cached.guest_backing_hash = backing_hash; // Only padding or another mip changed.
+        cached.guest_page_generation = page_generation;
         return false;
+    }
+
+    fn storageGuestAllocationChanged(self: *Renderer, snapshot: CachedStorageImage, allocation: []const u8, page_generation: u64) (Error || std.mem.Allocator.Error)!bool {
+        const uploaded_hash = snapshot.guest_texel_hash orelse return false;
+        self.frame_profile.storage_guest_checks +|= 1;
+        if (page_generation != 0 and page_generation == snapshot.guest_page_generation) {
+            self.frame_profile.storage_guest_page_hits +|= 1;
+            return false;
+        }
+        self.frame_profile.storage_guest_hash_bytes +|= allocation.len;
+        return gpu.parallel_copy.fingerprint(allocation) != snapshot.guest_backing_hash and
+            try self.storageGuestTexelHash(snapshot.subresource, snapshot.staging_bytes, allocation) != uploaded_hash;
     }
 
     fn flushCachedStorageImage(
@@ -21585,6 +21619,27 @@ pub const Renderer = struct {
         if (cache_index >= self.storage_image_cache.items.len) return;
         const snapshot = self.storage_image_cache.items[cache_index];
         if (!snapshot.valid or !snapshot.gpu_dirty) return;
+        var allocation_scratch = try self.image_scratch.acquire(self.allocator, snapshot.allocation_bytes);
+        defer allocation_scratch.release();
+        const allocation = allocation_scratch.bytes;
+        // A retired image can already have been replaced by the CPU. Detect
+        // that before copying bytes we would discard. The page watch lets the
+        // same host copy preserve padding after the wait; without that proof,
+        // retain the original single observation after GPU completion.
+        const observed_generation = if (snapshot.pin_count == 0)
+            if (memory.gpu_generation) |generation| generation(memory.context, snapshot.descriptor.address, snapshot.allocation_bytes) else 0
+        else
+            0;
+        if (observed_generation != 0) {
+            if (!memory.read(memory.context, snapshot.descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
+            if (try self.storageGuestAllocationChanged(snapshot, allocation, observed_generation)) {
+                self.invalidateStorageGuestContents(cache_index);
+                self.frame_profile.storage_discarded_readbacks +|= 1;
+                self.frame_profile.storage_discarded_readback_bytes +|= snapshot.staging_bytes;
+                return;
+            }
+        }
+        self.frame_profile.storage_image_readbacks +|= 1;
         const is_3d = snapshot.descriptor.image_type == .color_3d;
         const is_2d_array = snapshot.descriptor.image_type == .color_2d_array;
         const array_layers = if (is_2d_array) snapshot.subresource.depth_or_layers else 1;
@@ -21643,20 +21698,15 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
 
-        // Finish the GPU copy before reading guest padding or mapping its result.
+        // Finish the GPU copy before refreshing guest padding or mapping its result.
         // Keep the mapping inside the CPU-only transform, and release it before
         // invoking the guest write callback or changing cached image ownership.
         try self.waitForSubmittedWork();
-        var allocation_scratch = try self.image_scratch.acquire(self.allocator, snapshot.allocation_bytes);
-        defer allocation_scratch.release();
-        const allocation = allocation_scratch.bytes;
-        if (!memory.read(memory.context, snapshot.descriptor.address, allocation)) {
-            return Error.GuestMemoryReadFailed;
-        }
-        if (snapshot.guest_texel_hash) |uploaded_hash| {
-            if (gpu.parallel_copy.fingerprint(allocation) != snapshot.guest_backing_hash and
-                try self.storageGuestTexelHash(snapshot.subresource, snapshot.staging_bytes, allocation) != uploaded_hash)
-            {
+        const copy_still_current = observed_generation != 0 and
+            memory.gpu_generation.?(memory.context, snapshot.descriptor.address, snapshot.allocation_bytes) == observed_generation;
+        if (!copy_still_current) {
+            if (!memory.read(memory.context, snapshot.descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
+            if (try self.storageGuestAllocationChanged(snapshot, allocation, 0)) {
                 // The guest has written new contents since this GPU image was
                 // staged. Publishing its old output now would corrupt those
                 // contents (which may already be descriptors for another use).
@@ -27728,6 +27778,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu storage images] flip={d} budget_mib={d} evictions={d}\n",
                 .{ self.flip_callbacks, self.storage_image_cache_limit / (1024 * 1024), profile.storage_image_evictions },
+            );
+            std.debug.print(
+                "[gpu storage coherence] flip={d} checks={d} page_hits={d} checked_kib={d} readbacks={d} discarded={d}/{d}KiB\n",
+                .{ self.flip_callbacks, profile.storage_guest_checks, profile.storage_guest_page_hits, profile.storage_guest_hash_bytes / 1024, profile.storage_image_readbacks, profile.storage_discarded_readbacks, profile.storage_discarded_readback_bytes / 1024 },
             );
             std.debug.print(
                 "[gpu sampled cache] flip={d} creates={d}/{d}us allocs={d}/{d}us retries={d} trim_us={d} retire_waits={d} blocked={d} retire_fence_us={d} pending_kib={d} slack_kib={d} reuses={d}\n",

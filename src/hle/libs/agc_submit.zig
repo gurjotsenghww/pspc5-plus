@@ -816,7 +816,7 @@ fn drainQuietBuilderArenas() void {
     const available = pointer[0..@intCast(byte_length / @sizeOf(u32))];
     const snapshot = submission_allocator.dupe(u32, available) catch return;
     defer submission_allocator.free(snapshot);
-    const commands = submittedCommandPrefixForArena(snapshot, start);
+    const commands = submittedCommandPrefixForRange(snapshot, start, false);
     if (commands.len == 0 or commands.len != snapshot.len or
         !streamIsRecoverableOrphan(commands))
     {
@@ -838,7 +838,7 @@ fn drainQuietBuilderArenas() void {
         );
         orphan_arena_reports += 1;
     }
-    rememberSubmissionAlias(available[0..commands.len]);
+    rememberSubmissionRange(available[0..commands.len], false);
     // The guest queued no retirement record for work it never submitted, so
     // publish the label writes without turning them into a completion edge.
     execution_lock.lock();
@@ -871,7 +871,7 @@ fn reportPendingBuilderArenasAtFlip() void {
         const live = pointer[0..@intCast(byte_length / @sizeOf(u32))];
         const frozen = submission_allocator.dupe(u32, live) catch continue;
         defer submission_allocator.free(frozen);
-        const commands = submittedCommandPrefixForArena(frozen, arena.executed_end);
+        const commands = submittedCommandPrefixForRange(frozen, arena.executed_end, false);
         const summary = summarize(commands);
         std.debug.print(
             "[agc pending] first-flip arena base=0x{x} pending=0x{x}-0x{x} age_ms={d} commands={d}/{d} packets={d} draws={d} dispatches={d} recoverable={any} gpu_arena={any}\n",
@@ -2760,8 +2760,6 @@ fn executeAcceptedStream(
     event_id: u32,
     own_public_completion: bool,
 ) SubmitOutcome {
-    rememberSubmissionAlias(stream);
-    noteBuilderArenaExecuted(stream);
     // Freeze the caller-owned allocation before validating it. AGC command
     // arenas are shared with producer threads and may be recycled while this
     // HLE call is waiting for the serialized command processor. Validating the
@@ -2772,7 +2770,18 @@ fn executeAcceptedStream(
         return .{ .accepted = true, .completed = true };
     };
     defer submission_allocator.free(snapshot);
-    const commands = submittedCommandPrefixForArena(snapshot, @intFromPtr(stream.ptr));
+    // A public submission names a command span, not an allocator boundary.
+    // Even a complete first packet can immediately follow an embedded label;
+    // inventing a 16-byte header there rejects legitimate release writes and
+    // stops both queues. Retain compact aliases for command spans, without
+    // inferring ownership of their preceding bytes. Empty/non-command spans
+    // do not create aliases at all. Register before validating compact waits.
+    var first_packet = gpu.pm4.Walker.init(snapshot);
+    if (first_packet.next() catch null) |packet| {
+        if (packet.kind == .command or packet.kind == .filler) rememberSubmissionRange(stream, false);
+    }
+    noteBuilderArenaExecuted(stream);
+    const commands = submittedCommandPrefixForRange(snapshot, @intFromPtr(stream.ptr), false);
 
     if (commands.len != stream.len) {
         if (trace.isLive() or trimmed_submission_reports < 8) {
@@ -4599,6 +4608,52 @@ test "GPU writes cannot overwrite a submitted allocation header" {
     ));
     try testing.expectEqual(@as(u32, 0xfeed_beef), allocation[2]);
     try testing.expectEqual(@as(u32, 0), allocation[3]);
+}
+
+test "non-command and truncated submissions do not invent protected headers" {
+    for ([_]u32{ 0, 0x0001_cc42, command(gpu.pm4.release_mem, 100) }) |first_word| {
+        reset();
+        defer reset();
+        var allocation: [32]u32 = @splat(0);
+        allocation[5] = first_word;
+        // A submitted range can start one dword into a timestamp label. The
+        // high timestamp word is data, not a newly allocated command arena.
+        const outcome = submitDeviceStream(allocation[5..]);
+        try testing.expect(outcome.accepted and outcome.completed);
+        const timestamp: u64 = 0x0001_cc42_ac6a_ea36;
+        try testing.expect(writeGuestMemory(null, @intFromPtr(&allocation[4]), std.mem.asBytes(&timestamp)));
+        try testing.expectEqual(@as(u32, @truncate(timestamp)), allocation[4]);
+        try testing.expectEqual(@as(u32, @truncate(timestamp >> 32)), allocation[5]);
+    }
+}
+
+test "public command spans preserve labels immediately before their start" {
+    // Neither 16-byte alignment nor a valid first command establishes an
+    // allocation boundary. Exercise aligned and unaligned interior spans.
+    for ([_]usize{ 4, 5, 6 }) |start| {
+        reset();
+        defer reset();
+        var allocation: [32]u32 align(16) = @splat(0);
+        const target = @intFromPtr(&allocation[start - 2]);
+        const value: u64 = 0x0001_cc42_ac6a_ea36;
+        allocation[start] = command(gpu.pm4.nop, 1);
+        const initial = submitDeviceStream(allocation[start..][0..2]);
+        try testing.expect(initial.accepted and initial.completed);
+        // A different queue can release a label preceding this command span.
+        try testing.expect(writeGuestMemory(null, target, std.mem.asBytes(&value)));
+        try testing.expectEqual(value, std.mem.readInt(u64, std.mem.asBytes(&allocation)[(start - 2) * 4 ..][0..8], .little));
+        const write = [_]u32{
+            command(gpu.pm4.write_data, 5), 1 << 8,
+            @truncate(target),              @truncate(target >> 32),
+            7,                              0,
+        };
+        @memcpy(allocation[start..][0..write.len], &write);
+        const outcome = submitDeviceStream(allocation[start..][0..write.len]);
+        try testing.expect(outcome.accepted and outcome.completed);
+        // Prefix validation must not silently trim the legitimate write either.
+        try testing.expectEqual(@as(u32, 7), allocation[start - 2]);
+        try testing.expectEqual(@as(u32, 0), allocation[start - 1]);
+    }
 }
 
 test "bulk DMA writes may span a snapshotted submission header" {
