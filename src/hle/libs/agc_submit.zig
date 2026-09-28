@@ -3699,6 +3699,11 @@ fn publishSdk11DcbDriverGeneration(
     {
         return;
     }
+    // Only the ACB retirement bridge establishes the shared SDK11 table.
+    // Without it this DCB path cannot publish a generation: probing registers
+    // and stack spills just performs checked reads for an unusable result.
+    // Recheck on every submission so later table discovery enables the bridge.
+    if (sdk11_acb_label_page.load(.acquire) == 0) return;
     const stream_address = @intFromPtr(submission.address orelse return);
     // Which register still holds the queue object depends on the guest's own
     // allocation at this call site, so try each one that the thunk captured
