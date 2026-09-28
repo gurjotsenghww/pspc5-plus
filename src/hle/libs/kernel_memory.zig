@@ -363,6 +363,7 @@ pub fn attachAddressSpace(address_space: ?*memory.AddressSpace) void {
     // attachment without joining the pool's contention. Attach and detach
     // happen once each, around the guest's whole lifetime.
     @atomicStore(?*memory.AddressSpace, &guest_address_space, address_space, .release);
+    filesystem.attachGuestAddressSpace(address_space);
 }
 
 /// Whether a guest buffer is safe for firmware to touch.
@@ -470,6 +471,7 @@ pub fn deinit() void {
     pool = .{};
     pool_gpa = null;
     guest_address_space = null;
+    filesystem.attachGuestAddressSpace(null);
 }
 
 /// Direct-memory helpers for AMPR AMM command execution. They reuse the guest

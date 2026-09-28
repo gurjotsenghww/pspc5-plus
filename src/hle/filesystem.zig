@@ -15,6 +15,7 @@ const std = @import("std");
 const audio_fs = @import("audio_fs.zig");
 const savedata = @import("savedata.zig");
 const boot_config = @import("boot_config.zig");
+const guest_memory = @import("memory");
 
 /// Descriptors below this belong to the standard streams.
 pub const first_descriptor: i32 = 3;
@@ -426,6 +427,17 @@ var open_files: [maximum_open_files]?OpenFile = @splat(null);
 var next_descriptor: u32 = first_descriptor;
 var table_lock: Lock = .{};
 var virtual_socket_signal: std.atomic.Value(u8) = .init(0);
+var guest_address_space: ?*guest_memory.AddressSpace = null;
+// HLE calls can run on a guest stack, including pages observed by the GPU.
+// Keep the synchronous I/O destination in host TLS, outside guest mappings,
+// and reuse it without growing the guest stack or allocating on every read.
+threadlocal var host_file_read_scratch: [64 * 1024]u8 = undefined;
+
+/// Shares libkernel's guest mapping lifetime with host file reads.
+pub fn attachGuestAddressSpace(space: ?*guest_memory.AddressSpace) void {
+    @atomicStore(?*guest_memory.AddressSpace, &guest_address_space, space, .release);
+}
+
 var boot_override: [boot_config.maximum_bytes]u8 = undefined;
 var boot_override_length: usize = 0;
 
@@ -561,6 +573,17 @@ pub fn mountSaveDataSlot(slot: []const u8, may_create: bool) Error!SaveDataMount
         created = true;
         break :blk home.openDir(io, relative, .{ .iterate = true }) catch return Error.IoFailed;
     };
+
+    // Match slot enumeration: a named probe must not expose an interrupted
+    // transaction containing only metadata or empty staging files. Keep the
+    // files in place, but let a creating mount initialize the slot anew.
+    if (!created and !saveDataDirectoryHasPayload(directory, io, true, 0)) {
+        if (!may_create) {
+            directory.close(io);
+            return .missing;
+        }
+        created = true;
+    }
 
     table_lock.lock();
     defer table_lock.unlock();
@@ -1184,7 +1207,7 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
     // descriptor *is* does not depend on whether a mount happens to be
     // attached, and diagnosing it by the mount would mislabel a device.
     const io = active_io orelse return Error.NotAttached;
-    const count = file.readPositionalAll(io, buffer, offset) catch return Error.IoFailed;
+    const count = try readHostFile(file, io, buffer, offset);
 
     table_lock.lock();
     defer table_lock.unlock();
@@ -1226,7 +1249,36 @@ pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
         return Error.NotSupported;
     };
     const io = active_io orelse return Error.NotAttached;
+    return readHostFile(file, io, buffer, offset);
+}
+
+/// Kernel I/O writes do not raise the user-mode fault used by GPU page
+/// tracking. Read mapped guest destinations through host scratch, then publish
+/// each chunk with AddressSpace.write. Merely unprotecting before ReadFile is
+/// insufficient: another GPU read can rearm the page while the I/O is pending.
+fn readHostFile(file: std.Io.File, io: std.Io, buffer: []u8, offset: u64) Error!usize {
+    if (buffer.len == 0) return 0;
+    if (@atomicLoad(?*guest_memory.AddressSpace, &guest_address_space, .acquire)) |space| {
+        if (space.isWritable(@intFromPtr(buffer.ptr), buffer.len)) {
+            return readGuestFile(space, file, io, buffer, offset);
+        }
+    }
     return file.readPositionalAll(io, buffer, offset) catch Error.IoFailed;
+}
+
+noinline fn readGuestFile(space: *guest_memory.AddressSpace, file: std.Io.File, io: std.Io, buffer: []u8, offset: u64) Error!usize {
+    const scratch = &host_file_read_scratch;
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const chunk = @min(scratch.len, buffer.len - total);
+        const position = std.math.add(u64, offset, total) catch return Error.InvalidArgument;
+        const count = file.readPositionalAll(io, scratch[0..chunk], position) catch return Error.IoFailed;
+        if (count == 0) break;
+        space.write(@intFromPtr(buffer.ptr) + total, scratch[0..count]) catch return Error.IoFailed;
+        total += count;
+        if (count < chunk) break;
+    }
+    return total;
 }
 
 /// Writes only to the redirected diagnostic descriptor. Reserving the range
@@ -1653,6 +1705,51 @@ const Fixture = struct {
     }
 };
 
+test "file reads into GPU-watched guest pages preserve bytes offsets and generations" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const contents = try testing.allocator.alloc(u8, 64 * 1024 + 37);
+    defer testing.allocator.free(contents);
+    for (contents, 0..) |*byte, index| byte.* = @truncate(index * 31 + 7);
+    var fixture = try Fixture.init(contents);
+    defer fixture.deinit();
+    var space = try guest_memory.AddressSpace.init(testing.allocator);
+    defer space.deinit();
+    attachGuestAddressSpace(&space);
+    defer attachGuestAddressSpace(null);
+    const page = guest_memory.page_size;
+    const base = guest_memory.system_managed.start;
+    try space.mapFixed(base, 6 * page, .read_write, .private, null);
+    const mapped = @as([*]u8, @ptrFromInt(base))[0 .. 6 * page];
+    @memset(mapped, 0xa5);
+    const destination = mapped[123 .. 123 + contents.len + 7];
+    const address = @intFromPtr(destination.ptr);
+    space.enableGpuMemoryTracking();
+    _ = try space.trackGpuRead(base, mapped.len);
+    const untouched = space.gpuGeneration(base + 5 * page, page);
+    try testing.expect(untouched != 0);
+    const fd = try open("/app0/data.bin", O.rdonly);
+    defer close(fd) catch {};
+
+    try testing.expectEqual(contents.len - 11, try pread(fd, destination, 11));
+    try testing.expectEqualSlices(u8, contents[11..], destination[0 .. contents.len - 11]);
+    try testing.expectEqual(@as(i64, 0), try seek(fd, 0, 1));
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, contents.len));
+    try testing.expectEqual(untouched, space.gpuGeneration(base + 5 * page, page));
+    const rearmed = try space.trackGpuRead(address, contents.len);
+    try testing.expect(rearmed != 0);
+
+    try testing.expectEqual(contents.len, try read(fd, destination));
+    try testing.expectEqualSlices(u8, contents, destination[0..contents.len]);
+    for (destination[contents.len..]) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+    try testing.expectEqual(@as(i64, @intCast(contents.len)), try seek(fd, 0, 1));
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, contents.len));
+    try testing.expectEqual(untouched, space.gpuGeneration(base + 5 * page, page));
+    const at_eof = try space.trackGpuRead(address, destination.len);
+    try testing.expect(at_eof != rearmed);
+    try testing.expectEqual(@as(usize, 0), try read(fd, destination));
+    try testing.expectEqual(at_eof, space.gpuGeneration(address, destination.len));
+}
+
 test "display boot overlay has consistent reads and stat without modifying title content" {
     var fixture = try Fixture.init("unchanged");
     defer fixture.deinit();
@@ -1718,6 +1815,39 @@ test "save-data search hides interrupted slots without payload" {
     const found = listSaveDataSlots(&names);
     try testing.expectEqual(@as(usize, 1), found);
     try testing.expectEqualStrings("complete", std.mem.sliceTo(&names[0], 0));
+}
+
+test "save-data mount does not load an interrupted slot or replace an active mount" {
+    var fixture = try Fixture.init("title data");
+    defer fixture.deinit();
+    attachSaveDataHome(fixture.tmp.dir, "PPSA15065");
+    defer {
+        unmountSaveData();
+        savedata_home = null;
+        title_identifier_length = 0;
+    }
+    try fixture.tmp.dir.createDirPath(testing.io, "PPSA15065/incomplete/sce_sys");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "PPSA15065/incomplete/save.bin", .data = "" });
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "PPSA15065/incomplete/sce_sys/param.txt", .data = "metadata" });
+    try fixture.tmp.dir.createDirPath(testing.io, "PPSA15065/complete/data");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "PPSA15065/complete/data/progress.bin", .data = "progress" });
+
+    try testing.expectEqual(SaveDataMountOutcome.existed, try mountSaveDataSlot("complete", false));
+    try testing.expectEqual(SaveDataMountOutcome.missing, try mountSaveDataSlot("incomplete", false));
+    try testing.expectEqualStrings("complete", mountedSaveDataSlot());
+    var bytes: [32]u8 = undefined;
+    const metadata = try fixture.tmp.dir.readFile(testing.io, "PPSA15065/incomplete/sce_sys/param.txt", &bytes);
+    try testing.expectEqualStrings("metadata", metadata);
+    try testing.expectEqual(SaveDataMountOutcome.created, try mountSaveDataSlot("incomplete", true));
+    const fd = try open("/savedata0/save.bin", O.wronly);
+    try testing.expectEqual(@as(usize, 8), try write(fd, "new save"));
+    try close(fd);
+    unmountSaveData();
+    try testing.expectEqual(SaveDataMountOutcome.existed, try mountSaveDataSlot("incomplete", false));
+    const restored = try open("/savedata0/save.bin", O.rdonly);
+    defer close(restored) catch {};
+    const count = try read(restored, &bytes);
+    try testing.expectEqualStrings("new save", bytes[0..count]);
 }
 
 test "a title reads its own content through the mount" {

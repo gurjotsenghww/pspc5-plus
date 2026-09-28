@@ -860,3 +860,43 @@ test "APR completion delivery is best effort" {
     const submission = try submitCommandBuffer(0x9000);
     try waitCommandBuffer(submission);
 }
+
+test "APR completes a read into GPU-watched pages through the attached address space" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const guest_memory = @import("memory");
+    reset();
+    defer reset();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    try temporary.dir.writeFile(io, .{ .sub_path = "tracked.dat", .data = "tracked-payload" });
+    filesystem.attach(io, temporary.dir);
+    defer filesystem.detach();
+    var space = try guest_memory.AddressSpace.init(std.testing.allocator);
+    defer space.deinit();
+    memory.attachAddressSpace(&space);
+    defer memory.attachAddressSpace(null);
+    const base = guest_memory.system_managed.start;
+    try space.mapFixed(base, guest_memory.page_size, .read_write, .private, null);
+    try space.write(base, "xxxxxxxxxxxxxxx");
+    space.enableGpuMemoryTracking();
+    const generation = try space.trackGpuRead(base, 15);
+    try std.testing.expect(generation != 0);
+
+    const resolved = try resolve("/app0/tracked.dat");
+    var bytes_read: u64 = 0;
+    try constructCommandBuffer(0x1000);
+    try appendRead(0x1000, .{
+        .file_identifier = resolved.identifier,
+        .destination = base,
+        .size = 15,
+        .file_offset = 0,
+        .bytes_read_address = @intFromPtr(&bytes_read),
+    });
+    const submission = try submitCommandBuffer(0x1000);
+    try std.testing.expectEqual(@as(u64, 15), bytes_read);
+    try std.testing.expectEqualStrings("tracked-payload", @as([*]const u8, @ptrFromInt(base))[0..15]);
+    try std.testing.expectEqual(@as(u64, 0), space.gpuGeneration(base, 15));
+    try waitCommandBuffer(submission);
+    try std.testing.expectError(error.UnknownSubmission, waitCommandBuffer(submission));
+}
