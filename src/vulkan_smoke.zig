@@ -5958,6 +5958,20 @@ fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !vo
     std.debug.print("resident target reuse passed: {d} entries, warm working set, full cache, sampled source, GPU readback, released pins, queued transfer-buffer reseeding\n", .{limit});
 }
 
+fn expectStorageBufferAccounting(renderer: *const vulkan.Renderer) !void {
+    var backing_bytes: u64 = 0;
+    var device_bytes: u64 = 0;
+    for (renderer.guest_buffers.items) |entry| {
+        backing_bytes += entry.device_local.size;
+        if (entry.host_transfer) |transfer| {
+            backing_bytes += transfer.size;
+            device_bytes += entry.device_local.size;
+        }
+    }
+    try std.testing.expectEqual(backing_bytes, renderer.guest_buffer_backing_bytes);
+    try std.testing.expectEqual(device_bytes, renderer.guest_buffer_device_bytes);
+}
+
 fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, retain: bool, device_budget: usize, rename_budget: usize) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{
         .enable_timeline_scheduler = true,
@@ -6138,7 +6152,8 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     _ = try renderer.dispatchSpirv(bounds_module.words, .{ 1, 1, 1 });
     try renderer.readbackGuestStorageBuffer(0x1700, &grown_result);
     if (std.mem.readInt(u32, grown_result[0..4], .little) != 0) return error.RecycledBufferBoundsMismatch;
-    std.debug.print("queued compute buffer reuse passed: exact range, recycling, descriptor migration, full cache, bounds\n", .{});
+    try expectStorageBufferAccounting(&renderer);
+    std.debug.print("queued compute buffer reuse passed: exact range, recycling, descriptor migration, full cache, bounds, backing accounting\n", .{});
 
     // Scene kernels can exceed the old 4096-instruction headerless limit.
     // Drive the normal shader-analysis path and verify the work after it.
@@ -6258,6 +6273,7 @@ fn runQueuedDeviceUploadProbe(allocator: std.mem.Allocator, fingerprint: bool, d
     renderer.current_descriptor_slot = null;
     renderer.descriptor_set = renderer.descriptor_sets[0];
     try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.storage_buffer_renames);
+    try expectStorageBufferAccounting(&renderer);
     std.debug.print("queued storage uploads passed (host_backing={any}, fingerprint={any}, draw_uploads={any}, bytes={d}): 16 ordered values, same backing, zero upload waits/submissions, ring spill and complete GPU snapshot/hash\n", .{ host_backing, fingerprint, draw_uploads, source_bytes });
 }
 
@@ -6407,6 +6423,7 @@ fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool, 
     renderer.draw_batch_active = false;
     renderer.current_descriptor_slot = null;
     renderer.descriptor_set = renderer.descriptor_sets[0];
+    try expectStorageBufferAccounting(&renderer);
     std.debug.print("storage buffer rename passed (fingerprint={any}, draw_uploads={any}, oversized={any}): 16 queued snapshots, no upload submissions, completed spare reuse, bounded allocations, descriptor aliases\n", .{ fingerprint, draw_uploads, oversized });
 }
 
@@ -6440,6 +6457,8 @@ fn runStorageRenamePoolPressureProbe(allocator: std.mem.Allocator, byte_pressure
         _ = try renderer.stageGuestStorageBufferAt(0, 0x4000, size);
         try std.testing.expectEqual(@as(usize, 1), renderer.guest_buffers.items.len);
         const entry = renderer.guest_buffers.pop().?;
+        try std.testing.expect(entry.host_transfer == null);
+        renderer.guest_buffer_backing_bytes -= entry.device_local.size;
         renderer.guest_buffer_address_index.invalidate();
         @memset(&renderer.active_storage_buffers, 0);
         var requirements: vulkan.api.MemoryRequirements = undefined;
@@ -6485,6 +6504,7 @@ fn runStorageRenamePoolPressureProbe(allocator: std.mem.Allocator, byte_pressure
     renderer.draw_batch_active = false;
     renderer.current_descriptor_slot = null;
     renderer.descriptor_set = renderer.descriptor_sets[0];
+    try expectStorageBufferAccounting(&renderer);
     std.debug.print("storage rename pool pressure passed (bytes={any}): full 256-entry pool, matching spare preserved, eight exact queued reads, no upload waits/submissions\n", .{byte_pressure});
 }
 
@@ -8474,6 +8494,7 @@ fn runBufferCacheBudgetProbe(allocator: std.mem.Allocator) !void {
             }
             try std.testing.expect(found_protected);
             try std.testing.expect(allocated <= renderer.storage_buffer_cache_budget_bytes);
+            try expectStorageBufferAccounting(&renderer);
             var actual: [16]u8 = undefined;
             try renderer.readbackGuestStorageBuffer(0x5000, &actual);
             try std.testing.expectEqual(@as(u32, 0x87654321), std.mem.readInt(u32, actual[0..4], .little));
@@ -10133,6 +10154,7 @@ fn runRetainedBufferCapacityProbe(allocator: std.mem.Allocator, device_budget: u
         if (cached.guest_address == 0x10000 and cached.size == source_bytes) break cached;
     } else return error.EvictedHotRetainedBuffer;
     try std.testing.expectEqual(hot.buffer, retained_hot.device_local.handle);
+    try expectStorageBufferAccounting(&renderer);
     std.debug.print("retained backing capacity passed: 8 MiB -> 4 bytes, queued old reader preserved, device_budget={d}\n", .{device_budget});
 }
 

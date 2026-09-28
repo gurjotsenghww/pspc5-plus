@@ -189,11 +189,16 @@ and small ranges, and ring spills.
 `PS5_GPU_RETAIN_STORAGE_BUFFERS=1` retains buffer ranges across descriptor-slot
 changes. The runner enables retention when page tracking or buffer-content
 caching is enabled. `PS5_GPU_STORAGE_BUFFER_CACHE_ENTRIES` bounds the number
-of ranges (default 2048, configurable from 64 to 4096), independently of the
+of ranges (runner default 4096, renderer API default 2048, configurable from
+64 to 4096), independently of the
 shader's descriptor count. `PS5_GPU_STORAGE_BUFFER_CACHE_MIB` bounds their
 backings (default 4096 MiB). Allocations grow with observed demand; these limits
 do not reserve their full capacity. The address index covers the maximum entry
 count. `[gpu buffer cache]` reports hits, misses and evictions per sampled frame.
+Backing and device-local byte totals are maintained at allocation ownership
+changes, so an ordinary cache miss does not rescan every retained entry merely
+to check its budget. Replacements, trimming and renaming update both totals;
+retired rename allocations remain charged to their separate pool.
 Recycling a large backing for
 a much smaller range creates a suitably sized replacement; old GPU readers
 keep their original backing until retirement. Otherwise a four-byte range can

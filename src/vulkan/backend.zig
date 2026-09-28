@@ -4453,6 +4453,11 @@ pub const Renderer = struct {
     magnify_source_height: u32 = 0,
     magnify_source_format: u32 = 0,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
+    // Account retained backing capacity when ownership changes. Budget checks
+    // run on every cache miss; rescanning thousands of entries there made a
+    // streaming frame quadratic in the number of retained ranges.
+    guest_buffer_backing_bytes: u64 = 0,
+    guest_buffer_device_bytes: u64 = 0,
     guest_buffer_address_index: @import("sampled_image_index.zig").Index(maximum_retained_buffer_entries) = .{},
     active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
     active_storage_offsets: [maximum_storage_descriptors]vk.DeviceSize = @splat(0),
@@ -6280,15 +6285,27 @@ pub const Renderer = struct {
         // vkCmdCopyBuffer requires a whole number of dwords. Keep odd guest
         // ranges on the direct host-visible path without widening their views.
         if (size % 4 != 0 or size < self.device_storage_min_bytes or size > self.device_storage_budget_bytes) return false;
-        var allocated: u64 = 0;
-        for (self.guest_buffers.items, 0..) |entry, index| {
-            if (replacing == index or entry.host_transfer == null) continue;
-            allocated +|= entry.device_local.size;
+        var allocated = self.guest_buffer_device_bytes;
+        if (replacing) |index| {
+            const entry = self.guest_buffers.items[index];
+            if (entry.host_transfer != null) allocated -= entry.device_local.size;
         }
         return allocated <= self.device_storage_budget_bytes - size;
     }
 
     const StorageBacking = struct { device: OwnedBuffer, transfer: ?OwnedBuffer = null };
+
+    fn accountStorageBacking(self: *Renderer, device: OwnedBuffer, transfer: ?OwnedBuffer, add: bool) void {
+        const total = device.size + if (transfer) |buffer| buffer.size else 0;
+        const local: u64 = if (transfer != null) device.size else 0;
+        if (add) {
+            self.guest_buffer_backing_bytes += total;
+            self.guest_buffer_device_bytes += local;
+        } else {
+            self.guest_buffer_backing_bytes -= total;
+            self.guest_buffer_device_bytes -= local;
+        }
+    }
 
     fn releaseImportedAllocation(self: *Renderer, allocation: *ImportedAllocation) void {
         allocation.references -= 1;
@@ -6397,13 +6414,8 @@ pub const Renderer = struct {
 
     fn trimGuestBufferCache(self: *Renderer, incoming_size: usize, replacing_slot: u32) anyerror!void {
         var reclaimed = false;
-        var allocated: u64 = 0;
-        for (self.guest_buffers.items) |entry| {
-            allocated +|= entry.device_local.size;
-            if (entry.host_transfer) |transfer| allocated +|= transfer.size;
-        }
         const budget = self.storage_buffer_cache_budget_bytes;
-        while (allocated +| incoming_size > budget) {
+        while (self.guest_buffer_backing_bytes +| incoming_size > budget) {
             var oldest: u64 = std.math.maxInt(u64);
             var victim_index: ?usize = null;
             for (self.guest_buffers.items, 0..) |entry, index| {
@@ -6421,11 +6433,10 @@ pub const Renderer = struct {
             // Complete pending snapshots before reclaiming their allocation.
             try self.waitForStorageBufferUse(&self.guest_buffers.items[index]);
             const entry = self.guest_buffers.items[index];
+            self.accountStorageBacking(entry.device_local, entry.host_transfer, false);
             self.destroyBuffer(entry.device_local);
-            allocated -|= entry.device_local.size;
             if (entry.host_transfer) |transfer| {
                 self.destroyBuffer(transfer);
-                allocated -|= transfer.size;
             }
             if (self.active_storage_buffers[replacing_slot] == entry.device_local.handle)
                 self.active_storage_buffers[replacing_slot] = 0;
@@ -6575,6 +6586,8 @@ pub const Renderer = struct {
                         try self.flushGuestStorageBuffer(index);
                         const replacement = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, index), guest_address, host_identity);
                         const changed = &self.guest_buffers.items[index];
+                        self.accountStorageBacking(changed.device_local, changed.host_transfer, false);
+                        self.accountStorageBacking(replacement.device, replacement.transfer, true);
                         self.destroyBuffer(changed.device_local);
                         changed.device_local = replacement.device;
                         changed.host_transfer = replacement.transfer;
@@ -6657,6 +6670,7 @@ pub const Renderer = struct {
             if (recycle_index == null) {
                 try self.guest_buffers.ensureUnusedCapacity(self.allocator, 1);
                 const backing = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, null), guest_address, host_identity);
+                self.accountStorageBacking(backing.device, backing.transfer, true);
                 self.guest_buffer_address_index.insert(self.guest_buffers.items.len, guest_address);
                 self.guest_buffers.appendAssumeCapacity(.{
                     .descriptor_index = descriptor_index,
@@ -6687,6 +6701,8 @@ pub const Renderer = struct {
                 const local = size % 4 == 0 and size >= self.device_storage_min_bytes and self.storageFitsDeviceBudget(local_capacity, victim_index);
                 if (oversized or victim.device_local.host_mapping != null or host_identity != null or victim.device_local.size < size or local != (victim.host_transfer != null)) {
                     const replacement = try self.createStorageBacking(size, local, guest_address, host_identity);
+                    self.accountStorageBacking(victim.device_local, victim.host_transfer, false);
+                    self.accountStorageBacking(replacement.device, replacement.transfer, true);
                     if (self.trace_resource_failures) std.debug.print("[buffer lifetime] replace handle=0x{x} guest=0x{x} bytes={d} slot={d} with guest=0x{x} bytes={d}\n", .{ victim.device_local.handle, victim.guest_address, victim.size, descriptor_index, guest_address, size });
                     self.destroyBuffer(victim.device_local);
                     if (victim.host_transfer) |transfer| self.destroyBuffer(transfer);
@@ -24886,6 +24902,8 @@ pub const Renderer = struct {
             .allocation_bytes = requirements.size,
         });
         self.retired_storage_buffer_bytes += requirements.size;
+        self.accountStorageBacking(entry.device_local, entry.host_transfer, false);
+        self.accountStorageBacking(replacement, null, true);
         entry.device_local = replacement;
         entry.last_gpu_use = 0;
         self.frame_profile.storage_buffer_renames += 1;
