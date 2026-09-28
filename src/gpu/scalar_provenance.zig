@@ -52,7 +52,9 @@ pub const ScalarRegisters = [maximum_scalar_registers]ScalarValue;
 // per-lane values and writes on paths the walk did not execute stay unknown.
 const LaneSpills = struct {
     const Slot = struct { vgpr: u32 = 256, lane: u32 = 0, value: ScalarValue = .{} };
-    slots: [128]Slot = @splat(.{}),
+    // Only occupied slots are read. Most walks never spill a scalar register,
+    // so starting/resetting one must not initialize all 128 spill records.
+    slots: [128]Slot = undefined,
     occupied: u128 = 0,
 
     fn invalidate(self: *LaneSpills, first: u32, count: u32) void {
@@ -80,13 +82,17 @@ const LaneSpills = struct {
             return;
         };
         var free: ?usize = null;
-        for (self.slots, 0..) |slot, slot_index| {
+        var remaining = self.occupied;
+        while (remaining != 0) {
+            const slot_index: u7 = @intCast(@ctz(remaining));
+            remaining &= remaining - 1;
+            const slot = &self.slots[slot_index];
             if (slot.vgpr == inst.dst.reg and slot.lane == index) {
                 free = slot_index;
                 break;
             }
-            if (slot.vgpr == 256) free = slot_index;
         }
+        if (free == null and self.occupied != std.math.maxInt(u128)) free = @intCast(@ctz(~self.occupied));
         if (free) |slot_index| {
             const value = if (inst.src0.absolute or inst.src0.negate or inst.src0.dpp) null else source(result, inst.src0);
             self.slots[slot_index] = if (value) |known| .{ .vgpr = inst.dst.reg, .lane = index, .value = known } else .{};
@@ -120,6 +126,96 @@ const LaneSpills = struct {
         if (inst.dst2.kind == .vgpr) self.invalidate(inst.dst2.reg, count);
     }
 };
+
+/// Most shaders do not need scalar-loop exit tracking. Initialize its bitsets
+/// only on the first recorded edge; reads before that are uniformly false.
+const BranchSites = struct {
+    bits: std.StaticBitSet(64 * 1024) = undefined,
+    initialized: bool = false,
+
+    fn capacity(_: *const BranchSites) usize {
+        return 64 * 1024;
+    }
+
+    fn isSet(self: *const BranchSites, index: usize) bool {
+        return self.initialized and self.bits.isSet(index);
+    }
+
+    fn set(self: *BranchSites, index: usize) void {
+        if (!self.initialized) {
+            self.bits = .initEmpty();
+            self.initialized = true;
+        }
+        self.bits.set(index);
+    }
+};
+
+test "lane spills recycle invalidated slots and preserve occupied lanes" {
+    var spills = LaneSpills{};
+    var evaluation = Evaluation{};
+    var store_instruction = rdna2.Instruction{
+        .opcode = .v_writelane_b32,
+        .dst = .{ .kind = .vgpr },
+        .src0 = .{ .kind = .sgpr, .reg = 1 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0 },
+    };
+    for (0..128) |index| {
+        evaluation.registers[1] = .{ .known = true, .value = @intCast(index + 1) };
+        store_instruction.dst.reg = @intCast(index);
+        spills.store(&evaluation, store_instruction);
+    }
+    try std.testing.expectEqual(@as(u128, std.math.maxInt(u128)), spills.occupied);
+    store_instruction.dst.reg = 128;
+    evaluation.registers[1].value = 999;
+    spills.store(&evaluation, store_instruction);
+    var restore_instruction = rdna2.Instruction{
+        .opcode = .v_readlane_b32,
+        .dst = .{ .kind = .sgpr, .reg = 10 },
+        .src0 = .{ .kind = .vgpr, .reg = 128 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0 },
+    };
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expect(!evaluation.registers[10].known);
+
+    spills.invalidate(0, 1);
+    spills.store(&evaluation, store_instruction);
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expectEqual(@as(?u32, 999), if (evaluation.registers[10].known) evaluation.registers[10].value else null);
+    restore_instruction.src0.reg = 127;
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expectEqual(@as(?u32, 128), if (evaluation.registers[10].known) evaluation.registers[10].value else null);
+
+    // Updating a live slot cannot consume a second slot. An unknown write
+    // invalidates that lane without disturbing other occupied spill records.
+    restore_instruction.src0.reg = 128;
+    evaluation.registers[1].value = 1000;
+    spills.store(&evaluation, store_instruction);
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expectEqual(@as(u32, 1000), evaluation.registers[10].value);
+    try std.testing.expectEqual(@as(u8, 128), @popCount(spills.occupied));
+    evaluation.registers[1].known = false;
+    spills.store(&evaluation, store_instruction);
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expect(!evaluation.registers[10].known);
+    try std.testing.expectEqual(@as(u8, 127), @popCount(spills.occupied));
+}
+
+test "scalar branch tracking starts empty and clears previous walk edges" {
+    var sites = BranchSites{};
+    try std.testing.expect(!sites.isSet(0));
+    try std.testing.expect(!sites.isSet(sites.capacity() - 1));
+    sites.set(sites.capacity() - 1);
+    sites.set(31);
+    try std.testing.expect(sites.isSet(31));
+    try std.testing.expect(sites.isSet(sites.capacity() - 1));
+    try std.testing.expect(!sites.isSet(32));
+    sites = .{};
+    try std.testing.expect(!sites.isSet(31));
+    sites.set(32);
+    try std.testing.expect(sites.isSet(32));
+    try std.testing.expect(!sites.isSet(31));
+    try std.testing.expect(!sites.isSet(sites.capacity() - 1));
+}
 
 pub const ScalarLoad = struct {
     pc: u32,
@@ -657,8 +753,8 @@ fn evaluateInto(
     var decoded_cursor: usize = 0;
     var lane_spills = LaneSpills{};
     var setpc_follows: u8 = 0;
-    var unknown_scalar_exits: std.StaticBitSet(64 * 1024) = .initEmpty();
-    var revisited_loop_edges: std.StaticBitSet(64 * 1024) = .initEmpty();
+    var unknown_scalar_exits = BranchSites{};
+    var revisited_loop_edges = BranchSites{};
     var dense_walk = steps == null;
     var current_step: usize = 0;
     const instruction_limit: u32 = if (follow_lane_mask_fallthrough) bindings.resource_instruction_budget else maximum_instructions;
@@ -908,7 +1004,7 @@ fn evaluateInto(
     return;
 }
 
-fn resourceLoopHasUnresolvedExit(instructions: []const rdna2.Instruction, loop_start: u32, back_edge: u32, unknown_scalar_exits: *const std.StaticBitSet(64 * 1024)) bool {
+fn resourceLoopHasUnresolvedExit(instructions: []const rdna2.Instruction, loop_start: u32, back_edge: u32, unknown_scalar_exits: *const BranchSites) bool {
     if (loop_start >= back_edge) return false;
     const loop_begin = decodedInstructionIndexAtOrAfter(instructions, loop_start);
     for (instructions[loop_begin..]) |inst| {
