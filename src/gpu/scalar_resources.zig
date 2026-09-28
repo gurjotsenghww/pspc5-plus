@@ -54,7 +54,7 @@ pub fn appendMissingPointerLoads(
         if (pointer_register >= 127 or inst.data_words == 0 or
             inst.data_words > 16 or destination + inst.data_words > 128 or inst.memory_offset < 0) continue;
         if (output.len - end < inst.data_words) break;
-        var resolver = Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = graph, .snapshot = &empty, .definition_cache = cache };
+        var resolver = Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = graph, .snapshot = &empty.registers, .definition_cache = cache };
         var base: [2]u32 = undefined;
         if (!(resolver.words(@intCast(pointer_register), inst.pc, &base) catch false) or base[1] > 0xffff) continue;
         const pointer = @as(u64, base[0]) | (@as(u64, base[1]) << 32);
@@ -89,7 +89,8 @@ pub const Resolver = struct {
     reader: shaders.MemoryReader,
     instructions: []const rdna2.Instruction,
     graph: *const rdna2.control_flow.Graph,
-    snapshot: *const scalar.Evaluation,
+    /// Borrowed instruction-local registers; the caller owns their lifetime.
+    snapshot: *const scalar.ScalarRegisters,
     remaining: usize = 512,
     memoize_definitions: bool = true,
     definition_cache: ?*definitions.ScalarDefinitionCache = null,
@@ -161,7 +162,7 @@ pub const Resolver = struct {
             .instruction => |index| index,
         };
         const inst = self.instructions[index];
-        const known = self.snapshot.registers[register];
+        const known = self.snapshot[register];
         const destination = scalar.scalarRegisterIndex(inst.dst) orelse return null;
         if (register < destination) return null;
         const component: u32 = @intCast(register - destination);
@@ -420,14 +421,14 @@ test "empty scalar buffers resolve independently of dynamic offsets" {
         bindings.user_data[2] = if (variant == 1 or variant == 3) 1 else 0;
         instructions[0].opcode = if (variant == 2) .s_load_dwordx4 else .s_buffer_load_dwordx4;
         instructions[0].src1 = if (variant == 3) .{ .kind = .null } else .{ .kind = .sgpr, .reg = 40 };
-        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
         var words: [4]u32 = undefined;
         const success = try resolver.words(8, 8, &words);
         try std.testing.expectEqual(variant == 0 or variant == 3, success);
         if (success) try std.testing.expect(std.mem.allEqual(u32, &words, if (variant == 0) 0 else 0x12345678));
         try std.testing.expectEqual(@as(usize, if (variant == 3) 4 else 0), memory.calls);
     }
-    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
     var masked: [1]u32 = undefined;
     try std.testing.expect(try resolver.words(12, 16, &masked));
     try std.testing.expectEqual(@as(u32, 0x78), masked[0]);
@@ -480,7 +481,7 @@ test "resource descriptors survive lane spills, SGPR reuse, loops and branch joi
         bindings.user_data_count = 2;
         bindings.user_data[0] = 0x1000;
         const snapshot = scalar.Evaluation{};
-        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot, .definition_cache = &cache };
+        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers, .definition_cache = &cache };
         for (0..2) |_| {
             resolver.remaining = 512;
             var words: [8]u32 = undefined;
@@ -511,7 +512,7 @@ test "scalar resource recovery reconstructs bitfield sampler constants" {
     defer graph.deinit(std.testing.allocator);
     var bindings = std.mem.zeroes(shaders.StageBindings);
     var snapshot = scalar.Evaluation{};
-    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
     var words: [4]u32 = undefined;
     try std.testing.expect(try resolver.words(32, 12, &words));
     try std.testing.expectEqualSlices(u32, &.{ 0, 0x00fff000, 0x05500000, 0 }, &words);
@@ -548,7 +549,7 @@ test "sampler shifts resolve inside a branch with no scalar snapshot" {
     defer graph.deinit(std.testing.allocator);
     var bindings = std.mem.zeroes(shaders.StageBindings);
     var snapshot = scalar.Evaluation{};
-    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
     var words: [4]u32 = undefined;
     try std.testing.expect(try resolver.words(16, 16, &words));
     try std.testing.expectEqualSlices(u32, &.{ 0, 0x00fff000, 0x05000000, 0 }, &words);
@@ -590,7 +591,7 @@ test "scalar resource offsets recover wrapping multiplication before register re
     bindings.user_data[1] = 136;
     var snapshot = scalar.Evaluation{};
     snapshot.registers[4] = .{ .known = true, .value = 999, .producer_pc = 8 };
-    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
     var value: [1]u32 = undefined;
     try std.testing.expect(try resolver.words(4, 8, &value));
     try std.testing.expectEqual(@as(u32, 408), value[0]);
@@ -639,7 +640,7 @@ test "scalar resource recovery follows nested loads after USER_DATA reuse" {
     snapshot.registers[4] = .{ .known = true, .value = 0xdead, .producer_pc = 100 };
     // Even a matching producer must not bypass the descriptor bounds check.
     snapshot.registers[21] = .{ .known = true, .value = 0x700000, .producer_pc = 24 };
-    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = Memory.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = Memory.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
     var cache = definitions.ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
     defer cache.deinit();
     var words: [4]u32 = undefined;
@@ -718,7 +719,7 @@ test "persistent recovery rejects another program or control flow at the same PC
     bindings.user_data[0] = 10;
     bindings.user_data[1] = 20;
     const snapshot = scalar.Evaluation{};
-    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &original, .graph = &graph, .snapshot = &snapshot, .definition_cache = &cache };
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &original, .graph = &graph, .snapshot = &snapshot.registers, .definition_cache = &cache };
     var words: [1]u32 = undefined;
     try std.testing.expect(try resolver.words(4, 4, &words));
     try std.testing.expectEqual(@as(u32, 10), words[0]);
@@ -752,7 +753,7 @@ test "scalar resource recovery rejects skipped writers and clobbered halves" {
     bindings.user_data[0] = 0x1020;
     bindings.user_data[4] = 0x1000;
     const snapshot = scalar.Evaluation{};
-    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
     var words: [2]u32 = undefined;
     try std.testing.expect(!try resolver.words(4, 12, &words));
     // Entry words remain available only at their actual physical SGPR base.

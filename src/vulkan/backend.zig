@@ -3182,7 +3182,6 @@ const SampledImageKey = struct {
 
 const GraphicsResources = struct {
     scalar_reuse_safe: bool = true,
-    scalar_scratch: gpu.ScalarEvaluation = undefined,
     images: [maximum_sampled_images]PreparedSampledImage = undefined,
     image_count: usize = 0,
     descriptors: [maximum_sampled_images]gpu.ImageDescriptor = undefined,
@@ -3373,7 +3372,6 @@ const compute_watch_addresses = [_]u64{
 const ComputeResources = struct {
     scalar_reuse_safe: bool = true,
     vertex_index_proof: VertexIndexProof = .{},
-    scalar_scratch: gpu.ScalarEvaluation = undefined,
     mappings: [maximum_storage_mappings]gpu.ShaderSpirvStorageBufferBinding = undefined,
     mapping_count: usize = 0,
     scalar_registers: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister = undefined,
@@ -8591,8 +8589,8 @@ pub const Renderer = struct {
             bindings,
             reader,
             analysis,
-            &scalar,
-            &scalar,
+            &scalar.registers,
+            &scalar.registers,
             atomic.src1.reg,
             atomic.pc,
         )) orelse return Error.MissingStorageDescriptor;
@@ -9843,10 +9841,6 @@ pub const Renderer = struct {
         var table_loads: [maximum_storage_mappings]u32 = undefined;
         var table_load_count: usize = 0;
         const instructions = analysis.program.instructions.items;
-        // Checkpoints carry registers only. Reuse the empty load history
-        // instead of reinitializing its 512 records for every instruction.
-        const scalar = &result.scalar_scratch;
-        scalar.reset();
         var pointer_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .resource);
         while (pointer_instructions.next()) |instruction_index| {
             const candidate = &instructions[instruction_index];
@@ -9855,7 +9849,7 @@ pub const Renderer = struct {
             const pointer_register = gpu.scalar_provenance.scalarRegisterIndex(inst.src0) orelse continue;
             if (pointer_register + 1 >= 128) continue;
             if (hasScalarLoadAt(proven_pointer_loads, inst.pc)) continue;
-            scalar.registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc).*;
+            const scalar = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc);
             const table = try scalarPointerTablePlan(bindings, reader, analysis, scalar, candidate);
             var pointers = PointerCandidates{};
             var offset: u64 = 0;
@@ -9869,7 +9863,7 @@ pub const Renderer = struct {
                 table_loads[table_load_count] = inst.pc;
                 table_load_count += 1;
             } else {
-                if (scalar.registers[pointer_register].known and scalar.registers[pointer_register + 1].known) continue;
+                if (scalar[pointer_register].known and scalar[pointer_register + 1].known) continue;
                 const known_offset = scalarMemoryOffset(inst, scalar) orelse continue;
                 if (known_offset < 0) continue;
                 offset = @intCast(known_offset);
@@ -9931,7 +9925,7 @@ pub const Renderer = struct {
         bindings: *const gpu.ShaderBindings,
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
-        scalar: *const gpu.ScalarEvaluation,
+        scalar: *const gpu.scalar_provenance.ScalarRegisters,
         access: gpu.ShaderInstruction,
         writable: bool,
     ) anyerror!bool {
@@ -10468,10 +10462,8 @@ pub const Renderer = struct {
         const scalar_checkpoint_pcs = checkpoints.pcs;
         const scalar_checkpoint_registers = checkpoints.snapshots;
 
-        // Descriptor resolvers borrow this state read-only. Only the register
-        // snapshot changes between checkpoints; the load history stays empty.
-        const instruction_scalar = &result.scalar_scratch;
-        instruction_scalar.reset();
+        // Resolvers borrow the instruction-local snapshot until this lease is
+        // released. No register array or unused load history needs copying.
         const buffer_scan_started = hostTimestampNs();
         var buffer_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .resource);
         while (buffer_instructions.next()) |instruction_index| {
@@ -10575,11 +10567,11 @@ pub const Renderer = struct {
             // reuse the same SGPR quartet for several SMEM-loaded V# values;
             // a final whole-program snapshot (or the first mapping for that
             // SGPR) is not authoritative for a later MUBUF operation.
-            instruction_scalar.registers = scalarRegistersAtCheckpoint(
+            const instruction_scalar = scalarRegistersAtCheckpoint(
                 scalar_checkpoint_pcs,
                 scalar_checkpoint_registers,
                 inst.pc,
-            ).*;
+            );
             if (!scalarRegistersKnown(instruction_scalar, resource_sgpr, 4)) result.scalar_reuse_safe = false;
             // The instruction-local scalar state is authoritative. Attribute
             // tables are ordered by semantic/location, while shader fetches
@@ -10604,7 +10596,7 @@ pub const Renderer = struct {
                         table,
                         &used_vertex_attributes,
                         resolved,
-                        if (formatted_vertex_fetch) vertexFetchScalarOffset(inst.src2, &instruction_scalar.registers) else null,
+                        if (formatted_vertex_fetch) vertexFetchScalarOffset(inst.src2, instruction_scalar) else null,
                     )
                 else
                     null
@@ -10655,7 +10647,7 @@ pub const Renderer = struct {
                 );
                 continue;
             }
-            var staged_extent = constantBufferFetchExtent(descriptor, inst, &instruction_scalar.registers);
+            var staged_extent = constantBufferFetchExtent(descriptor, inst, instruction_scalar);
             if (draw_bounds) |bounds| {
                 if (formatted_vertex_fetch and descriptor.stride != 0 and inst.index_enable and inst.src0.kind == .vgpr and !inst.src0.dpp and !inst.src0.dpp8 and
                     !inst.src0.negate and !inst.src0.negate_hi and !inst.src0.absolute and inst.src0.sdwa_sel == 6 and
@@ -10669,7 +10661,7 @@ pub const Renderer = struct {
                         break :origins gpu.index_bounds.vectorOrigins(instructions, &analysis.graph, instruction_index, inst.src0.reg, 0);
                     };
                     if (origins) |proven| {
-                        staged_extent = vertexStagingPrefix(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, if (vertex_attribute) |attribute| attribute.offset_bytes else vertexFetchScalarOffset(inst.src2, &instruction_scalar.registers), proven.upperBound(&bounds.entries)));
+                        staged_extent = vertexStagingPrefix(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, if (vertex_attribute) |attribute| attribute.offset_bytes else vertexFetchScalarOffset(inst.src2, instruction_scalar), proven.upperBound(&bounds.entries)));
                     }
                 }
             }
@@ -10840,11 +10832,11 @@ pub const Renderer = struct {
             // instruction; using the entry snapshot bound late destinations
             // to an unrelated fallback slot (notably a 2D image for a 3D
             // image_store in large volume-processing kernels).
-            instruction_scalar.registers = scalarRegistersAtCheckpoint(
+            const instruction_scalar = scalarRegistersAtCheckpoint(
                 scalar_checkpoint_pcs,
                 scalar_checkpoint_registers,
                 inst.pc,
-            ).*;
+            );
             self.frame_profile.compute_images_resolved +|= 1;
             const resolve_started = hostTimestampNs();
             var descriptor = (try resolveComputeImageDescriptor(
@@ -11041,11 +11033,11 @@ pub const Renderer = struct {
             }
 
             const descriptor_slot = result.sampled_image_mapping_count;
-            instruction_scalar.registers = scalarRegistersAtCheckpoint(
+            const instruction_scalar = scalarRegistersAtCheckpoint(
                 scalar_checkpoint_pcs,
                 scalar_checkpoint_registers,
                 inst.pc,
-            ).*;
+            );
             const direct_image = try resolveComputeSampledImageDescriptor(
                 bindings,
                 reader,
@@ -20870,8 +20862,6 @@ pub const Renderer = struct {
         const scalar_checkpoint_pcs = checkpoints.pcs;
         const scalar_checkpoint_registers = checkpoints.snapshots;
 
-        const sampled_scalar = &result.scalar_scratch;
-        sampled_scalar.reset();
         const sampled_scan_started = hostTimestampNs();
         defer self.frame_profile.graphics_sampled_scan_ns +|= elapsedHostNanoseconds(sampled_scan_started);
         var sampled_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .sampled);
@@ -20912,11 +20902,11 @@ pub const Renderer = struct {
             // compute programs. Recover the state at this particular sample;
             // the fallback slots still cover shaders that reference only SRT
             // metadata and have no executable scalar producer.
-            sampled_scalar.registers = scalarRegistersAtCheckpoint(
+            const sampled_scalar = scalarRegistersAtCheckpoint(
                 scalar_checkpoint_pcs,
                 scalar_checkpoint_registers,
                 inst.pc,
-            ).*;
+            );
             if (!scalarRegistersKnown(sampled_scalar, inst.src1.reg, inst.imageResourceWords()) or
                 (!image_fetch and !scalarRegistersKnown(sampled_scalar, inst.src2.reg, 4))) result.scalar_reuse_safe = false;
             const image_descriptor = (try resolveComputeSampledImageDescriptor(
@@ -21045,7 +21035,7 @@ pub const Renderer = struct {
         bindings: *const gpu.ShaderBindings,
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
-        scalar: *const gpu.ScalarEvaluation,
+        scalar: *const gpu.scalar_provenance.ScalarRegisters,
         inst: gpu.ShaderInstruction,
         sampler_slot: usize,
         target: GuestColorTarget,
@@ -28373,7 +28363,7 @@ pub const Renderer = struct {
         return false;
     }
 
-    fn reportResourceFailure(self: *Renderer, bindings: *const gpu.ShaderBindings, inst: gpu.ShaderInstruction, scalar: *const gpu.ScalarEvaluation) void {
+    fn reportResourceFailure(self: *Renderer, bindings: *const gpu.ShaderBindings, inst: gpu.ShaderInstruction, scalar: *const gpu.scalar_provenance.ScalarRegisters) void {
         if (!self.trace_resource_failures) return;
         for (&self.reported_resource_failures) |*entry| {
             if (entry.*) |known| {
@@ -28387,7 +28377,7 @@ pub const Renderer = struct {
             std.debug.print("[resource userdata]", .{});
             for (bindings.user_data[0..bindings.user_data_count]) |word| std.debug.print(" {x:0>8}", .{word});
             std.debug.print("\n[resource scalars]", .{});
-            for (scalar.registers, 0..) |reg, index| {
+            for (scalar, 0..) |reg, index| {
                 if (reg.known) std.debug.print(" s{d}={x:0>8}@{x}", .{ index, reg.value, reg.producer_pc });
             }
             std.debug.print("\n", .{});
@@ -30488,9 +30478,9 @@ fn drawReuseStorageSafe(resources: *const ComputeResources) bool {
     return true;
 }
 
-fn scalarRegistersKnown(scalar: *const gpu.ScalarEvaluation, first: u32, count: u32) bool {
-    if (first > scalar.registers.len or count > scalar.registers.len - first) return false;
-    for (scalar.registers[first..][0..count]) |value| if (!value.known) return false;
+fn scalarRegistersKnown(scalar: *const gpu.scalar_provenance.ScalarRegisters, first: u32, count: u32) bool {
+    if (first > scalar.len or count > scalar.len - first) return false;
+    for (scalar[first..][0..count]) |value| if (!value.known) return false;
     return true;
 }
 
@@ -32911,7 +32901,7 @@ fn loadedScalarIndexUpperBound(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     before: usize,
     register: u32,
 ) anyerror!?u32 {
@@ -32945,7 +32935,7 @@ fn maskedBufferIndexUpperBound(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     before: usize,
     register: u32,
 ) anyerror!?u32 {
@@ -32978,7 +32968,7 @@ fn uniformScalarLoopUpperBound(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     before: usize,
     register: u32,
 ) anyerror!?u32 {
@@ -33001,7 +32991,7 @@ fn scalarPointerTablePlan(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     load: *const gpu.ShaderInstruction,
 ) anyerror!?ScalarPointerTablePlan {
     if (!isPointerScalarLoad(load.opcode) or load.memory_offset < 0) return null;
@@ -33056,7 +33046,7 @@ fn resolveScalarPointerImageCandidates(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
     const instructions = analysis.program.instructions.items;
@@ -33100,7 +33090,7 @@ fn typedImageIndexRange(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     before: usize,
     register: u32,
 ) ?TypedIndexRange {
@@ -33113,7 +33103,7 @@ fn typedDefinitionsIndexRange(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     definitions: gpu.index_bounds.LaneDefinitions,
     remaining: *u32,
 ) ?TypedIndexRange {
@@ -33130,7 +33120,7 @@ fn typedIndexOperandRange(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     before: usize,
     op: rdna2.Operand,
     remaining: *u32,
@@ -33148,7 +33138,7 @@ fn typedVectorIndexRange(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     definition: gpu.index_bounds.Definition,
     remaining: *u32,
 ) ?TypedIndexRange {
@@ -33194,7 +33184,7 @@ fn typedVectorIndexRange(
 fn resolveBufferTablePlan(
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     wanted_sgpr: u32,
     wanted_words: u32,
     before_pc: u32,
@@ -33235,7 +33225,7 @@ fn resolveBufferTablePlan(
         // a later snapshot may have reused the same SGPRs.
         if (try scalarBufferDescriptor(scalar, load.src0.reg)) |candidate| {
             var unchanged = true;
-            for (scalar.registers[load.src0.reg..][0..4]) |word|
+            for (scalar[load.src0.reg..][0..4]) |word|
                 unchanged = unchanged and word.producer_pc < load.pc;
             if (unchanged) break :table candidate;
         }
@@ -33321,7 +33311,7 @@ fn resolveIndexedBufferImageCandidates(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
     const instructions = analysis.program.instructions.items;
@@ -33387,7 +33377,7 @@ fn resolveBufferImageCandidates(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
     const plan = (try resolveBufferTablePlan(reader, analysis, scalar, sample.src1.reg, sample.imageResourceWords(), sample.pc, bindings, 16384)) orelse {
@@ -33419,7 +33409,7 @@ fn resolveVectorImageCandidates(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
     const instructions = analysis.program.instructions.items;
@@ -33469,7 +33459,7 @@ fn resolveBufferPointerCandidates(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     register: u32,
     before_pc: u32,
 ) anyerror!?PointerCandidates {
@@ -33506,7 +33496,7 @@ fn resolvePointerImageCandidates(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
     const instructions = analysis.program.instructions.items;
@@ -33544,13 +33534,13 @@ fn resolvePointerImageCandidates(
 }
 
 fn scalarBufferDescriptor(
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     resource_sgpr: u32,
 ) gpu.resources.Error!?gpu.BufferDescriptor {
     if (resource_sgpr + 4 > gpu.scalar_provenance.maximum_scalar_registers) return null;
     var words: [4]u32 = undefined;
     for (&words, 0..) |*word, index| {
-        const value = scalar.registers[resource_sgpr + index];
+        const value = scalar[resource_sgpr + index];
         if (!value.known) return null;
         word.* = value.value;
     }
@@ -33564,14 +33554,14 @@ fn scalarBufferDescriptor(
 }
 
 fn scalarImageDescriptor(
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     resource_sgpr: u32,
     word_count: u32,
 ) gpu.resources.Error!?gpu.ImageDescriptor {
     if (resource_sgpr + word_count > gpu.scalar_provenance.maximum_scalar_registers) return null;
     var words: [8]u32 = undefined;
     for (words[0..word_count], 0..) |*word, index| {
-        const value = scalar.registers[resource_sgpr + index];
+        const value = scalar[resource_sgpr + index];
         if (!value.known) return null;
         word.* = value.value;
     }
@@ -33582,13 +33572,13 @@ fn scalarImageDescriptor(
 }
 
 fn scalarSamplerDescriptor(
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     sampler_sgpr: u32,
 ) gpu.resources.Error!?gpu.resources.SamplerDescriptor {
     if (sampler_sgpr + 4 > gpu.scalar_provenance.maximum_scalar_registers) return null;
     var words: [4]u32 = undefined;
     for (&words, 0..) |*word, index| {
-        const value = scalar.registers[sampler_sgpr + index];
+        const value = scalar[sampler_sgpr + index];
         if (!value.known) return null;
         word.* = value.value;
     }
@@ -33660,7 +33650,7 @@ fn resolveProducedImageDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     resource_sgpr: u32,
     before_pc: u32,
     word_count: u32,
@@ -33682,7 +33672,7 @@ fn resolveProducedSamplerDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     sampler_sgpr: u32,
     before_pc: u32,
 ) anyerror!?gpu.resources.SamplerDescriptor {
@@ -33720,7 +33710,7 @@ fn resolveComputeSampledImageDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     resource_sgpr: u32,
     instruction_pc: u32,
     fallback_slot: usize,
@@ -33760,7 +33750,7 @@ fn resolveComputeSamplerDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     sampler_sgpr: u32,
     instruction_pc: u32,
     fallback_slot: usize,
@@ -33795,7 +33785,7 @@ fn resolveComputeImageDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     resource_sgpr: u32,
     instruction_pc: u32,
     fallback_slot: usize,
@@ -33883,13 +33873,13 @@ fn isBufferScalarLoad(opcode: gpu.ShaderOpcode) bool {
     };
 }
 
-fn scalarMemoryOffset(inst: gpu.ShaderInstruction, scalar: *const gpu.ScalarEvaluation) ?i64 {
+fn scalarMemoryOffset(inst: gpu.ShaderInstruction, scalar: *const gpu.scalar_provenance.ScalarRegisters) ?i64 {
     const operand_offset: i64 = switch (inst.src1.kind) {
         .null => 0,
         .integer_inline_constant, .literal_constant => inst.src1.value,
         .sgpr => if (inst.src1.reg < gpu.scalar_provenance.maximum_scalar_registers and
-            scalar.registers[inst.src1.reg].known)
-            scalar.registers[inst.src1.reg].value
+            scalar[inst.src1.reg].known)
+            scalar[inst.src1.reg].value
         else
             return null,
         else => return null,
@@ -33914,7 +33904,7 @@ fn resolveProducedBufferDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
     resource_sgpr: u32,
     before_pc: u32,
     depth: u8,
@@ -33941,8 +33931,8 @@ fn resolveComputeBufferDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
-    specialized: *const gpu.ScalarEvaluation,
-    full: *const gpu.ScalarEvaluation,
+    specialized: *const gpu.scalar_provenance.ScalarRegisters,
+    full: *const gpu.scalar_provenance.ScalarRegisters,
     resource_sgpr: u32,
     instruction_pc: u32,
 ) anyerror!?gpu.BufferDescriptor {
@@ -36985,7 +36975,7 @@ test "buffer table plans follow reaching loads and offsets across sibling branch
             analysis.program = program;
             analysis.graph = graph;
             analysis.scalar_definitions = if (cached) &cache else null;
-            const plan = try resolveBufferTablePlan(reader, &analysis, &scalar, 32, 8, 40, null, 16384);
+            const plan = try resolveBufferTablePlan(reader, &analysis, &scalar.registers, 32, 8, 40, null, 16384);
             if (variant != 0) {
                 try std.testing.expect(plan == null);
                 continue;
@@ -37032,22 +37022,22 @@ test "loaded scalar index bounds reread payloads and reject unavailable proof" {
     bindings.user_data_count = 8;
     @memcpy(bindings.user_data[4..8], &[_]u32{ 0x1000, 4 << 16, 16, 0 });
     const scalar = gpu.ScalarEvaluation{};
-    try std.testing.expectEqual(@as(?u32, 6), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    try std.testing.expectEqual(@as(?u32, 6), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar.registers, 1, 8));
     std.mem.writeInt(u32, memory.bytes[4..8], 13, .little);
-    try std.testing.expectEqual(@as(?u32, 14), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    try std.testing.expectEqual(@as(?u32, 14), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar.registers, 1, 8));
     std.mem.writeInt(u32, memory.bytes[4..8], std.math.maxInt(u32), .little);
-    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar.registers, 1, 8));
     memory.inaccessible = true;
-    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar.registers, 1, 8));
     const reads = memory.reads;
     bindings.user_data[6] = 0;
-    try std.testing.expectEqual(@as(?u32, 1), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    try std.testing.expectEqual(@as(?u32, 1), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar.registers, 1, 8));
     bindings.user_data[6] = 4;
     bindings.user_data[5] = 8 << 16;
-    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar.registers, 1, 8));
     bindings.user_data[5] = 4 << 16;
     bindings.user_data[6] = 16385;
-    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar.registers, 1, 8));
     try std.testing.expectEqual(reads, memory.reads);
 }
 
@@ -37094,14 +37084,14 @@ test "R128 scalar images ignore unknown and unrelated upper registers" {
     var scalar = gpu.ScalarEvaluation{};
     const words = [_]u32{ 0x40, 56 << 20, 0x8000c000, 0x90000fac };
     for (words, 80..) |value, register| scalar.registers[register] = .{ .known = true, .value = value };
-    const compact = (try scalarImageDescriptor(&scalar, 80, 4)).?;
+    const compact = (try scalarImageDescriptor(&scalar.registers, 80, 4)).?;
     try std.testing.expect(!compact.extended);
     try std.testing.expectEqual(compact.width, compact.pitch);
     try std.testing.expectEqual(@as(u64, 0), compact.metadata_address);
-    try std.testing.expectEqual(null, try scalarImageDescriptor(&scalar, 80, 8));
+    try std.testing.expectEqual(null, try scalarImageDescriptor(&scalar.registers, 80, 8));
     for (84..88) |register| scalar.registers[register] = .{ .known = true, .value = 0xffffffff };
-    try std.testing.expectEqualDeep(compact, (try scalarImageDescriptor(&scalar, 80, 4)).?);
-    const full = (try scalarImageDescriptor(&scalar, 80, 8)).?;
+    try std.testing.expectEqualDeep(compact, (try scalarImageDescriptor(&scalar.registers, 80, 4)).?);
+    const full = (try scalarImageDescriptor(&scalar.registers, 80, 8)).?;
     try std.testing.expect(full.extended);
     try std.testing.expect(full.metadata_address != 0);
 }
