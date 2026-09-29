@@ -1366,6 +1366,9 @@ const GuestBufferEntry = struct {
     last_used_sequence: u64,
     /// Content epoch advances on GPU writes, independently of cache reads.
     last_written_sequence: u64 = 0,
+    /// Publication order of actual GPU producers. Ordinary CPU uploads also
+    /// change the content epoch, but cannot supersede a pending GPU writer.
+    last_gpu_write_sequence: u64 = 0,
     /// Pending until the recorded consumer receives a submission timeline tick.
     last_gpu_use: u64 = 0,
     gpu_dirty: bool = false,
@@ -6501,7 +6504,7 @@ pub const Renderer = struct {
         const budget = self.storage_buffer_cache_budget_bytes;
         while (self.guest_buffer_backing_bytes +| incoming_size > budget) {
             const index = self.oldestGuestBuffer(replacing_slot, false) orelse break;
-            try self.flushGuestStorageBuffer(index);
+            try self.flushGuestStorageBeforeRemoval(index);
             // Complete pending snapshots before reclaiming their allocation.
             try self.waitForStorageBufferUse(&self.guest_buffers.items[index]);
             const entry = self.guest_buffers.items[index];
@@ -6656,7 +6659,7 @@ pub const Renderer = struct {
                     if (host_identity == null or view.identity != host_identity.?) {
                         // Keep one cache entry per guest range: publication and
                         // readback lookups must never find its retired identity.
-                        try self.flushGuestStorageBuffer(index);
+                        try self.flushGuestStorageBeforeRemoval(index);
                         const replacement = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, index), guest_address, host_identity);
                         const changed = &self.guest_buffers.items[index];
                         self.accountStorageBacking(changed.device_local, changed.host_transfer, false);
@@ -6666,6 +6669,7 @@ pub const Renderer = struct {
                         changed.host_transfer = replacement.transfer;
                         changed.last_gpu_use = 0;
                         changed.last_written_sequence = 0;
+                        changed.last_gpu_write_sequence = 0;
                         changed.gpu_dirty = false;
                         changed.page_generation = 0;
                         changed.content_hash = null;
@@ -6742,9 +6746,7 @@ pub const Renderer = struct {
                 // readback below before this backing allocation is recycled.
                 const victim_index = recycle_index.?;
                 self.frame_profile.buffer_cache_evictions +|= 1;
-                if (self.guest_buffers.items[victim_index].gpu_dirty) {
-                    try self.flushGuestStorageBuffer(victim_index);
-                }
+                try self.flushGuestStorageBeforeRemoval(victim_index);
                 const victim = &self.guest_buffers.items[victim_index];
                 // Retaining hundreds of small ranges must not retain the
                 // multi-megabyte capacities they happened to inherit from an
@@ -6771,6 +6773,7 @@ pub const Renderer = struct {
                 victim.size = size;
                 victim.last_used_sequence = self.guest_buffer_sequence;
                 victim.last_written_sequence = 0;
+                victim.last_gpu_write_sequence = 0;
                 victim.gpu_dirty = false;
                 victim.page_generation = 0;
                 victim.content_hash = null;
@@ -7012,6 +7015,41 @@ pub const Renderer = struct {
 
     fn flushGuestStoragePrefix(self: *Renderer, index: usize, requested_size: usize) (Error || std.mem.Allocator.Error)!void {
         if (index >= self.guest_buffers.items.len) return Error.GuestBufferNotStaged;
+        if (!self.guest_buffers.items[index].gpu_dirty or requested_size == 0) return;
+        // An older view can be observed before an overlapping newer writer.
+        // Publish those dependencies first, including their transitive overlaps.
+        // Use an iterative worklist: a long alias chain must not recurse on the
+        // guest submission thread's stack or drain unrelated dirty resources.
+        var stack = std.heap.stackFallback(@sizeOf(usize) * 32, self.allocator);
+        const allocator = stack.get();
+        var pending: std.ArrayList(usize) = .empty;
+        defer pending.deinit(allocator);
+        var selected = std.StaticBitSet(maximum_retained_buffer_entries).initEmpty();
+        try pending.append(allocator, index);
+        selected.set(index);
+        var cursor: usize = 0;
+        while (cursor < pending.items.len) : (cursor += 1) {
+            const current = pending.items[cursor];
+            const owner = &self.guest_buffers.items[current];
+            const end = owner.guest_address + @min(owner.size, if (current == index) requested_size else std.math.maxInt(usize));
+            for (self.guest_buffers.items, 0..) |*other, candidate| {
+                if (!other.gpu_dirty or selected.isSet(candidate) or
+                    other.last_gpu_write_sequence <= owner.last_gpu_write_sequence or
+                    other.guest_address >= end or other.guest_address + other.size <= owner.guest_address) continue;
+                try pending.append(allocator, candidate);
+                selected.set(candidate);
+            }
+        }
+        const Order = struct {
+            fn newer(renderer: *Renderer, a: usize, b: usize) bool {
+                return renderer.guest_buffers.items[a].last_gpu_write_sequence > renderer.guest_buffers.items[b].last_gpu_write_sequence;
+            }
+        };
+        std.mem.sort(usize, pending.items, self, Order.newer);
+        for (pending.items) |current| try self.flushGuestStoragePrefixOrdered(current, if (current == index) requested_size else std.math.maxInt(usize));
+    }
+
+    fn flushGuestStoragePrefixOrdered(self: *Renderer, index: usize, requested_size: usize) (Error || std.mem.Allocator.Error)!void {
         const entry = &self.guest_buffers.items[index];
         if (!entry.gpu_dirty) return;
         entry.content_hash = null;
@@ -7035,13 +7073,15 @@ pub const Renderer = struct {
         const mapping = try self.mapStorageReadback(entry, size);
         defer mapping.release(self);
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
-        if (!memory.write(memory.context, entry.guest_address, mapping.bytes)) return Error.GuestMemoryWriteFailed;
+        const clipped = try self.publishGuestStorageBytes(index, mapping.bytes);
         self.frame_profile.readback_bytes +%= size;
         self.frame_profile.storage_readback_bytes +%= size;
         if (size == entry_size) {
             entry.gpu_dirty = false;
             self.deferred_shader_metadata_slots.unset(index);
-            entry.page_generation = if (memory.gpu_generation) |generation|
+            // The protected subranges remain newer in guest memory than in
+            // this old backing. A clean rebind must upload them again.
+            entry.page_generation = if (clipped) 0 else if (memory.gpu_generation) |generation|
                 generation(memory.context, entry.guest_address, entry_size)
             else
                 0;
@@ -7049,7 +7089,7 @@ pub const Renderer = struct {
             // A later read-only SSBO bind can then distinguish unchanged
             // published output from a new native CPU write without reuploading
             // the former or hiding the latter from sampled-image consumers.
-            if (size >= self.storage_fingerprint_min_bytes) {
+            if (!clipped and size >= self.storage_fingerprint_min_bytes) {
                 const hash_started = hostTimestampNs();
                 entry.content_hash = gpu.parallel_copy.fingerprint(mapping.bytes);
                 self.frame_profile.buffer_fingerprint_ns +|= elapsedHostNanoseconds(hash_started);
@@ -7059,6 +7099,59 @@ pub const Renderer = struct {
 
     fn flushGuestStorageBuffer(self: *Renderer, index: usize) (Error || std.mem.Allocator.Error)!void {
         return self.flushGuestStoragePrefix(index, std.math.maxInt(usize));
+    }
+
+    /// Independent Vulkan buffers can cover the same guest bytes. Publishing
+    /// an old wide snapshot must preserve a newer writer inside that range,
+    /// even when the newer result has already been published and is clean.
+    fn publishGuestStorageBytes(self: *Renderer, index: usize, bytes: []const u8) (Error || std.mem.Allocator.Error)!bool {
+        const entry = self.guest_buffers.items[index];
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const end = entry.guest_address + bytes.len;
+        const Span = struct {
+            first: usize,
+            end: usize,
+            fn less(_: void, a: @This(), b: @This()) bool {
+                return a.first < b.first;
+            }
+        };
+        var stack = std.heap.stackFallback(@sizeOf(Span) * 32, self.allocator);
+        const allocator = stack.get();
+        var protected: std.ArrayList(Span) = .empty;
+        defer protected.deinit(allocator);
+        for (self.guest_buffers.items) |other| {
+            if (other.last_gpu_write_sequence <= entry.last_gpu_write_sequence or
+                other.guest_address >= end or other.guest_address + other.size <= entry.guest_address) continue;
+            try protected.append(allocator, .{
+                .first = @intCast(@max(other.guest_address, entry.guest_address) - entry.guest_address),
+                .end = @intCast(@min(other.guest_address + other.size, end) - entry.guest_address),
+            });
+        }
+        std.mem.sort(Span, protected.items, {}, Span.less);
+        var cursor: usize = 0;
+        for (protected.items) |span| {
+            if (span.first > cursor and !memory.write(memory.context, entry.guest_address + cursor, bytes[cursor..span.first]))
+                return Error.GuestMemoryWriteFailed;
+            cursor = @max(cursor, span.end);
+        }
+        if (cursor < bytes.len and !memory.write(memory.context, entry.guest_address + cursor, bytes[cursor..]))
+            return Error.GuestMemoryWriteFailed;
+        return protected.items.len != 0;
+    }
+
+    /// A clean newer writer still protects overlapping bytes. Publish older
+    /// dirty views while that protection exists, before removing its entry.
+    fn flushGuestStorageBeforeRemoval(self: *Renderer, index: usize) (Error || std.mem.Allocator.Error)!void {
+        const removed = self.guest_buffers.items[index];
+        if (removed.last_gpu_write_sequence != 0) {
+            for (self.guest_buffers.items, 0..) |other, older_index| {
+                if (!other.gpu_dirty or other.last_gpu_write_sequence >= removed.last_gpu_write_sequence or
+                    other.guest_address >= removed.guest_address + removed.size or
+                    other.guest_address + other.size <= removed.guest_address) continue;
+                try self.flushGuestStorageBuffer(older_index);
+            }
+        }
+        try self.flushGuestStorageBuffer(index);
     }
 
     fn flushGuestStorageRange(self: *Renderer, address: u64, size: usize) (Error || std.mem.Allocator.Error)!void {
@@ -11362,6 +11455,7 @@ pub const Renderer = struct {
 
     fn markGuestBufferWritten(self: *Renderer, entry: *GuestBufferEntry) void {
         self.advanceGuestBufferContents(entry);
+        entry.last_gpu_write_sequence = entry.last_written_sequence;
         entry.gpu_dirty = true;
         entry.content_hash = null;
         if (entry.size >= deferred_storage_write_min_bytes) return;

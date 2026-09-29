@@ -1,5 +1,10 @@
 # Yotei shader resource audit and repeated-query cost
 
+Follow-up: the [buffer-publication investigation](yotei-buffer-publication-2026-09-29.md)
+subsequently identified an old GPU readback as the writer of a corrupt producer
+header and added a shared renderer correction. The startup observations below
+describe the preceding build.
+
 The renderer has real resource gaps even when shader instructions decode
 successfully. This investigation fixes missing resource preparation for
 floating-point buffer atomics and removes repeated static register-definition

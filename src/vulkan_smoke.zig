@@ -2249,6 +2249,63 @@ fn runBufferAtomicResourcesProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("floating buffer atomic resources passed: min/max, decoded/typed IR, automatic staging and published writes\n", .{});
 }
 
+fn runBufferRangePublicationProbe(allocator: std.mem.Allocator) !void {
+    for (0..3) |read_order| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = true, .retain_clean_storage_buffers = true });
+        defer renderer.deinit();
+        var guest = GuestMemory{ .watch_generation = 1 };
+        const backend = renderer.dcbBackend(guest.interface());
+        for (0..32) |i| guest.word(0x1000 + i * 4, 0x3f72_603a);
+        for ([_][2]u12{ .{ 0, 124 }, .{ 32, 60 } }, 0..) |offsets, index| {
+            const first = mubuf(0x1c, offsets[0], 0, 0, 0);
+            const last = mubuf(0x1c, offsets[1], 0, 0, 0);
+            const code = [_]u32{ vop1(1, 0, 4), first[0] & ~@as(u32, 1 << 13), first[1], vop1(1, 0, 5), last[0] & ~@as(u32, 1 << 13), last[1], 0xbf81_0000 };
+            const program: u32 = 0x100 + @as(u32, @intCast(index)) * 0x100;
+            for (code, 0..) |word, i| guest.word(program + i * 4, word);
+            if (index == 1) @memset(guest.bytes[0x1020..0x1060], 0);
+            var state = gpu.State{};
+            try state.writeRegister(.shader, 0x20c, program >> 8);
+            try state.writeRegister(.shader, 0x20d, 0);
+            try state.writeRegister(.shader, 0x213, 6 << 1);
+            const descriptor = if (index == 0) [_]u32{ 0x1000, 0, 128, 0, 0x11223344, 0x55667788 } else [_]u32{ 0x1020, 0, 64, 0, 487, 0x12345678 };
+            for (descriptor, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        }
+        var expected: [64]u8 = @splat(0);
+        std.mem.writeInt(u32, expected[32..36], 487, .little);
+        std.mem.writeInt(u32, expected[60..64], 0x12345678, .little);
+        if (read_order == 1) {
+            // The wide view is observed while the newer header is still dirty.
+            var wide: [128]u8 = undefined;
+            try std.testing.expect(backend.vtable.read(backend.context, 0x1000, &wide));
+            try std.testing.expectEqualSlices(u8, &expected, wide[32..96]);
+        } else {
+            var header: [64]u8 = undefined;
+            try std.testing.expect(backend.vtable.read(backend.context, 0x1020, &header));
+            try std.testing.expectEqualSlices(u8, &expected, &header);
+            if (read_order == 2) {
+                // Keep the old dirty range bound while forcing the clean newer
+                // header out of the cache. Its publication authority must survive
+                // long enough to prevent the old snapshot from replacing it.
+                _ = try renderer.stageGuestStorageBufferAt(1, 0x1000, 128);
+                renderer.storage_buffer_cache_budget_bytes = 0;
+                _ = try renderer.stageGuestStorageBufferAt(0, 0x2000, 64);
+                for (renderer.guest_buffers.items) |entry| try std.testing.expect(entry.guest_address != 0x1020);
+            }
+        }
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqualSlices(u8, &expected, guest.bytes[0x1020..0x1060]);
+        try std.testing.expectEqual(@as(u32, 0x11223344), std.mem.readInt(u32, guest.bytes[0x1000..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, 0x55667788), std.mem.readInt(u32, guest.bytes[0x107c..][0..4], .little));
+        // A clipped old backing is now clean but must re-upload the merged bytes.
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x1000, 128);
+        var merged: [128]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x1000, &merged);
+        try std.testing.expectEqualSlices(u8, guest.bytes[0x1000..0x1080], &merged);
+    }
+    std.debug.print("buffer range publication passed: both read orders, clean newer eviction, disjoint writes and merged rebind\n", .{});
+}
+
 fn runBufferAtomicProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -11642,6 +11699,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-atomic-resources")) {
         try runBufferAtomicResourcesProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-range-publication")) {
+        try runBufferRangePublicationProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-logical-scc")) {
