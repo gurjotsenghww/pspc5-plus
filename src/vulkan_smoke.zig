@@ -2210,6 +2210,45 @@ fn runBufferCompactionProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("buffer compaction passed: sparse/high-only/empty wave64 masks, exact counts, dense indices, concurrent waves and preserved padding\n", .{});
 }
 
+/// Exercise native resource discovery and effect classification too. The
+/// instruction-only atomic probe below supplies its bindings explicitly.
+fn runBufferAtomicResourcesProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |typed_ir| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_shader_ir = typed_ir });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        for ([_]u7{ 0x3f, 0x40 }, [_]f32{ -20, 20 }, 0..) |opcode, value, index| {
+            const program: u32 = 0x100 + @as(u32, @intCast(index)) * 0x100;
+            const destination: u32 = 0x10000 + @as(u32, @intCast(index)) * 0x100;
+            const atomic = mubuf(opcode, 0, 1, 0, 4);
+            const code = [_]u32{
+                0xf408_0100,               0xfa00_0000, // s_load_dwordx4 s4, s[0:1]
+                0xbf8c_007f,               vop1(1, 1, 255),
+                @as(u32, @bitCast(value)), atomic[0] & ~@as(u32, 1 << 13),
+                atomic[1],                 0xbf81_0000,
+            };
+            for (code, 0..) |word, i| guest.word(program + i * 4, word);
+            guest.word(destination, @bitCast(@as(f32, 10)));
+            guest.word(destination + 4, 0x1234_5678);
+            var state = gpu.State{};
+            try state.writeRegister(.shader, 0x20c, program >> 8);
+            try state.writeRegister(.shader, 0x20d, 0);
+            try state.writeRegister(.shader, 0x213, 2 << 1);
+            try state.writeRegister(.shader, 0x240, 0x800);
+            try state.writeRegister(.shader, 0x241, 0);
+            const words = [_]u32{ destination, 0, 8, 0 };
+            for (words, 0..) |word, i| guest.word(0x800 + i * 4, word);
+            const report = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            try std.testing.expect(report.spirv_words != 0);
+            try renderer.flushPendingGuestWrites();
+            try std.testing.expectEqual(@as(u32, @bitCast(value)), std.mem.readInt(u32, guest.bytes[destination..][0..4], .little));
+            try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, guest.bytes[destination + 4 ..][0..4], .little));
+        }
+    }
+    std.debug.print("floating buffer atomic resources passed: min/max, decoded/typed IR, automatic staging and published writes\n", .{});
+}
+
 fn runBufferAtomicProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -11599,6 +11638,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-atomics")) {
         try runBufferAtomicProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-atomic-resources")) {
+        try runBufferAtomicResourcesProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-logical-scc")) {

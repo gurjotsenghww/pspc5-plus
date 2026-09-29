@@ -411,6 +411,8 @@ fn needsResource(opcode: rdna2.Opcode) bool {
         .buffer_atomic_and,
         .buffer_atomic_or,
         .buffer_atomic_xor,
+        .buffer_atomic_fmin,
+        .buffer_atomic_fmax,
         .image_load,
         .image_load_mip,
         .image_store,

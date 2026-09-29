@@ -2708,6 +2708,12 @@ const FrameProfile = struct {
     compute_image_dedup_ns: u64 = 0,
     compute_image_dedup_steps: u64 = 0,
     compute_tail_ns: u64 = 0,
+    failed_draws: u64 = 0,
+    failed_dispatches: u64 = 0,
+    unsupported_compute_programs: u64 = 0,
+    unresolved_storage_resources: u64 = 0,
+    null_storage_resources: u64 = 0,
+    rejected_storage_resources: u64 = 0,
     compute_sampled_loop_ns: u64 = 0,
     compute_descriptor_update_ns: u64 = 0,
     compute_flat_memory_ns: u64 = 0,
@@ -4759,6 +4765,7 @@ pub const Renderer = struct {
     reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
     reported_compute_resource_programs: [8]u64 = @splat(0),
     reported_resource_failures: [64]?struct { program: u64, pc: u32 } = @splat(null),
+    reported_storage_failures: [64]?struct { program: u64, pc: u32, reason: []const u8 } = @splat(null),
     reported_yotei_gds_dispatches: u8 = 0,
     reported_yotei_visibility_dispatches: u8 = 0,
     yotei_packed_visibility_seeds: u8 = 0,
@@ -7533,6 +7540,7 @@ pub const Renderer = struct {
         // staging large transient resources for a shader that cannot execute
         // can invalidate still-recorded NVIDIA command buffers.
         if (firstUnsupportedInstruction(analysis)) |unsupported| {
+            self.frame_profile.unsupported_compute_programs += 1;
             self.elided_dispatches += 1;
             if (self.shouldReportComputeShaderFailure(program_address, error.UnsupportedOpcode)) {
                 std.debug.print(
@@ -9996,11 +10004,10 @@ pub const Renderer = struct {
     ) anyerror!bool {
         if (!self.storage_buffer_nonuniform_indexing or access.family == .smem or access.src1.kind != .sgpr) return false;
         const instructions = analysis.program.instructions.items;
-        var before: usize = 0;
-        while (before < instructions.len and instructions[before].pc < access.pc) : (before += 1) {}
+        const before = analysis.instructionBefore(access.pc);
         var load_index: ?usize = null;
         for (0..4) |component| {
-            const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, before, access.src1.reg + @as(u32, @intCast(component))) orelse return false;
+            const definition = analysis.scalarDefinition(before, access.src1.reg + @as(u32, @intCast(component))) orelse return false;
             const index = switch (definition) {
                 .entry => return false,
                 .instruction => |index| index,
@@ -10446,7 +10453,26 @@ pub const Renderer = struct {
     }
 
     fn traceSkippedStorage(self: *Renderer, bindings: *const gpu.ShaderBindings, inst: gpu.ShaderInstruction, reason: []const u8, descriptor: ?gpu.BufferDescriptor) void {
+        // These count resource-preparation gaps, not executed GPU accesses:
+        // unresolved instructions may belong to a lane-dependent inactive path.
+        if (descriptor == null) {
+            self.frame_profile.unresolved_storage_resources += 1;
+        } else if (descriptor.?.isNull() or descriptor.?.size_bytes == 0) {
+            self.frame_profile.null_storage_resources += 1;
+        } else {
+            self.frame_profile.rejected_storage_resources += 1;
+        }
         if (!self.trace_resource_failures) return;
+        // Retain per-frame totals, but avoid printing the same static gap tens
+        // of thousands of times. Reasons are literals or static error names.
+        for (&self.reported_storage_failures) |*entry| {
+            if (entry.*) |known| {
+                if (known.program == bindings.program_address and known.pc == inst.pc and std.mem.eql(u8, known.reason, reason)) return;
+            } else {
+                entry.* = .{ .program = bindings.program_address, .pc = inst.pc, .reason = reason };
+                break;
+            }
+        } else return;
         std.debug.print("[storage skipped] flip={d} draw={d} stage={s} program=0x{x} pc=0x{x} op={s} reason={s} address=0x{x} bytes={d}\n", .{
             self.flip_callbacks,                             self.frame_profile.draws, @tagName(bindings.stage), bindings.program_address,
             inst.pc,                                         inst.opcode.mnemonic(),   reason,                   if (descriptor) |value| value.address else 0,
@@ -10603,6 +10629,8 @@ pub const Renderer = struct {
                 .buffer_atomic_and,
                 .buffer_atomic_or,
                 .buffer_atomic_xor,
+                .buffer_atomic_fmin,
+                .buffer_atomic_fmax,
                 => true,
                 else => continue,
             };
@@ -27932,6 +27960,10 @@ pub const Renderer = struct {
                 "[gpu shader reads] flip={d} metadata_candidates={d} scans_skipped={d}\n",
                 .{ self.flip_callbacks, profile.shader_metadata_candidates, profile.shader_metadata_scans_skipped },
             );
+            std.debug.print(
+                "[gpu gaps] flip={d} draw_failures={d} dispatch_failures={d} unsupported_compute={d} storage_unresolved={d} storage_null={d} storage_rejected={d}\n",
+                .{ self.flip_callbacks, profile.failed_draws, profile.failed_dispatches, profile.unsupported_compute_programs, profile.unresolved_storage_resources, profile.null_storage_resources, profile.rejected_storage_resources },
+            );
             if (profile.feedback_snapshots != 0) std.debug.print(
                 "[gpu feedback] flip={d} snapshots={d} copy_kib={d}\n",
                 .{ self.flip_callbacks, profile.feedback_snapshots, profile.feedback_snapshot_bytes / 1024 },
@@ -28749,6 +28781,7 @@ pub const Renderer = struct {
     }
 
     fn reportGuestDrawFailure(self: *Renderer, state: *const gpu.State, err: anyerror) void {
+        self.frame_profile.failed_draws += 1;
         if (self.trace_resource_failures) {
             const vertex = if (graphicsVertexStage(state)) |stage| stage.programAddress(state) else null;
             const local = (@as(u64, state.readRegister(.shader, 0x148) orelse 0) << 8) |
@@ -29281,6 +29314,7 @@ pub const Renderer = struct {
             self.last_dispatch_error = err;
             // Soft-skip resource/translation gaps so one incomplete compute
             // kernel does not abort the DCB before later draws and flips.
+            self.frame_profile.failed_dispatches += 1;
             const soft = self.reanimal_nvidia_compute_workaround_active or
                 err == Error.MissingStorageDescriptor or
                 err == Error.GuestMemoryReadFailed or
@@ -33201,7 +33235,7 @@ fn maskedBufferIndexUpperBound(
     register: u32,
 ) anyerror!?u32 {
     const instructions = analysis.program.instructions.items;
-    const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, before, register) orelse return null;
+    const definition = analysis.scalarDefinition(before, register) orelse return null;
     const index = switch (definition) {
         .entry => return null,
         .instruction => |index| index,
@@ -33262,7 +33296,7 @@ fn scalarPointerTablePlan(
     const instructions = analysis.program.instructions.items;
     var load_index: usize = 0;
     while (load_index < instructions.len and instructions[load_index].pc < load.pc) : (load_index += 1) {}
-    const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, load_index, @intCast(offset_register)) orelse return null;
+    const definition = analysis.scalarDefinition(load_index, @intCast(offset_register)) orelse return null;
     const multiply_index = switch (definition) {
         .entry => return null,
         .instruction => |index| index,
@@ -33311,11 +33345,10 @@ fn resolveScalarPointerImageCandidates(
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
     const instructions = analysis.program.instructions.items;
-    var before: usize = 0;
-    while (before < instructions.len and instructions[before].pc < sample.pc) : (before += 1) {}
+    const before = analysis.instructionBefore(sample.pc);
     var load_index: ?usize = null;
     for (0..sample.imageResourceWords()) |component| {
-        const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, before, sample.src1.reg + @as(u32, @intCast(component))) orelse return null;
+        const definition = analysis.scalarDefinition(before, sample.src1.reg + @as(u32, @intCast(component))) orelse return null;
         const index = switch (definition) {
             .entry => return null,
             .instruction => |index| index,
@@ -33576,11 +33609,10 @@ fn resolveIndexedBufferImageCandidates(
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
     const instructions = analysis.program.instructions.items;
-    var before: usize = 0;
-    while (before < instructions.len and instructions[before].pc < sample.pc) : (before += 1) {}
+    const before = analysis.instructionBefore(sample.pc);
     var load_index: ?usize = null;
     for (0..sample.imageResourceWords()) |component| {
-        const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, before, sample.src1.reg + @as(u32, @intCast(component))) orelse return null;
+        const definition = analysis.scalarDefinition(before, sample.src1.reg + @as(u32, @intCast(component))) orelse return null;
         const index = switch (definition) {
             .entry => return null,
             .instruction => |index| index,
@@ -33592,7 +33624,7 @@ fn resolveIndexedBufferImageCandidates(
     if (!isBufferScalarLoad(load.opcode) or load.dst.kind != .sgpr or load.src0.kind != .sgpr or
         load.memory_offset < 0 or sample.src1.reg < load.dst.reg or sample.src1.reg + sample.imageResourceWords() > load.dst.reg + load.data_words) return null;
     const offset_register = gpu.scalar_provenance.scalarRegisterIndex(load.src1) orelse return null;
-    const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, load_index.?, @intCast(offset_register)) orelse return null;
+    const definition = analysis.scalarDefinition(load_index.?, @intCast(offset_register)) orelse return null;
     const shift_index = switch (definition) {
         .entry => return null,
         .instruction => |index| index,

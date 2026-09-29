@@ -321,6 +321,13 @@ pub const ScalarDefinitionCache = struct {
         return position;
     }
 
+    /// Immutable reaching definitions, including an ambiguous result. Resource
+    /// candidate planners use the same bounded cache as scalar recovery.
+    pub fn definition(self: *ScalarDefinitionCache, before: usize, register: u32) ?ScalarDefinition {
+        if (!static_query_cache_enabled.load(.monotonic)) return scalarDefinition(self.instructions, &self.graph, before, register);
+        return self.lookup(before, register).value;
+    }
+
     pub fn vectorEntryOrigins(self: *ScalarDefinitionCache, before: usize, register: u32) ?VectorEntryOrigins {
         if (!static_query_cache_enabled.load(.monotonic)) return vectorOrigins(self.instructions, &self.graph, before, register, 0);
         const key = Key{ .before = before, .register = register };

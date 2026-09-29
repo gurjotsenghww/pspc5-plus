@@ -69,6 +69,24 @@ pub const Analysis = struct {
         self.scalar_definitions = cache;
     }
 
+    pub fn instructionBefore(self: *const Analysis, pc: u32) usize {
+        const instructions = self.program.instructions.items;
+        if (self.scalar_definitions) |cache| {
+            if (cache.matches(instructions, &self.graph)) return cache.instructionBefore(pc);
+        }
+        var position: usize = 0;
+        while (position < instructions.len and instructions[position].pc < pc) : (position += 1) {}
+        return position;
+    }
+
+    pub fn scalarDefinition(self: *const Analysis, before: usize, register: u32) ?@import("index_bounds.zig").ScalarDefinition {
+        const instructions = self.program.instructions.items;
+        if (self.scalar_definitions) |cache| {
+            if (cache.matches(instructions, &self.graph)) return cache.definition(before, register);
+        }
+        return @import("index_bounds.zig").scalarDefinition(instructions, &self.graph, before, register);
+    }
+
     pub fn scalarIndexUpperBound(self: *const Analysis, before: usize, register: u32) ?u32 {
         const instructions = self.program.instructions.items;
         if (self.scalar_definitions) |cache| {
@@ -248,6 +266,8 @@ pub const Analysis = struct {
                 .buffer_atomic_and,
                 .buffer_atomic_or,
                 .buffer_atomic_xor,
+                .buffer_atomic_fmin,
+                .buffer_atomic_fmax,
                 .tbuffer_store_format_x,
                 .tbuffer_store_format_xy,
                 .tbuffer_store_format_xyz,
@@ -321,6 +341,8 @@ pub const Analysis = struct {
                 .buffer_atomic_and,
                 .buffer_atomic_or,
                 .buffer_atomic_xor,
+                .buffer_atomic_fmin,
+                .buffer_atomic_fmax,
                 .tbuffer_store_format_x,
                 .tbuffer_store_format_xy,
                 .tbuffer_store_format_xyz,
@@ -639,6 +661,26 @@ test "analysis identifies a global buffer store as externally visible" {
     try std.testing.expect(analysis.hasExternalEffects());
     try std.testing.expect(analysis.hasBufferExternalEffects());
     try std.testing.expect(analysis.hasNonRasterEffects());
+}
+
+test "floating buffer atomics retain effects and resource checkpoints" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 0x3f, 0x40 }) |opcode| {
+        for ([_]bool{ false, true }) |typed_ir| {
+            var memory = TestMemory{};
+            memory.word(0, 0xe000_0000 | (opcode << 18));
+            memory.word(4, 0); // buffer_atomic_fmin/fmax v0, s[0:3]
+            memory.word(8, 0xbf81_0000);
+            var analysis = try decodeWithOptions(a, memory.reader(), 0, 16, .{ .enable_typed_ir = typed_ir });
+            defer analysis.deinit(a);
+            try std.testing.expect(analysis.hasExternalEffects());
+            try std.testing.expect(analysis.hasNonRasterEffects());
+            try std.testing.expect(analysis.hasBufferExternalEffects());
+            try analysis.enableResourceCheckpoints(a);
+            try std.testing.expectEqualSlices(u32, &.{0}, analysis.resource_checkpoints.?.resource);
+            try std.testing.expect(!analysis.resource_checkpoints.?.reads_only_resources);
+        }
+    }
 }
 
 test "analysis follows a forward branch beyond an early return and padding" {
