@@ -223,6 +223,10 @@ append-only catalog cannot save a new multi-megabyte module at that occupancy.
 A bounded replacement policy is an identified follow-up; this change does not
 implement it or increase the memory budget.
 
+Subsequent work implements and tests that bounded replacement policy; see the
+[warmup catalog follow-up](yotei-warmup-catalog-2026-09-30.md). It also records
+a later repeat that passes flip 725, qualifying the stall observation below.
+
 A later consistent translation-cache sample read all 391 graphics modules and
 547 compute modules in those caches. None used the linear control-flow fallback
 that drops branches; 145 graphics and 451 compute modules used the dispatcher
