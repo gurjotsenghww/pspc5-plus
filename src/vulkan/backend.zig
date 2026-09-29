@@ -11503,6 +11503,7 @@ pub const Renderer = struct {
                 self.pipeline_cache_hits += 1;
                 self.frame_profile.compute_pipeline_hits += 1;
                 entry.last_used_sequence = self.compute_pipeline_sequence;
+                if (self.compute_warmup) |warmup| warmup.touch(entry.hash);
                 return .{ .pipeline = entry.pipeline, .cache_hit = true };
             }
         }
@@ -11518,6 +11519,7 @@ pub const Renderer = struct {
                 self.pipeline_cache_hits += 1;
                 self.frame_profile.compute_pipeline_hits += 1;
                 entry.last_used_sequence = self.compute_pipeline_sequence;
+                if (self.compute_warmup) |warmup| warmup.touch(entry.hash);
                 return .{ .pipeline = entry.pipeline, .cache_hit = true };
             }
         }
@@ -11574,7 +11576,7 @@ pub const Renderer = struct {
         }
         self.pipeline_cache_misses += 1;
         self.frame_profile.compute_pipeline_misses += 1;
-        if (self.compute_warmup) |warmup| warmup.record(&self.pipeline_compile_queue, words);
+        if (self.compute_warmup) |warmup| warmup.recordHashed(&self.pipeline_compile_queue, hash, words);
         return .{ .pipeline = pipeline, .cache_hit = false };
     }
 

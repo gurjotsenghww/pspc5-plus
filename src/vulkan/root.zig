@@ -37,4 +37,5 @@ test {
     _ = image_alias;
     _ = image_state;
     _ = pipeline_compiler;
+    _ = @import("pipeline_warmup.zig");
 }
