@@ -201,28 +201,30 @@ fn runCopyDataProbe(allocator: std.mem.Allocator) !void {
     );
 }
 fn runExpandedBufferCacheProbe(allocator: std.mem.Allocator) !void {
+    const count = 4096;
+    const base: usize = 0x4000;
+    const ProbeMemory = SizedGuestMemory(base + (count + 1) * 64);
     const renderer = try allocator.create(vulkan.Renderer);
     defer allocator.destroy(renderer);
     renderer.* = try vulkan.Renderer.init(allocator, .{
         .enable_timeline_scheduler = true,
         .retain_clean_storage_buffers = true,
-        .storage_buffer_cache_entries = 600,
+        .storage_buffer_cache_entries = count,
         .cache_storage_buffer_contents = true,
     });
     defer renderer.deinit();
-    var guest = GuestMemory{};
+    var guest = ProbeMemory{};
     var memory = guest.interface();
-    memory.fingerprint = GuestMemory.fingerprint;
+    memory.fingerprint = ProbeMemory.fingerprint;
     _ = renderer.dcbBackend(memory);
     renderer.storage_fingerprint_min_bytes = 16;
-    const base: usize = 0x4000;
     var original: u64 = 0;
-    for (0..600) |index| {
+    for (0..count) |index| {
         guest.word(base + index * 64, @intCast(0x12340000 + index));
         const staged = try renderer.stageGuestStorageBufferAt(0, base + index * 64, 64);
         if (index == 0) original = staged.buffer;
     }
-    try std.testing.expectEqual(@as(usize, 600), renderer.guest_buffers.items.len);
+    try std.testing.expectEqual(@as(usize, count), renderer.guest_buffers.items.len);
     var rebound = try renderer.stageGuestStorageBufferAt(0, base, 64);
     try std.testing.expect(rebound.allocation_cache_hit);
     try std.testing.expectEqual(original, rebound.buffer);
@@ -230,21 +232,30 @@ fn runExpandedBufferCacheProbe(allocator: std.mem.Allocator) !void {
     try renderer.readbackGuestStorageBuffer(base, &bytes);
     try std.testing.expectEqualSlices(u8, guest.bytes[base..][0..64], &bytes);
 
-    // Native CPU replacement must invalidate contents even beyond the old
-    // 512-entry capacity. Slot pressure then preserves the recently used one.
+    // Native CPU replacement must invalidate contents at full cache capacity.
+    // Slot pressure then preserves the recently used range.
     guest.word(base, 0xaabbccdd);
     rebound = try renderer.stageGuestStorageBufferAt(0, base, 64);
     try std.testing.expect(rebound.allocation_cache_hit);
     try renderer.readbackGuestStorageBuffer(base, &bytes);
     try std.testing.expectEqual(@as(u32, 0xaabbccdd), std.mem.readInt(u32, bytes[0..4], .little));
     const evictions = renderer.frame_profile.buffer_cache_evictions;
-    _ = try renderer.stageGuestStorageBufferAt(0, base + 600 * 64, 64);
+    const victim_steps = renderer.frame_profile.buffer_cache_victim_steps;
+    _ = try renderer.stageGuestStorageBufferAt(0, base + count * 64, 64);
+    try std.testing.expectEqual(victim_steps + 1, renderer.frame_profile.buffer_cache_victim_steps);
     try std.testing.expectEqual(evictions + 1, renderer.frame_profile.buffer_cache_evictions);
-    try std.testing.expectEqual(@as(usize, 600), renderer.guest_buffers.items.len);
+    try std.testing.expectEqual(@as(usize, count), renderer.guest_buffers.items.len);
     rebound = try renderer.stageGuestStorageBufferAt(0, base, 64);
     try std.testing.expect(rebound.allocation_cache_hit);
     try std.testing.expectEqual(original, rebound.buffer);
-    std.debug.print("expanded buffer cache passed: 600 resident ranges, CPU replacement, indexed lookup and LRU eviction\n", .{});
+    // Rebind the highest original slot, including its CPU update.
+    const high_address = base + (count - 1) * 64;
+    guest.word(high_address, 0x55667788);
+    rebound = try renderer.stageGuestStorageBufferAt(0, high_address, 64);
+    try std.testing.expect(rebound.allocation_cache_hit);
+    try renderer.readbackGuestStorageBuffer(high_address, &bytes);
+    try std.testing.expectEqual(@as(u32, 0x55667788), std.mem.readInt(u32, bytes[0..4], .little));
+    std.debug.print("expanded buffer cache passed: {d} resident ranges, CPU replacement, indexed lookup and LRU eviction\n", .{count});
 }
 
 fn command(opcode: u8, body_words: u14) u32 {

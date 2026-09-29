@@ -201,7 +201,12 @@ of ranges (runner default 4096, renderer API default 2048, configurable from
 shader's descriptor count. `PS5_GPU_STORAGE_BUFFER_CACHE_MIB` bounds their
 backings (default 4096 MiB). Allocations grow with observed demand; these limits
 do not reserve their full capacity. The address index covers the maximum entry
-count. `[gpu buffer cache]` reports hits, misses and evictions per sampled frame.
+count. An allocation-free recency list updates in constant time on each use.
+Victim searches walk from the oldest entry and stop at the first eligible
+buffer, preserving active descriptor bindings and dirty-buffer publication.
+Budget trimming repairs the list when a dense cache slot moves; the moved
+buffer keeps its age. `[gpu buffer cache]` reports hits, misses, evictions and
+`victim_steps` (entries examined during victim selection) per sampled frame.
 Backing and device-local byte totals are maintained at allocation ownership
 changes, so an ordinary cache miss does not rescan every retained entry merely
 to check its budget. Replacements, trimming and renaming update both totals;

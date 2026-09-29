@@ -217,9 +217,10 @@ fn fillPadData(output: *PadData) void {
     output.analog_l2 = host.analog_l2;
     output.analog_r2 = host.analog_r2;
 
-    // Direct CLI runs retain the automatic bring-up pulse. The launcher always
-    // selects an explicit mode, so physical input is never mixed with it.
-    if (host_input.mode() != .automatic) return;
+    // Scripted checks use the same pulses with a neutral host state, so typing
+    // in another application cannot move the title into a different scene.
+    const input_mode = host_input.mode();
+    if (input_mode != .automatic and input_mode != .scripted) return;
     const profile: AutomaticProfile = @enumFromInt(automatic_profile.load(.acquire));
     if (profile == .default or profile == .rapid_down) {
         const now_us = kernel_runtime.processTimeMicroseconds();

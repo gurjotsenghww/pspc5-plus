@@ -20,6 +20,8 @@ pub const Mode = enum {
     controller,
     keyboard,
     hybrid,
+    /// Unattended bring-up pulses without physical keyboard/controller input.
+    scripted,
 };
 
 pub const State = struct {
@@ -90,6 +92,7 @@ pub fn mode() Mode {
             if (eqlIgnoreCase(text, "controller")) value = .controller;
             if (eqlIgnoreCase(text, "keyboard")) value = .keyboard;
             if (eqlIgnoreCase(text, "hybrid")) value = .hybrid;
+            if (eqlIgnoreCase(text, "scripted")) value = .scripted;
         }
     }
     cached_mode = value;
@@ -99,6 +102,7 @@ pub fn mode() Mode {
 pub fn read() State {
     const selected = mode();
     var state = State{ .connected = true };
+    if (selected == .scripted) return state;
     // Direct game-run sessions keep the unattended Cross pulse in libScePad,
     // but must still accept an explicit key or a physical controller. Some
     // title prompts stop their render loop while waiting, so a short pulse

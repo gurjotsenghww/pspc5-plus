@@ -1364,6 +1364,37 @@ const GuestBufferEntry = struct {
     content_hash: ?u64 = null,
 };
 
+test "buffer victims follow recency while preserving dirty and active bindings" {
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    var entries: [4]GuestBufferEntry = undefined;
+    for (&entries, 0..) |*entry, index| entry.* = .{
+        .descriptor_index = @intCast(index),
+        .guest_address = 0x1000 + index * 64,
+        .size = 64,
+        .device_local = .{ .handle = index + 1, .memory = 0, .size = 64 },
+        .last_used_sequence = index,
+    };
+    renderer.guest_buffers = .{ .items = &entries, .capacity = entries.len };
+    renderer.guest_buffer_recency = .{};
+    for (entries) |_| renderer.guest_buffer_recency.append();
+    renderer.active_storage_buffers = @splat(0);
+    renderer.frame_profile = .{};
+    entries[0].gpu_dirty = true;
+    renderer.active_storage_buffers[1] = entries[1].device_local.handle;
+    try std.testing.expectEqual(@as(?usize, 0), renderer.oldestGuestBuffer(0, false));
+    try std.testing.expectEqual(@as(?usize, 2), renderer.oldestGuestBuffer(0, true));
+    try std.testing.expectEqual(@as(?usize, 1), renderer.oldestGuestBuffer(1, true));
+    renderer.guest_buffer_recency.touch(0);
+    try std.testing.expectEqual(@as(?usize, 2), renderer.oldestGuestBuffer(0, false));
+    renderer.active_storage_buffers[0] = entries[2].device_local.handle;
+    try std.testing.expectEqual(@as(?usize, 2), renderer.oldestGuestBuffer(0, false));
+    try std.testing.expectEqual(@as(?usize, 3), renderer.oldestGuestBuffer(4, false));
+    renderer.active_storage_buffers[2] = entries[3].device_local.handle;
+    renderer.active_storage_buffers[3] = entries[0].device_local.handle;
+    try std.testing.expectEqual(null, renderer.oldestGuestBuffer(4, false));
+}
+
 test "buffer page observations follow native epochs, range changes and racing writes" {
     const Watch = struct {
         epoch: u64 = 1,
@@ -2740,6 +2771,7 @@ const FrameProfile = struct {
     buffer_cache_hits: u64 = 0,
     buffer_cache_misses: u64 = 0,
     buffer_cache_evictions: u64 = 0,
+    buffer_cache_victim_steps: u64 = 0,
     sampled_stage_ns: u64 = 0,
     sampled_flush_ns: u64 = 0,
     sampled_generation_ns: u64 = 0,
@@ -4465,6 +4497,7 @@ pub const Renderer = struct {
     guest_buffer_backing_bytes: u64 = 0,
     guest_buffer_device_bytes: u64 = 0,
     guest_buffer_address_index: @import("sampled_image_index.zig").Index(maximum_retained_buffer_entries) = .{},
+    guest_buffer_recency: @import("buffer_recency.zig").Index(maximum_retained_buffer_entries) = .{},
     active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
     active_storage_offsets: [maximum_storage_descriptors]vk.DeviceSize = @splat(0),
     active_storage_ranges: [maximum_storage_descriptors]vk.DeviceSize = @splat(0),
@@ -6418,23 +6451,23 @@ pub const Renderer = struct {
         return .{ .device = device, .transfer = transfer };
     }
 
+    fn oldestGuestBuffer(self: *Renderer, replacing_slot: u32, clean_only: bool) ?usize {
+        var order = self.guest_buffer_recency.oldestFirst();
+        while (order.next()) |index| {
+            self.frame_profile.buffer_cache_victim_steps +|= 1;
+            const entry = self.guest_buffers.items[index];
+            if (clean_only and entry.gpu_dirty) continue;
+            // Bindings prepared for this draw or dispatch remain pinned.
+            if (!self.storageBufferBoundElsewhere(entry.device_local.handle, replacing_slot)) return index;
+        }
+        return null;
+    }
+
     fn trimGuestBufferCache(self: *Renderer, incoming_size: usize, replacing_slot: u32) anyerror!void {
         var reclaimed = false;
         const budget = self.storage_buffer_cache_budget_bytes;
         while (self.guest_buffer_backing_bytes +| incoming_size > budget) {
-            var oldest: u64 = std.math.maxInt(u64);
-            var victim_index: ?usize = null;
-            for (self.guest_buffers.items, 0..) |entry, index| {
-                // Previously prepared bindings belong to the current draw or
-                // dispatch. A cache budget must never invalidate those inputs.
-                if (entry.last_used_sequence < oldest and
-                    !self.storageBufferBoundElsewhere(entry.device_local.handle, replacing_slot))
-                {
-                    oldest = entry.last_used_sequence;
-                    victim_index = index;
-                }
-            }
-            const index = victim_index orelse break;
+            const index = self.oldestGuestBuffer(replacing_slot, false) orelse break;
             try self.flushGuestStorageBuffer(index);
             // Complete pending snapshots before reclaiming their allocation.
             try self.waitForStorageBufferUse(&self.guest_buffers.items[index]);
@@ -6455,6 +6488,7 @@ pub const Renderer = struct {
                 if (bound.* == index) bound.* = null else if (bound.* == last_index) bound.* = index;
             }
             self.guest_buffer_address_index.invalidate();
+            self.guest_buffer_recency.removeSwap(index);
             _ = self.guest_buffers.swapRemove(index);
             self.frame_profile.buffer_cache_evictions +|= 1;
             reclaimed = true;
@@ -6626,14 +6660,15 @@ pub const Renderer = struct {
             // slot owner can be the hottest vertex buffer while hundreds of
             // old one-draw constants occupy the rest of the cache.
             var recycle_index: ?usize = null;
-            for (self.guest_buffers.items, 0..) |entry, index| {
-                if (!self.retain_clean_storage_buffers and
-                    (entry.device_local.host_mapping == null or cache_full) and
-                    entry.descriptor_index == descriptor_index and
-                    !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
-                {
-                    recycle_index = index;
-                    break;
+            if (!self.retain_clean_storage_buffers) {
+                for (self.guest_buffers.items, 0..) |entry, index| {
+                    if ((entry.device_local.host_mapping == null or cache_full) and
+                        entry.descriptor_index == descriptor_index and
+                        !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
+                    {
+                        recycle_index = index;
+                        break;
+                    }
                 }
             }
             // Do not evict a GPU-authored range merely because the next shader
@@ -6646,31 +6681,11 @@ pub const Renderer = struct {
             if (recycle_index) |index| {
                 if (self.guest_buffers.items[index].gpu_dirty) {
                     recycle_index = null;
-                    if (cache_full) {
-                        var oldest_clean: u64 = std.math.maxInt(u64);
-                        for (self.guest_buffers.items, 0..) |entry, candidate_index| {
-                            if (!entry.gpu_dirty and entry.last_used_sequence < oldest_clean and
-                                !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
-                            {
-                                oldest_clean = entry.last_used_sequence;
-                                recycle_index = candidate_index;
-                            }
-                        }
-                    }
+                    if (cache_full) recycle_index = self.oldestGuestBuffer(descriptor_index, true);
                 }
             }
             if (recycle_index == null and cache_full) {
-                var oldest_index: ?usize = null;
-                var oldest: u64 = std.math.maxInt(u64);
-                for (self.guest_buffers.items, 0..) |entry, index| {
-                    if (entry.last_used_sequence < oldest and
-                        !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
-                    {
-                        oldest = entry.last_used_sequence;
-                        oldest_index = index;
-                    }
-                }
-                recycle_index = oldest_index orelse return Error.InvalidStorageDescriptor;
+                recycle_index = self.oldestGuestBuffer(descriptor_index, false) orelse return Error.InvalidStorageDescriptor;
             }
 
             if (recycle_index == null) {
@@ -6686,6 +6701,7 @@ pub const Renderer = struct {
                     .host_transfer = backing.transfer,
                     .last_used_sequence = self.guest_buffer_sequence,
                 });
+                self.guest_buffer_recency.append();
                 entry_index = self.guest_buffers.items.len - 1;
             } else {
                 // Batched graphics snapshots clean ranges in the frame upload
@@ -6737,6 +6753,7 @@ pub const Renderer = struct {
 
         const entry = &self.guest_buffers.items[entry_index.?];
         entry.last_used_sequence = self.guest_buffer_sequence;
+        self.guest_buffer_recency.touch(entry_index.?);
         if (entry.device_local.host_mapping != null) {
             try self.flushGuestStorageImageRange(guest_address, size);
             self.frame_profile.resident_storage_bytes +%= size;
@@ -27720,9 +27737,9 @@ pub const Renderer = struct {
                 "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d} materialize_ms={d} views_ms={d} page_ms={d} page_reused_kib={d} vertex_trim_kib={d} vertex_trim_fetches={d}\n",
                 .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms, profile.stage_materialize_ns / std.time.ns_per_ms, profile.stage_views_ns / std.time.ns_per_ms, profile.buffer_page_ns / std.time.ns_per_ms, profile.page_reused_bytes / 1024, profile.bounded_vertex_bytes / 1024, profile.bounded_vertex_fetches },
             );
-            std.debug.print("[gpu buffer cache] flip={d} hit={d} miss={d} evict={d} limit={d}\n", .{
-                self.flip_callbacks,                                                                                 profile.buffer_cache_hits, profile.buffer_cache_misses, profile.buffer_cache_evictions,
-                if (self.retain_clean_storage_buffers) self.storage_buffer_cache_entries else maximum_guest_buffers,
+            std.debug.print("[gpu buffer cache] flip={d} hit={d} miss={d} evict={d} limit={d} victim_steps={d}\n", .{
+                self.flip_callbacks,                                                                                 profile.buffer_cache_hits,         profile.buffer_cache_misses, profile.buffer_cache_evictions,
+                if (self.retain_clean_storage_buffers) self.storage_buffer_cache_entries else maximum_guest_buffers, profile.buffer_cache_victim_steps,
             });
             std.debug.print("[gpu emulated copies] flip={d} words={d} batched={d}\n", .{
                 self.flip_callbacks, profile.emulated_copy_words, profile.batched_copy_words,

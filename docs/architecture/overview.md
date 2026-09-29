@@ -99,6 +99,10 @@ Alt plus the arrow keys controls the right stick. The launcher passes these pref
 `PS5_INPUT_MODE`, `PS5_CONTROLLER_INDEX`, `PS5_KEYMAP`, `PS5_SHOW_FPS`, and
 `PS5_AUDIO_DISABLED`, so direct CLI and automated runs keep their previous
 behaviour unless those variables are set.
+For unattended diagnostics, `PS5_INPUT_MODE=scripted` keeps the existing
+bring-up button pulses while ignoring physical keyboard and controller input.
+This prevents activity in another application from changing the measured
+scene. The launcher and default interactive CLI input remain unchanged.
 
 Saved games are kept at the emulator home in `savedata/<titleId>/<slot>/`, keyed
 by the product code the title publishes about itself. That is deliberate: a
