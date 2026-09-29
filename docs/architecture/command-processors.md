@@ -65,6 +65,13 @@ Excess threads sleep and remain reusable; reducing a limit never interrupts an
 accepted job. Foreground compilation retains priority over queued warmups.
 Diagnostics do not alter admission decisions.
 
+With a configured ceiling of at least two, background jobs may occupy at most
+`ceiling - 1` slots. The remaining capacity lets a newly arriving foreground
+job start without waiting for a running warmup to finish. Foreground admission
+may temporarily exceed the adaptive limit for this purpose, but never the
+configured ceiling. One-worker configurations remain serial. Running jobs are
+not preempted, and a thread-creation failure can still delay foreground work.
+
 For eligible graphics shaders, the owner captures guest reads during the normal
 sampled-resource checkpoint walk. Separate scalar-state and storage-checkpoint
 jobs use that immutable snapshot while the owner resolves and stages textures.
@@ -88,7 +95,9 @@ Compute dispatch resource staging is unchanged.
 `[gpu resource workers]` reports jobs, consumed results, fallbacks, worker/wait
 time, active admission limit, created threads, peak simultaneous jobs, average
 job/queue time and controller changes. `[gpu compiler workers]` reports the
-compiler limit, activity, backlog, completion count and controller changes.
+compiler limit, activity, active background jobs, backlog, completion count and
+controller changes. The reported limit is the adaptive limit before the
+foreground reservation described above.
 
 Large CPU tile/detile transforms also share the existing bounded copy pool
 (`PS5_GPU_COPY_WORKERS`, default four participants including the caller for

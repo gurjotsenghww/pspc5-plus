@@ -59,6 +59,7 @@ pub const Queue = struct {
     thread_count: usize = 0,
     outstanding: usize = 0,
     active: usize = 0,
+    background_active: usize = 0,
     peak_active: usize = 0,
     adaptation: policy.Policy = .{},
     completed: u64 = 0,
@@ -69,6 +70,7 @@ pub const Queue = struct {
         limit: usize,
         threads: usize,
         active: usize,
+        background_active: usize,
         outstanding: usize,
         completed: u64,
         peak_active: usize,
@@ -96,6 +98,7 @@ pub const Queue = struct {
             .limit = if (self.adaptation.enabled) @min(self.adaptation.limit, self.worker_limit) else self.worker_limit,
             .threads = self.thread_count,
             .active = self.active,
+            .background_active = self.background_active,
             .outstanding = self.outstanding,
             .completed = self.completed,
             .peak_active = self.peak_active,
@@ -111,12 +114,28 @@ pub const Queue = struct {
     }
 
     fn ensureWorkers(self: *Queue, now: u64) void {
-        const desired = @min(self.effectiveLimit(now), self.outstanding);
+        const desired = @min(self.admissionLimit(now), self.outstanding);
         while (self.thread_count < desired) {
             const thread = self.spawn_worker(self) catch return;
             self.threads[self.thread_count] = thread;
             self.thread_count += 1;
         }
+    }
+
+    fn admissionLimit(self: *Queue, now: u64) usize {
+        const limit = self.effectiveLimit(now);
+        // An adaptive limit of one must not hide the reserved foreground slot
+        // behind a long-running warmup. Never exceed the configured ceiling.
+        if (self.foreground.head != null and self.background_active != 0)
+            return @min(std.math.clamp(self.worker_limit, 1, maximum_workers), @max(limit, self.background_active + 1));
+        return limit;
+    }
+
+    fn backgroundLimit(self: *const Queue) usize {
+        // Driver compilations cannot be interrupted. Leave capacity for a
+        // future frame-critical job, even while the foreground list is empty.
+        // A one-worker configuration necessarily remains serial.
+        return @max(1, std.math.clamp(self.worker_limit, 1, maximum_workers) - 1);
     }
 
     pub fn submit(self: *Queue, job: *Job) void {
@@ -145,6 +164,7 @@ pub const Queue = struct {
             // fallback even when native thread creation fails.
             _ = if (background) self.background.pop() else self.foreground.pop();
             self.active += 1;
+            if (background) self.background_active += 1;
             self.lock.unlock(io);
             const started = timestamp();
             job.thread_id = std.Thread.getCurrentId();
@@ -155,6 +175,7 @@ pub const Queue = struct {
             job.done.set(io);
             self.lock.lockUncancelable(io);
             self.active -= 1;
+            if (background) self.background_active -= 1;
             self.outstanding -= 1;
             self.completed += 1;
             self.adaptation.complete(ended, elapsed, 0);
@@ -197,7 +218,12 @@ pub const Queue = struct {
         defer self.lock.unlock(io);
         while (true) {
             if (self.stopping and self.outstanding == 0) return;
-            if (self.active >= self.effectiveLimit(timestamp())) {
+            if (self.active >= self.admissionLimit(timestamp())) {
+                self.ready.waitUncancelable(io, &self.lock);
+                continue;
+            }
+            const background = self.foreground.head == null;
+            if (background and self.background_active >= self.backgroundLimit()) {
                 self.ready.waitUncancelable(io, &self.lock);
                 continue;
             }
@@ -207,6 +233,7 @@ pub const Queue = struct {
                 continue;
             };
             self.active += 1;
+            if (background) self.background_active += 1;
             self.peak_active = @max(self.peak_active, self.active);
             const queued_ns = job.queued_ns;
             self.lock.unlock(io);
@@ -220,6 +247,7 @@ pub const Queue = struct {
             // The owner may now release job. Never access it again here.
             self.lock.lockUncancelable(io);
             self.active -= 1;
+            if (background) self.background_active -= 1;
             self.outstanding -= 1;
             self.completed += 1;
             self.adaptation.complete(ended, elapsed, started -| queued_ns);
@@ -306,6 +334,69 @@ test "foreground compilation precedes queued warmups with FIFO within priority" 
     gate.set(syncIo());
     queue.waitIdle();
     try std.testing.expectEqual(@as(u32, 1423), output.load(.acquire));
+}
+
+test "long warmups leave a worker available for newly arriving foreground work" {
+    var queue = Queue{ .worker_limit = 4 };
+    var gate: std.Io.Event = .unset;
+    defer queue.deinit();
+    defer gate.set(syncIo());
+    var entered = std.atomic.Value(u32).init(0);
+    var urgent_entered = std.atomic.Value(u32).init(0);
+    var output = std.atomic.Value(u32).init(0);
+    var urgent_output = std.atomic.Value(u32).init(0);
+    var warmups: [4]TestWork = undefined;
+    for (&warmups) |*work| {
+        work.* = .{ .entered = &entered, .gate = &gate, .output = &output, .digit = 1 };
+        queue.submitBackground(&work.job);
+    }
+    try waitEntered(&entered, 3);
+    var urgent = TestWork{ .entered = &urgent_entered, .output = &urgent_output, .digit = 7 };
+    queue.submit(&urgent.job);
+    // Completion must not depend on releasing any of the background jobs.
+    try waitEntered(&urgent_entered, 1);
+    urgent.job.wait();
+    try std.testing.expectEqual(@as(u32, 7), urgent_output.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 3), entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), queue.status().background_active);
+    gate.set(syncIo());
+    queue.waitIdle();
+    try std.testing.expectEqual(@as(u32, 1111), output.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), queue.status().background_active);
+    try std.testing.expect(queue.status().peak_active <= 4);
+}
+
+test "foreground can use reserved capacity when adaptive admission is one" {
+    var queue = Queue{
+        .worker_limit = 2,
+        .adaptation = .{
+            .enabled = true,
+            // Cheap completed jobs keep adaptive admission at one independently
+            // of test scheduling. A running background job is now slow instead.
+            .samples = 16,
+            .average_job_ns = 1,
+        },
+    };
+    var gate: std.Io.Event = .unset;
+    defer queue.deinit();
+    defer gate.set(syncIo());
+    var entered = std.atomic.Value(u32).init(0);
+    var urgent_entered = std.atomic.Value(u32).init(0);
+    var output = std.atomic.Value(u32).init(0);
+    var urgent_output = std.atomic.Value(u32).init(0);
+    var warmup = TestWork{ .entered = &entered, .gate = &gate, .output = &output, .digit = 1 };
+    var urgent = TestWork{ .entered = &urgent_entered, .output = &urgent_output, .digit = 7 };
+    queue.submitBackground(&warmup.job);
+    try waitEntered(&entered, 1);
+    try std.testing.expectEqual(@as(usize, 1), queue.status().limit);
+    queue.submit(&urgent.job);
+    try waitEntered(&urgent_entered, 1);
+    urgent.job.wait();
+    try std.testing.expectEqual(@as(u32, 7), urgent_output.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), output.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), queue.status().peak_active);
+    gate.set(syncIo());
+    queue.waitIdle();
 }
 
 test "compiler shutdown drains jobs and joins every worker" {

@@ -21072,8 +21072,8 @@ pub const Renderer = struct {
                 if (try self.appendIndirectGraphicsImages(result, bindings, reader, analysis, sampled_scalar, inst, sampler_slot, render_target_write, extra_colors)) continue;
                 self.reportResourceFailure(bindings, inst, sampled_scalar);
                 std.debug.print(
-                    "[vulkan dcb] sampled image missing for s{d} (user_data={d} srt={any})\n",
-                    .{ inst.src1.reg, bindings.user_data_count, bindings.srt_address != null },
+                    "[vulkan dcb] sampled image missing for s{d} (user_data={d} srt={any} stage={s} program=0x{x} pc=0x{x})\n",
+                    .{ inst.src1.reg, bindings.user_data_count, bindings.srt_address != null, @tagName(bindings.stage), bindings.program_address, inst.pc },
                 );
                 return Error.UnsupportedSampledImage;
             };
@@ -27950,8 +27950,8 @@ pub const Renderer = struct {
             }
             const compilers = self.pipeline_compile_queue.status();
             if (compilers.completed != 0 or compilers.outstanding != 0) std.debug.print(
-                "[gpu compiler workers] flip={d} limit={d} threads={d} active={d} pending={d} completed={d} peak={d} auto={any} changes={d}/{d}\n",
-                .{ self.flip_callbacks, compilers.limit, compilers.threads, compilers.active, compilers.outstanding - compilers.active, compilers.completed, compilers.peak_active, compilers.adaptation.enabled, compilers.adaptation.increases, compilers.adaptation.decreases },
+                "[gpu compiler workers] flip={d} limit={d} threads={d} active={d} background={d} pending={d} completed={d} peak={d} auto={any} changes={d}/{d}\n",
+                .{ self.flip_callbacks, compilers.limit, compilers.threads, compilers.active, compilers.background_active, compilers.outstanding - compilers.active, compilers.completed, compilers.peak_active, compilers.adaptation.enabled, compilers.adaptation.increases, compilers.adaptation.decreases },
             );
             // Separated from the fence total: waiting because the command
             // buffer pool ran dry is a cost of how the frame was cut up, not
