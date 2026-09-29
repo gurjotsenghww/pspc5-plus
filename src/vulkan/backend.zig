@@ -10110,23 +10110,26 @@ pub const Renderer = struct {
         }
         const load = &instructions[load_index.?];
         if (load.dst.kind != .sgpr or access.src1.reg < load.dst.reg or access.src1.reg + 4 > load.dst.reg + load.data_words) return false;
-        const plan = (try scalarPointerTablePlan(bindings, reader, analysis, scalar, load)) orelse return false;
-        if (plan.count > 32 or result.mapping_count + plan.count > result.mappings.len) return false;
-        var descriptors: [32]gpu.BufferDescriptor = undefined;
-        var candidates: [32][4]u32 = undefined;
-        // One instruction has one addressing/format layout. Keep dissimilar
-        // layouts unresolved until their addressing can also be selected.
-        for (0..plan.count) |index| {
-            try reader.readWords(((plan.base + plan.first + index * plan.step) & ~@as(u64, 3)) + (access.src1.reg - load.dst.reg) * 4, &candidates[index]);
-            const descriptor = gpu.resources.decodeBufferDescriptor(&candidates[index]) catch return false;
-            if (!isBoundedProducedBufferDescriptor(descriptor) or descriptor.isNull() or descriptor.size_bytes == 0) return false;
-            if (index != 0 and ((candidates[index][1] & 0xffff0000) != (candidates[0][1] & 0xffff0000) or candidates[index][3] != candidates[0][3])) return false;
-            descriptors[index] = descriptor;
+        var candidates = BufferDescriptorCandidates{};
+        if (isBufferScalarLoad(load.opcode)) {
+            // The scalar buffer bounds every possible descriptor read, even
+            // when its index comes from a lane or its byte product wraps.
+            const plan = (try resolveBufferTablePlan(reader, analysis, scalar, access.src1.reg, 4, access.pc, bindings, 16384)) orelse return false;
+            var offset = plan.first;
+            while (offset < plan.limit) : (offset += plan.step) {
+                const words = try readBufferImageWords(reader, plan.buffer, offset & ~@as(u64, 3), 4);
+                if (!candidates.append(words[0..4].*)) return false;
+            }
+        } else {
+            const plan = (try scalarPointerTablePlan(bindings, reader, analysis, scalar, load)) orelse return false;
+            for (0..plan.count) |index| {
+                var words: [4]u32 = undefined;
+                try reader.readWords(((plan.base + plan.first + index * plan.step) & ~@as(u64, 3)) + (access.src1.reg - load.dst.reg) * 4, &words);
+                if (!candidates.append(words)) return false;
+            }
         }
-        for (descriptors[0..plan.count], candidates[0..plan.count], 0..) |descriptor, words, index| {
-            var duplicate = false;
-            for (candidates[0..index]) |previous| duplicate = duplicate or std.mem.eql(u32, &previous, &words);
-            if (duplicate) continue;
+        if (candidates.count == 0 or result.mapping_count + candidates.count > result.mappings.len) return false;
+        for (candidates.descriptors[0..candidates.count], candidates.words[0..candidates.count]) |descriptor, words| {
             const size: usize = @intCast(descriptor.size_bytes);
             const slot = result.descriptorForRange(descriptor.address, size) orelse blk: {
                 const free = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
@@ -10372,9 +10375,13 @@ pub const Renderer = struct {
 
     fn prepareStorageBufferLookups(self: *Renderer, resources: *ComputeResources) anyerror!void {
         const mappings = resources.mappings[0..resources.mapping_count];
-        // Small shaders retain their direct comparisons. Large dynamic V#
-        // tables otherwise bake streamed addresses into hundreds of sites.
-        if (mappings.len < 64) return;
+        // Even small dynamic V# tables change addresses during streaming.
+        // Keep their tuples in runtime data so relocation reuses the pipeline.
+        // Ordinary bindings need neither lookup storage nor a plan allocation.
+        const has_candidates = for (mappings) |binding| {
+            if (binding.candidate_words != null and binding.lookup == null) break true;
+        } else false;
+        if (!has_candidates) return;
         const lookup = rdna2.spirv.buffer_lookup;
         const plan = &resources.lookup_plan;
         try plan.reset(self.allocator, mappings.len);
@@ -20198,47 +20205,12 @@ pub const Renderer = struct {
                                 self.frame_profile.draws,
                             },
                         );
-                        for (self.completed_frames.items) |captured| {
-                            if (captured.guest_address != captured_target.descriptor.address) continue;
-                            var trace_path_buffer: [96]u8 = undefined;
-                            const trace_path = std.fmt.bufPrintZ(
-                                &trace_path_buffer,
-                                "out\\trace-frame-{d:0>4}-draw-{d}.ppm",
-                                .{ self.flip_callbacks + 1, self.frame_profile.draws },
-                            ) catch break;
-                            if (captured_target.format.bytes_per_texel == 4) {
-                                if (captured_target.format.vulkan == vk.format_b10g11r11_ufloat_pack32) {
-                                    dumpR11G11B10FrameThumbnailPpm(
-                                        trace_path.ptr,
-                                        captured.width,
-                                        captured.height,
-                                        captured.pixels.items,
-                                    );
-                                } else if (captured_target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32) {
-                                    dumpA2B10G10R10FrameThumbnailPpm(
-                                        trace_path.ptr,
-                                        captured.width,
-                                        captured.height,
-                                        captured.pixels.items,
-                                    );
-                                } else {
-                                    dumpFrameThumbnailPpm(
-                                        trace_path.ptr,
-                                        captured.width,
-                                        captured.height,
-                                        captured.pixels.items,
-                                    );
-                                }
-                            } else if (captured_target.format.bytes_per_texel == 8) {
-                                dumpRgba16FloatFrameThumbnailPpm(
-                                    trace_path.ptr,
-                                    captured.width,
-                                    captured.height,
-                                    captured.pixels.items,
-                                );
-                            }
-                            break;
-                        }
+                        var trace_path_buffer: [96]u8 = undefined;
+                        if (std.fmt.bufPrintZ(
+                            &trace_path_buffer,
+                            "out\\trace-frame-{d:0>4}-draw-{d}.ppm",
+                            .{ self.flip_callbacks + 1, self.frame_profile.draws },
+                        )) |trace_path| self.dumpTracedTarget(captured_target, trace_path.ptr) else |_| {}
                     }
                 }
                 // The persistent attachment is intentionally not read back
@@ -22969,6 +22941,22 @@ pub const Renderer = struct {
         }
     }
 
+    /// Reuse the explicit frame trace's existing readback. Keeping producer
+    /// images as well as draw images exposes artifacts introduced by compute
+    /// before the next raster/composite pass, with no extra GPU synchronization.
+    fn dumpTracedTarget(self: *const Renderer, target: GuestColorTarget, path: [*:0]const u8) void {
+        for (self.completed_frames.items) |captured| {
+            if (captured.guest_address != target.descriptor.address) continue;
+            switch (target.format.vulkan) {
+                vk.format_b10g11r11_ufloat_pack32 => dumpR11G11B10FrameThumbnailPpm(path, captured.width, captured.height, captured.pixels.items),
+                vk.format_a2b10g10r10_unorm_pack32 => dumpA2B10G10R10FrameThumbnailPpm(path, captured.width, captured.height, captured.pixels.items),
+                vk.format_r16g16b16a16_sfloat => dumpRgba16FloatFrameThumbnailPpm(path, captured.width, captured.height, captured.pixels.items),
+                else => if (target.format.bytes_per_texel == 4) dumpFrameThumbnailPpm(path, captured.width, captured.height, captured.pixels.items),
+            }
+            return;
+        }
+    }
+
     fn commitStorageImages(self: *Renderer, memory: GuestMemory, resources: *const ComputeResources) anyerror!void {
         for (resources.storage_images[0..resources.storage_image_count]) |prepared| {
             if (!prepared.writable) continue;
@@ -22985,6 +22973,12 @@ pub const Renderer = struct {
                 // scene data can be identified from its guest address.
                 if (self.traceCurrentGraphicsFrame()) {
                     try self.materializeRenderTarget(target_index);
+                    var path_buffer: [160]u8 = undefined;
+                    if (std.fmt.bufPrintZ(
+                        &path_buffer,
+                        "out\\trace-frame-{d:0>4}-storage-d{d}-c{d}-{x}.ppm",
+                        .{ self.flip_callbacks + 1, self.frame_profile.draws, self.frame_profile.dispatches, target.target.descriptor.address },
+                    )) |path| self.dumpTracedTarget(target.target, path.ptr) else |_| {}
                 }
                 continue;
             }
@@ -33279,6 +33273,31 @@ const BufferTablePlan = struct {
     step: u64,
     limit: u64,
     fully_in_bounds: bool = false,
+};
+
+const BufferDescriptorCandidates = struct {
+    words: [32][4]u32 = undefined,
+    descriptors: [32]gpu.BufferDescriptor = undefined,
+    count: usize = 0,
+
+    fn append(self: *BufferDescriptorCandidates, words: [4]u32) bool {
+        // Null table records and out-of-bounds scalar loads do not need host
+        // storage. The runtime four-word match rejects them, returning zero
+        // for reads and suppressing writes instead of selecting a neighbour.
+        if (std.mem.allEqual(u32, &words, 0)) return true;
+        for (self.words[0..self.count]) |previous|
+            if (std.mem.eql(u32, &previous, &words)) return true;
+        if (self.count == self.words.len) return false;
+        const descriptor = gpu.resources.decodeBufferDescriptor(&words) catch return false;
+        if (!isBoundedProducedBufferDescriptor(descriptor) or descriptor.isNull() or descriptor.size_bytes == 0) return false;
+        // Addressing and format are currently shared by an instruction's
+        // candidates; unequal extents are checked against the selected SSBO.
+        if (self.count != 0 and ((words[1] & 0xffff0000) != (self.words[0][1] & 0xffff0000) or words[3] != self.words[0][3])) return false;
+        self.words[self.count] = words;
+        self.descriptors[self.count] = descriptor;
+        self.count += 1;
+        return true;
+    }
 };
 
 const ScalarPointerTablePlan = struct { base: u64, first: u64, step: u32, count: u32 };
