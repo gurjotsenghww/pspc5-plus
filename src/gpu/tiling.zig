@@ -933,28 +933,45 @@ pub const Layout = struct {
         if (self.block.width > x_offsets.len or self.block.height > y_offsets.len) return Error.UnsupportedTileMode;
         for (0..self.block.width) |x| x_offsets[x] = try self.block.byteOffset(@intCast(x), 0);
         for (0..self.block.height) |y| y_offsets[y] = try self.block.byteOffset(0, @intCast(y));
+        // Many colour swizzles keep 16-byte horizontal runs contiguous. Prove
+        // that from the actual X equation once, rather than assuming it from
+        // a format or title. A row's XOR must also preserve those low bits.
+        const contiguous_runs = contiguousXRun16(element_bytes, x_offsets[0..self.block.width]);
         const Work = struct {
             layout: Layout,
             source: []const u8,
             destination: []u8,
             x_offsets: *const [256]u32,
             y_offsets: *const [256]u32,
+            contiguous_runs: bool,
             errors: [parallel_copy.Pool.maximum_participants]?Error = @splat(null),
 
             fn run(raw: *anyopaque, first: usize, end: usize, participant: usize) void {
                 const work: *@This() = @ptrCast(@alignCast(raw));
-                work.layout.copyElementRows(to_tiled, element_bytes, work.source, work.destination, work.x_offsets, work.y_offsets, first, end) catch |err| {
+                work.layout.copyElementRows(to_tiled, element_bytes, work.source, work.destination, work.x_offsets, work.y_offsets, work.contiguous_runs, first, end) catch |err| {
                     work.errors[participant] = err;
                 };
             }
         };
-        var work = Work{ .layout = self, .source = source, .destination = destination, .x_offsets = &x_offsets, .y_offsets = &y_offsets };
+        var work = Work{ .layout = self, .source = source, .destination = destination, .x_offsets = &x_offsets, .y_offsets = &y_offsets, .contiguous_runs = contiguous_runs };
         const rows = @as(usize, self.layers) * self.blocks_per_column;
         if (self.staging_bytes >= 1024 * 1024)
             pool.forRanges(rows, &work, Work.run)
         else
             Work.run(&work, 0, rows, 0);
         for (work.errors) |failure| if (failure) |err| return err;
+    }
+
+    fn contiguousXRun16(comptime element_bytes: usize, offsets: []const u32) bool {
+        if (element_bytes >= 16) return false;
+        const elements = 16 / element_bytes;
+        if (offsets.len < elements or offsets.len % elements != 0) return false;
+        for (offsets, 0..) |offset, x| {
+            const first = x & ~(elements - 1);
+            const base = offsets[first];
+            if (base & 15 != 0 or offset != base + (x - first) * element_bytes) return false;
+        }
+        return true;
     }
 
     fn copyElementRows(
@@ -965,6 +982,7 @@ pub const Layout = struct {
         destination: []u8,
         x_offsets: *const [256]u32,
         y_offsets: *const [256]u32,
+        contiguous_runs: bool,
         first: usize,
         end: usize,
     ) Error!void {
@@ -991,7 +1009,20 @@ pub const Layout = struct {
                     const linear_row = staging_slice +
                         ((@as(usize, y_base) + local_y) * self.width + x_base) * element_bytes;
                     const row_xor = y_offsets[local_y] ^ block_xor;
-                    for (0..copy_width) |local_x| {
+                    var local_x: usize = 0;
+                    if (element_bytes < 16 and contiguous_runs and row_xor & 15 == 0) {
+                        const elements = 16 / element_bytes;
+                        while (local_x + elements <= copy_width) : (local_x += elements) {
+                            const tiled = tiled_block + (x_offsets[local_x] ^ row_xor);
+                            const linear = linear_row + local_x * element_bytes;
+                            const src = if (to_tiled) linear else tiled;
+                            const dst = if (to_tiled) tiled else linear;
+                            @memcpy(destination[dst..][0..16], source[src..][0..16]);
+                        }
+                    }
+                    // Partial right-edge runs and noncontiguous swizzles keep
+                    // the element path, leaving all guest padding untouched.
+                    while (local_x < copy_width) : (local_x += 1) {
                         const tiled = tiled_block + (x_offsets[local_x] ^ row_xor);
                         const linear = linear_row + local_x * element_bytes;
                         const src = if (to_tiled) linear else tiled;
@@ -3527,6 +3558,49 @@ test "volume color attachments and sampled images share all slice addresses" {
         for (0..32) |z| for (0..32) |y| for (0..32) |x| {
             try testing.expectEqual(try sampled.sourceByteOffset(@intCast(x), @intCast(y), @intCast(z), 0), try attachment.sourceByteOffset(@intCast(x), @intCast(y), @intCast(z)));
         };
+    }
+}
+
+test "wide tile copies match scalar addresses and preserve every padding byte" {
+    const allocator = std.testing.allocator;
+    inline for (.{ 1, 2, 4, 8, 16 }) |bytes| {
+        for ([_]resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .depth, .render_target }) |mode| {
+            if (mode == .depth and bytes == 16) continue;
+            const block = try BlockLayout.init(mode, bytes);
+            const layout = try Layout.init(.{
+                .tile_mode = mode,
+                .width = block.width * 2 + 3,
+                .height = block.height + 3,
+                .layers = 2,
+                .first_slice = 1,
+            }, bytes);
+            // Guest views and staging slices need not have SIMD alignment.
+            const linear_backing = try allocator.alloc(u8, @intCast(layout.staging_bytes + 5));
+            defer allocator.free(linear_backing);
+            const linear = linear_backing[5..];
+            const expected = try allocator.alloc(u8, @intCast(layout.required_source_bytes));
+            defer allocator.free(expected);
+            const actual_backing = try allocator.alloc(u8, expected.len + 3);
+            defer allocator.free(actual_backing);
+            const actual = actual_backing[3..];
+            const roundtrip_backing = try allocator.alloc(u8, linear.len + 1);
+            defer allocator.free(roundtrip_backing);
+            const roundtrip = roundtrip_backing[1..];
+            for (linear, 0..) |*value, index| value.* = @truncate(index *% 29 +% (index >> 5));
+            @memset(expected, 0xc3);
+            @memset(actual, 0xc3);
+            // Construct the reference from the independent checked address
+            // equation, so matching tile/detile bugs cannot pass a round trip.
+            for (0..layout.layers) |slice| for (0..layout.height) |y| for (0..layout.width) |x| {
+                const tiled: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), @intCast(slice)));
+                const linear_offset: usize = @intCast(try layout.stagingByteOffset(@intCast(x), @intCast(y), @intCast(slice)));
+                @memcpy(expected[tiled..][0..bytes], linear[linear_offset..][0..bytes]);
+            };
+            try layout.tile(linear, actual);
+            try testing.expectEqualSlices(u8, expected, actual);
+            try layout.detile(expected, roundtrip);
+            try testing.expectEqualSlices(u8, linear, roundtrip);
+        }
     }
 }
 
