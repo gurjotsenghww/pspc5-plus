@@ -786,6 +786,10 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 256);
     } else |_| 0;
+    const buffer_recycle_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BUFFER_RECYCLE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(usize, text, 10) catch 32, 256);
+    } else |_| 32;
     const device_detile_sources = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_DETILE_INPUT")) |text| parse: {
         defer allocator.free(text);
         break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
@@ -898,6 +902,7 @@ fn run(init: std.process.Init) !bool {
             .device_storage_budget_bytes = device_storage_mib * 1024 * 1024,
             .device_storage_min_bytes = device_storage_min_kib * 1024,
             .storage_buffer_rename_budget_bytes = storage_rename_mib * 1024 * 1024,
+            .buffer_recycle_budget_bytes = buffer_recycle_mib * 1024 * 1024,
             .queued_host_storage_uploads = queued_host_storage_uploads,
             .retain_clean_storage_buffers = retain_storage_buffers,
             .cache_storage_buffer_contents = enable_gpu_buffer_content_cache,

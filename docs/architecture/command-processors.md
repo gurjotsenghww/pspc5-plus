@@ -211,6 +211,20 @@ Backing and device-local byte totals are maintained at allocation ownership
 changes, so an ordinary cache miss does not rescan every retained entry merely
 to check its budget. Replacements, trimming and renaming update both totals;
 retired rename allocations remain charged to their separate pool.
+
+Completed ordinary Vulkan buffers can also retain their allocation in a small
+spare pool. `PS5_GPU_BUFFER_RECYCLE_MIB` bounds it (default 32 MiB, zero disables,
+maximum 256 MiB), with at most 256 entries and 16 MiB per allocation. Reuse
+requires the exact original size, usage flags, required memory flags and memory
+preference. Imported guest mappings are excluded. The existing retirement tick
+must complete before admission; recording or queued commands keep ownership.
+Pool lookup does not submit or wait for work. FIFO replacement retires obsolete
+sizes, allocation failure can release completed spares before retrying, and
+teardown drains the pool. This does not retain guest content-cache entries or
+skip guest uploads. `[gpu buffer allocations]` reports creates, frees, their host
+times, reuse counts and spare memory. `vulkan-smoke --buffer-recycle` checks a
+queued GPU copy, exact-request matching, both mapping modes and both pool limits.
+
 Recycling a large backing for
 a much smaller range creates a suitably sized replacement; old GPU readers
 keep their original backing until retirement. Otherwise a four-byte range can

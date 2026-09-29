@@ -11879,6 +11879,15 @@ pub fn main(init: std.process.Init) !void {
         try runResidentTargetReuseProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-recycle")) {
+        for ([_]bool{ false, true }) |persistent| {
+            var renderer = try vulkan.Renderer.init(allocator, .{ .persistent_host_mappings = persistent, .enable_timeline_scheduler = true });
+            defer renderer.deinit();
+            try renderer.probeBufferRecycling();
+        }
+        std.debug.print("Completed buffer recycling preserves queued copies, exact requests, mappings and pool limits\n", .{});
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
         for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false, 0, 0);
         return;

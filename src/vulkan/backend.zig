@@ -311,6 +311,9 @@ pub const Options = struct {
     /// Opt-in spare allocations for small CPU uploads with queued readers.
     /// Retired allocation bytes are bounded independently of the live cache.
     storage_buffer_rename_budget_bytes: usize = 0,
+    /// Completed, non-imported allocations available for exact-request reuse.
+    /// This bounds spare memory separately from live guest buffer contents.
+    buffer_recycle_budget_bytes: usize = 32 * 1024 * 1024,
     /// Copy fresh upload slices into busy host-visible buffers on the GPU.
     queued_host_storage_uploads: bool = false,
     /// Optional device-local storage backing with a CPU-cached transfer mirror.
@@ -796,6 +799,13 @@ const Candidate = struct {
     score: u32,
 };
 
+const BufferReuseKey = struct {
+    size: vk.DeviceSize,
+    usage: vk.Flags,
+    properties: vk.Flags,
+    preferred: vk.Flags,
+};
+
 const OwnedBuffer = struct {
     handle: vk.Buffer,
     memory: vk.DeviceMemory,
@@ -803,6 +813,8 @@ const OwnedBuffer = struct {
     mapping: ?[*]u8 = null,
     host_mapping: ?external_host.Mapping = null,
     imported_allocation: ?*ImportedAllocation = null,
+    reuse_key: ?BufferReuseKey = null,
+    allocation_bytes: vk.DeviceSize = 0,
 };
 
 const ImportedAllocation = struct {
@@ -2743,6 +2755,11 @@ const FrameProfile = struct {
     storage_buffer_waits_avoided: u64 = 0,
     storage_buffer_renames: u64 = 0,
     storage_buffer_rename_reuses: u64 = 0,
+    buffer_creates: u64 = 0,
+    buffer_create_ns: u64 = 0,
+    buffer_frees: u64 = 0,
+    buffer_free_ns: u64 = 0,
+    buffer_recycles: u64 = 0,
     content_reused_bytes: u64 = 0,
     compute_submit_ns: u64 = 0,
     shader_analysis_hits: u64 = 0,
@@ -4384,6 +4401,9 @@ pub const Renderer = struct {
     draw_reuse_storage_image_count: usize = 0,
     draw_uploads_enabled: bool = false,
     deferred_vulkan_objects: std.ArrayList(DeferredVulkanObjectEntry) = .empty,
+    recycled_buffers: std.ArrayList(OwnedBuffer) = .empty,
+    recycled_buffer_bytes: u64 = 0,
+    buffer_recycle_budget_bytes: usize = 0,
     retired_storage_buffers: std.ArrayList(RetiredStorageBuffer) = .empty,
     retired_storage_buffer_bytes: u64 = 0,
     pending_sampled_image_bytes: u64 = 0,
@@ -5430,6 +5450,7 @@ pub const Renderer = struct {
             .reuse_graphics_resources = options.reuse_graphics_resources,
             .resource_preparation = .{ .worker_limit = @min(options.resource_preparation_workers, gpu.resource_preparation.Pool.maximum_workers), .adaptive = options.adaptive_resource_workers },
             .storage_buffer_rename_budget_bytes = options.storage_buffer_rename_budget_bytes,
+            .buffer_recycle_budget_bytes = options.buffer_recycle_budget_bytes,
             .queued_host_storage_uploads = options.queued_host_storage_uploads,
             .storage_buffer_cache_budget_bytes = options.storage_buffer_cache_budget_bytes,
             .storage_buffer_cache_entries = std.math.clamp(options.storage_buffer_cache_entries, maximum_guest_buffers, maximum_retained_buffer_entries),
@@ -5512,6 +5533,11 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
+        // Teardown must free both the spare pool and subsequently retired work.
+        self.buffer_recycle_budget_bytes = 0;
+        self.clearRecycledBuffers();
+        self.recycled_buffers.deinit(self.allocator);
+        self.recycled_buffers = .empty;
         if (self.compute_warmup) |warmup| warmup.stop();
         self.pipeline_compile_queue.deinit();
         if (self.compute_warmup) |warmup| warmup.deinit();
@@ -16592,6 +16618,91 @@ pub const Renderer = struct {
         return elapsed;
     }
 
+    /// Verify retirement with a real queued copy, then exercise compatibility,
+    /// persistent mapping, byte pressure and the entry cap on the same device.
+    pub fn probeBufferRecycling(self: *Renderer) anyerror!void {
+        const properties = vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit;
+        const usage = vk.buffer_usage_transfer_src_bit;
+        const size = 4096;
+        self.clearRecycledBuffers();
+        const source = try self.createBuffer(size, usage, properties);
+        const destination = try self.createBuffer(size, vk.buffer_usage_transfer_dst_bit, properties);
+        defer self.destroyBuffer(destination);
+        const expected: [size]u8 = @splat(0x5a);
+        try self.writeMapped(source, &expected);
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = size };
+        self.device_functions.cmd_copy_buffer(command_buffer, source.handle, destination.handle, 1, @ptrCast(&copy));
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = destination.handle,
+            .offset = 0,
+            .size = size,
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        // A pending command is not yet represented by submitted_tick. Its
+        // source must stay unavailable even when every submitted tick is done.
+        self.destroyBuffer(source);
+        try std.testing.expectEqual(@as(usize, 0), self.recycled_buffers.items.len);
+        const busy_replacement = try self.createBuffer(size, usage, properties);
+        try std.testing.expect(busy_replacement.handle != source.handle);
+        const poison: [size]u8 = @splat(0xee);
+        try self.writeMapped(busy_replacement, &poison);
+        try self.submitOneShot(command_buffer);
+        try self.waitForSubmittedWork();
+        try self.expectMapped(destination, &expected);
+        const completed = try self.createBuffer(size, usage, properties);
+        try std.testing.expectEqual(source.handle, completed.handle);
+        try std.testing.expectEqual(source.memory, completed.memory);
+        try std.testing.expectEqual(self.persistent_host_mappings, completed.mapping != null);
+        try self.writeMapped(completed, &poison);
+        try self.expectMapped(completed, &poison);
+
+        self.buffer_recycle_budget_bytes = @intCast(completed.allocation_bytes);
+        const frees = self.frame_profile.buffer_frees;
+        self.destroyBuffer(completed);
+        self.destroyBuffer(busy_replacement);
+        try std.testing.expectEqual(@as(usize, 1), self.recycled_buffers.items.len);
+        try std.testing.expectEqual(completed.allocation_bytes, self.recycled_buffer_bytes);
+        try std.testing.expectEqual(frees + 1, self.frame_profile.buffer_frees);
+        // Same allocation size alone is not a compatibility proof. Keep this
+        // candidate alive while varying each original creation requirement.
+        const reuse_count = self.frame_profile.buffer_recycles;
+        const other_size = try self.createBuffer(size - 4, usage, properties);
+        const other_usage = try self.createBuffer(size, vk.buffer_usage_transfer_dst_bit, properties);
+        const other_properties = try self.createBuffer(size, usage, vk.memory_property_device_local_bit);
+        const other_preferred = try self.createBufferWithMemoryPreference(size, usage, properties, vk.memory_property_host_cached_bit);
+        try std.testing.expectEqual(reuse_count, self.frame_profile.buffer_recycles);
+        try std.testing.expectEqual(@as(usize, 1), self.recycled_buffers.items.len);
+        const exact = try self.createBuffer(size, usage, properties);
+        try std.testing.expectEqual(busy_replacement.handle, exact.handle);
+        self.destroyBuffer(exact);
+        self.destroyBuffer(other_size);
+        self.destroyBuffer(other_usage);
+        self.destroyBuffer(other_properties);
+        self.destroyBuffer(other_preferred);
+        try std.testing.expect(self.recycled_buffer_bytes <= self.buffer_recycle_budget_bytes);
+        self.clearRecycledBuffers();
+
+        self.buffer_recycle_budget_bytes = 32 * 1024 * 1024;
+        for (0..260) |index| {
+            const buffer = try self.createBuffer(16 + index * 4, usage, properties);
+            self.destroyBuffer(buffer);
+        }
+        try std.testing.expectEqual(@as(usize, 256), self.recycled_buffers.items.len);
+        try std.testing.expect(self.recycled_buffer_bytes <= self.buffer_recycle_budget_bytes);
+        self.clearRecycledBuffers();
+        // A buffer larger than the spare budget is freed, not retained.
+        self.buffer_recycle_budget_bytes = 1;
+        const oversized = try self.createBuffer(size, usage, properties);
+        self.destroyBuffer(oversized);
+        try std.testing.expectEqual(@as(usize, 0), self.recycled_buffers.items.len);
+        try std.testing.expectEqual(@as(u64, 0), self.recycled_buffer_bytes);
+        self.buffer_recycle_budget_bytes = 0;
+    }
+
     /// Repeated CPU subrange access followed by a real GPU copy. This checks
     /// both mapping modes, byte offsets, retained contents and readback waits.
     pub fn probeBufferMappings(self: *Renderer) anyerror!u64 {
@@ -21145,6 +21256,17 @@ pub const Renderer = struct {
     }
 
     fn createBufferWithMemoryPreference(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags, preferred: vk.Flags) Error!OwnedBuffer {
+        const key = BufferReuseKey{ .size = size, .usage = usage, .properties = properties, .preferred = preferred };
+        for (self.recycled_buffers.items, 0..) |buffer, index| {
+            if (std.meta.eql(buffer.reuse_key.?, key)) {
+                self.recycled_buffer_bytes -= buffer.allocation_bytes;
+                self.frame_profile.buffer_recycles +|= 1;
+                return self.recycled_buffers.orderedRemove(index);
+            }
+        }
+        const started = hostTimestampNs();
+        defer self.frame_profile.buffer_create_ns +|= elapsedHostNanoseconds(started);
+        self.frame_profile.buffer_creates +|= 1;
         const create_info = vk.BufferCreateInfo{ .size = size, .usage = usage };
         var handle: vk.Buffer = 0;
         if (self.device_functions.create_buffer(self.device, &create_info, null, &handle) != vk.success) {
@@ -21162,7 +21284,12 @@ pub const Renderer = struct {
             .memory_type_index = memory_type_index,
         };
         var memory: vk.DeviceMemory = 0;
-        if (self.device_functions.allocate_memory(self.device, &allocation_info, null, &memory) != vk.success) {
+        var allocation_result = self.device_functions.allocate_memory(self.device, &allocation_info, null, &memory);
+        if ((allocation_result == vk.error_out_of_device_memory or allocation_result == vk.error_out_of_host_memory) and self.recycled_buffers.items.len != 0) {
+            self.clearRecycledBuffers();
+            allocation_result = self.device_functions.allocate_memory(self.device, &allocation_info, null, &memory);
+        }
+        if (allocation_result != vk.success) {
             return Error.MemoryAllocationFailed;
         }
         errdefer self.device_functions.free_memory(self.device, memory, null);
@@ -21175,7 +21302,7 @@ pub const Renderer = struct {
         if (self.device_functions.bind_buffer_memory(self.device, handle, memory, 0) != vk.success) {
             return Error.MemoryBindingFailed;
         }
-        return .{ .handle = handle, .memory = memory, .size = size, .mapping = @ptrCast(mapping) };
+        return .{ .handle = handle, .memory = memory, .size = size, .mapping = @ptrCast(mapping), .reuse_key = key, .allocation_bytes = requirements.size };
     }
 
     fn createImageWithExtent(
@@ -21290,7 +21417,11 @@ pub const Renderer = struct {
 
     fn allocateImageMemory(self: *Renderer, info: *const vk.MemoryAllocateInfo, memory: *vk.DeviceMemory, sampled_cache: bool) vk.Result {
         const started = hostTimestampNs();
-        const result = self.device_functions.allocate_memory(self.device, info, null, memory);
+        var result = self.device_functions.allocate_memory(self.device, info, null, memory);
+        if ((result == vk.error_out_of_device_memory or result == vk.error_out_of_host_memory) and self.recycled_buffers.items.len != 0) {
+            self.clearRecycledBuffers();
+            result = self.device_functions.allocate_memory(self.device, info, null, memory);
+        }
         if (sampled_cache) {
             self.frame_profile.sampled_allocate_calls +|= 1;
             self.frame_profile.sampled_allocate_ns +|= elapsedHostNanoseconds(started);
@@ -25757,14 +25888,7 @@ pub const Renderer = struct {
     fn destroyVulkanObject(self: *Renderer, object: DeferredVulkanObject) void {
         switch (object) {
             .buffer => |buffer| {
-                if (buffer.mapping != null and buffer.host_mapping == null) self.device_functions.unmap_memory(self.device, buffer.memory);
-                self.device_functions.destroy_buffer(self.device, buffer.handle, null);
-                if (buffer.imported_allocation) |allocation| {
-                    self.releaseImportedAllocation(allocation);
-                } else {
-                    self.device_functions.free_memory(self.device, buffer.memory, null);
-                    if (buffer.host_mapping) |view| view.release(view.bytes);
-                }
+                if (!self.recycleCompletedBuffer(buffer)) self.freeBufferAllocation(buffer);
             },
             .image => |image| {
                 self.device_functions.destroy_image(self.device, image.handle, null);
@@ -25786,6 +25910,49 @@ pub const Renderer = struct {
                     self.storage_image_cache.items[index].pin_count -= 1;
                 }
             },
+        }
+    }
+
+    /// Called only after the existing retirement tick has completed. Keep the
+    /// original size, usage and memory preference: reuse never widens a shader
+    /// descriptor or substitutes an imported guest allocation. Contents remain
+    /// unspecified, just as for a new Vulkan allocation; callers initialize it.
+    fn recycleCompletedBuffer(self: *Renderer, buffer: OwnedBuffer) bool {
+        if (self.buffer_recycle_budget_bytes == 0 or buffer.reuse_key == null or
+            buffer.host_mapping != null or buffer.imported_allocation != null or
+            buffer.allocation_bytes == 0 or buffer.allocation_bytes > 16 * 1024 * 1024 or
+            buffer.allocation_bytes > self.buffer_recycle_budget_bytes) return false;
+        // FIFO replacement prevents obsolete sizes from occupying the pool
+        // indefinitely. Neither admission nor lookup submits or waits for work.
+        while (self.recycled_buffers.items.len >= 256 or
+            self.recycled_buffer_bytes + buffer.allocation_bytes > self.buffer_recycle_budget_bytes)
+        {
+            const oldest = self.recycled_buffers.orderedRemove(0);
+            self.recycled_buffer_bytes -= oldest.allocation_bytes;
+            self.freeBufferAllocation(oldest);
+        }
+        self.recycled_buffers.append(self.allocator, buffer) catch return false;
+        self.recycled_buffer_bytes += buffer.allocation_bytes;
+        return true;
+    }
+
+    fn clearRecycledBuffers(self: *Renderer) void {
+        for (self.recycled_buffers.items) |buffer| self.freeBufferAllocation(buffer);
+        self.recycled_buffers.clearRetainingCapacity();
+        self.recycled_buffer_bytes = 0;
+    }
+
+    fn freeBufferAllocation(self: *Renderer, buffer: OwnedBuffer) void {
+        const started = hostTimestampNs();
+        defer self.frame_profile.buffer_free_ns +|= elapsedHostNanoseconds(started);
+        self.frame_profile.buffer_frees +|= 1;
+        if (buffer.mapping != null and buffer.host_mapping == null) self.device_functions.unmap_memory(self.device, buffer.memory);
+        self.device_functions.destroy_buffer(self.device, buffer.handle, null);
+        if (buffer.imported_allocation) |allocation| {
+            self.releaseImportedAllocation(allocation);
+        } else {
+            self.device_functions.free_memory(self.device, buffer.memory, null);
+            if (buffer.host_mapping) |view| view.release(view.bytes);
         }
     }
 
@@ -27696,6 +27863,11 @@ pub const Renderer = struct {
             });
             if (profile.storage_buffer_renames != 0)
                 std.debug.print("[gpu buffer rename] flip={d} renames={d} reused={d} pool={d}/{d}KiB\n", .{ self.flip_callbacks, profile.storage_buffer_renames, profile.storage_buffer_rename_reuses, self.retired_storage_buffers.items.len, self.retired_storage_buffer_bytes / 1024 });
+            std.debug.print("[gpu buffer allocations] flip={d} creates={d}/{d}us frees={d}/{d}us reused={d} spare={d}/{d}KiB budget={d}KiB\n", .{
+                self.flip_callbacks,             profile.buffer_creates,            profile.buffer_create_ns / 1000,
+                profile.buffer_frees,            profile.buffer_free_ns / 1000,     profile.buffer_recycles,
+                self.recycled_buffers.items.len, self.recycled_buffer_bytes / 1024, self.buffer_recycle_budget_bytes / 1024,
+            });
             std.debug.print(
                 "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} sampled_ms={d}/{d}/{d}/{d} probe_ms={d} target_create_ms={d}/{d} cxlat={d}/{d}/{d}MiB\n",
                 .{
