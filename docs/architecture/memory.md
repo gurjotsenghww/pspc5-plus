@@ -90,7 +90,22 @@ subtracting the page address. This prevents a later writable allocation from
 inheriting an earlier module's permissions through unsigned underflow, and
 avoids scanning every earlier mapping for each tracked page. Tests cover gaps,
 reserved ranges, full-page boundaries and writes to a later allocation with
-different permissions. Native rendering and performance with page tracking
-enabled still require title-specific verification.
+different permissions. Native rendering and performance still require
+title-specific verification; see the [Big Helmet Heroes watch measurements](../development/big-helmet-heroes-page-watches-2026-09-29.md).
+
+On Windows, adjacent unarmed pages in suitable direct-memory mappings can
+share one protection call within a 64 KiB granule. Each group is bounded by a
+fresh native-region query, so it cannot cross separately mapped views or a
+protection split. Private and unaligned mappings keep individual page calls.
+This changes protection calls only; host view sizes are unchanged.
+
+A group is marked armed only after host protection succeeds. Native fault
+handlers share the tracker lock, and generations remain per page. HLE writes
+restore groups only when their saved logical rights agree; native faults
+still restore one page. All entries in a group are allocated before its
+protection changes. A rejected grouped operation retries one page without
+claiming the remainder.
+Tests exercise aligned and remapped views, mixed rights, individual write
+faults, generation invalidation and the grouped-operation fallback.
 
 ---

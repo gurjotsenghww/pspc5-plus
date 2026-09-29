@@ -323,6 +323,8 @@ const TrackedGpuPage = struct {
     generation: u64,
     restore_protection: Protection,
     armed: bool = false,
+    /// A hint only: every grouped protection still checks the native region.
+    batch_protection: bool = false,
 };
 
 /// CPU-write watch state for memory which has been consumed by the GPU.  The
@@ -333,6 +335,21 @@ const GpuPageTracker = struct {
     lock: Lock = .{},
     generation_counter: u64 = 1,
     enabled: bool = false,
+    /// Watch-related host protection attempts, for diagnostics and native probes.
+    protection_calls: u64 = 0,
+
+    fn protectRun(self: *GpuPageTracker, address: u64, end: u64, protection: Protection) Error!u64 {
+        self.protection_calls +|= 1;
+        hostProtectContiguous(address, end - address, protection) catch |err| {
+            if (end - address == page_size) return err;
+            // A failed grouped operation must not publish armed metadata.
+            // Retain the original page operation if the host rejects a group.
+            self.protection_calls +|= 1;
+            try hostProtectContiguous(address, page_size, protection);
+            return address + page_size;
+        };
+        return end;
+    }
 
     fn nextGeneration(self: *GpuPageTracker) u64 {
         const next = @atomicLoad(u64, &self.generation_counter, .monotonic) +% 1;
@@ -876,28 +893,55 @@ pub const AddressSpace = struct {
 
         var fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
         var page = first_page;
-        while (page < end_page) : (page += page_size) {
+        while (page < end_page) {
             const mapping = self.mappingForPageLocked(page) orelse return Error.RangeNotMapped;
+            const can_batch = builtin.os.tag == .windows and
+                hostMappingViewSize(mapping.kind, mapping.address, mapping.size, mapping.backing_offset) > page_size;
             const result = try tracker.pages.getOrPut(self.allocator, page);
-            if (!result.found_existing) {
-                result.value_ptr.* = .{
-                    .generation = tracker.nextGeneration(),
-                    .restore_protection = mapping.protection,
-                };
-            } else {
-                result.value_ptr.restore_protection = mapping.protection;
-            }
+            if (!result.found_existing) result.value_ptr.* = .{
+                .generation = tracker.nextGeneration(),
+                .restore_protection = mapping.protection,
+            };
+            result.value_ptr.restore_protection = mapping.protection;
+            result.value_ptr.batch_protection = can_batch;
             if (mapping.protection.write and !result.value_ptr.armed) {
+                var run_end = page + page_size;
+                if (can_batch) {
+                    const limit = @min(end_page, mapping.end(), (page & ~(windows_allocation_granularity - 1)) + windows_allocation_granularity);
+                    while (run_end < limit) : (run_end += page_size) {
+                        if (tracker.pages.get(run_end)) |next| {
+                            if (next.armed) break;
+                        }
+                    }
+                    run_end = gpuProtectionRunEnd(page, run_end);
+                }
+                // Finish every potentially allocating insertion before changing
+                // host permissions. Hash-map growth can invalidate result pointers.
+                var next_page = page + page_size;
+                while (next_page < run_end) : (next_page += page_size) {
+                    const next = try tracker.pages.getOrPut(self.allocator, next_page);
+                    if (!next.found_existing) next.value_ptr.* = .{
+                        .generation = tracker.nextGeneration(),
+                        .restore_protection = mapping.protection,
+                    };
+                    next.value_ptr.restore_protection = mapping.protection;
+                    next.value_ptr.batch_protection = can_batch;
+                }
                 var watched = mapping.protection;
                 watched.read = true;
                 watched.write = false;
-                try hostProtect(page, page_size, watched);
-                result.value_ptr.armed = true;
+                run_end = try tracker.protectRun(page, run_end, watched);
+                // Native fault handlers share the tracker lock and cannot see
+                // a partially published group. Each page retains its own epoch.
+                while (page < run_end) : (page += page_size) {
+                    const tracked = tracker.pages.getPtr(page).?;
+                    tracked.armed = true;
+                    fingerprintGpuPage(&fingerprint, page, tracked.generation);
+                }
+            } else {
+                fingerprintGpuPage(&fingerprint, page, result.value_ptr.generation);
+                page += page_size;
             }
-            fingerprint ^= page;
-            fingerprint *%= 0x100_0000_01b3;
-            fingerprint ^= result.value_ptr.generation;
-            fingerprint *%= 0x100_0000_01b3;
         }
         return if (fingerprint == 0) 1 else fingerprint;
     }
@@ -947,13 +991,32 @@ pub const AddressSpace = struct {
         if (!tracker.enabled) return;
 
         var page = first_page;
-        while (page < end_page) : (page += page_size) {
-            const tracked = tracker.pages.getPtr(page) orelse continue;
+        while (page < end_page) {
+            const tracked = tracker.pages.getPtr(page) orelse {
+                page += page_size;
+                continue;
+            };
+            var run_end = page + page_size;
             if (tracked.armed) {
-                hostProtect(page, page_size, tracked.restore_protection) catch continue;
-                tracked.armed = false;
+                if (tracked.batch_protection) {
+                    const limit = @min(end_page, (page & ~(windows_allocation_granularity - 1)) + windows_allocation_granularity);
+                    while (run_end < limit) : (run_end += page_size) {
+                        const next = tracker.pages.get(run_end) orelse break;
+                        if (!next.armed or !next.batch_protection or
+                            next.restore_protection.guestBits() != tracked.restore_protection.guestBits()) break;
+                    }
+                    run_end = gpuProtectionRunEnd(page, run_end);
+                }
+                run_end = tracker.protectRun(page, run_end, tracked.restore_protection) catch {
+                    page += page_size;
+                    continue;
+                };
             }
-            tracked.generation = tracker.nextGeneration();
+            while (page < run_end) : (page += page_size) {
+                const changed = tracker.pages.getPtr(page).?;
+                changed.armed = false;
+                changed.generation = tracker.nextGeneration();
+            }
         }
     }
 
@@ -976,7 +1039,7 @@ pub const AddressSpace = struct {
             // faults and unmapped pages still belong to the normal handler.
             return windowsRangeAccessible(fault_address, 1, .write);
         }
-        hostProtect(page, page_size, tracked.restore_protection) catch return false;
+        _ = tracker.protectRun(page, page + page_size, tracked.restore_protection) catch return false;
         tracked.armed = false;
         tracked.generation = tracker.nextGeneration();
         return true;
@@ -2011,25 +2074,41 @@ fn hostCommit(address: u64, size: u64, protection: Protection) Error!void {
     }
 }
 
-fn hostProtect(address: u64, size: u64, protection: Protection) Error!void {
+fn fingerprintGpuPage(fingerprint: *u64, page: u64, generation: u64) void {
+    fingerprint.* ^= page;
+    fingerprint.* *%= 0x100_0000_01b3;
+    fingerprint.* ^= generation;
+    fingerprint.* *%= 0x100_0000_01b3;
+}
+
+/// A Windows protection operation cannot cross independently mapped views.
+/// VirtualQuery also bounds a run at an existing protection split. Never cache
+/// this boundary: partial unmapping can replace a view at the same address.
+fn gpuProtectionRunEnd(address: u64, requested_end: u64) u64 {
+    if (builtin.os.tag != .windows or requested_end - address <= page_size) return requested_end;
+    var info: WindowsMemoryInfo = undefined;
+    if (windowsVirtualQuery(address, &info) == 0 or info.state != windows_mem_commit) return address + page_size;
+    const end = std.math.add(u64, @intFromPtr(info.base_address), info.region_size) catch return address + page_size;
+    const bounded = @min(requested_end, end & ~(page_size - 1));
+    return @max(address + page_size, bounded);
+}
+
+fn hostProtectContiguous(address: u64, size: u64, protection: Protection) Error!void {
     switch (builtin.os.tag) {
-        .windows => {
-            var cursor = address;
-            while (cursor < address + size) : (cursor += page_size) {
-                const pointer: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(cursor);
-                std.process.protectMemory(
-                    pointer[0..@intCast(page_size)],
-                    protection.host(),
-                ) catch return Error.ProtectionDenied;
-            }
-        },
-        .linux, .macos => {
+        .windows, .linux, .macos => {
             const pointer: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(address);
-            std.process.protectMemory(pointer[0..@intCast(size)], protection.host()) catch
-                return Error.ProtectionDenied;
+            std.process.protectMemory(pointer[0..@intCast(size)], protection.host()) catch return Error.ProtectionDenied;
         },
         else => return Error.UnsupportedHost,
     }
+}
+
+fn hostProtect(address: u64, size: u64, protection: Protection) Error!void {
+    if (builtin.os.tag == .windows) {
+        var cursor = address;
+        while (cursor < address + size) : (cursor += page_size)
+            try hostProtectContiguous(cursor, page_size, protection);
+    } else try hostProtectContiguous(address, size, protection);
 }
 
 fn hostDecommit(address: u64, size: u64) Error!void {
@@ -2449,6 +2528,94 @@ test "GPU page mapping lookup selects the containing range and its protection" {
     try testing.expectEqual(null, space.mappingForPageLocked(10 * page_size - 1));
     space.mappings.items = &.{};
     try testing.expectEqual(null, space.mappingForPageLocked(8 * page_size));
+}
+
+test "GPU watches batch within native views and retain per-page write epochs" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const bytes = 2 * windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, bytes);
+    defer space.deinit();
+    const address = user.start;
+    try space.mapFixed(address, bytes, .read_write, .direct_memory, 0);
+    space.enableGpuMemoryTracking();
+    const first = try space.trackGpuRead(address, bytes);
+    try testing.expectEqual(@as(u64, 2), space.gpu_tracker.protection_calls);
+    try testing.expectEqual(first, space.gpuGeneration(address, bytes));
+    try testing.expect(!isHostRangeWritable(address, bytes));
+    const calls = space.gpu_tracker.protection_calls;
+    try testing.expectEqual(first, try space.trackGpuRead(address + 1, bytes - 2));
+    try testing.expectEqual(calls, space.gpu_tracker.protection_calls);
+    const untouched = space.gpu_tracker.pages.get(address).?.generation;
+    try testing.expect(space.handleGpuTrackedWriteFault(address + 2 * page_size));
+    try testing.expect(isHostRangeWritable(address + 2 * page_size, page_size));
+    try testing.expect(!isHostRangeWritable(address, page_size));
+    try testing.expect(!isHostRangeWritable(address + 3 * page_size, page_size));
+    try testing.expectEqual(untouched, space.gpu_tracker.pages.get(address).?.generation);
+    const rearmed = try space.trackGpuRead(address, bytes);
+    try testing.expect(rearmed != first);
+    try testing.expectEqual(calls + 2, space.gpu_tracker.protection_calls);
+    const before_write = space.gpu_tracker.protection_calls;
+    space.notifyGuestWrite(address + 1, bytes - 2);
+    try testing.expectEqual(before_write + 2, space.gpu_tracker.protection_calls);
+    try testing.expect(isHostRangeWritable(address, bytes));
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, bytes));
+    const written: [*]u8 = @ptrFromInt(address);
+    @memset(written[0..bytes], 0x5a);
+    var previous: u64 = 0;
+    for (0..bytes / page_size) |index| {
+        const page = space.gpu_tracker.pages.get(address + index * page_size).?;
+        try testing.expect(!page.armed and page.generation > previous);
+        previous = page.generation;
+    }
+}
+
+test "GPU watch groups preserve protection splits and requery remapped view boundaries" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const bytes = 2 * windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, bytes);
+    defer space.deinit();
+    const address = user.start;
+    // Start with executable view rights, then narrow individual pages.
+    try space.mapFixed(address, bytes, .read_write_execute, .direct_memory, 0);
+    space.enableGpuMemoryTracking();
+    _ = try space.trackGpuRead(address, bytes);
+    space.notifyGuestWrite(address, bytes);
+    try space.protect(address + page_size, page_size, .read_only);
+    try space.protect(address + 3 * page_size, page_size, .read_write);
+    _ = try space.trackGpuRead(address, bytes);
+    space.notifyGuestWrite(address, bytes);
+    try testing.expect(isHostRangeWritable(address, page_size));
+    try testing.expect(!isHostRangeWritable(address + page_size, page_size));
+    var info: WindowsMemoryInfo = undefined;
+    try testing.expect(windowsVirtualQuery(address + 2 * page_size, &info) != 0);
+    try testing.expectEqual(windows_page_execute_readwrite, info.protect);
+    try testing.expect(windowsVirtualQuery(address + 3 * page_size, &info) != 0);
+    try testing.expectEqual(windows_page_readwrite, info.protect);
+
+    try space.unmap(address, windows_allocation_granularity);
+    for (0..4) |index| try space.mapFixed(address + index * page_size, page_size, .read_write, .direct_memory, index * page_size);
+    // An old 64 KiB view is now four independent 16 KiB views at the same VA.
+    try testing.expectEqual(address + page_size, gpuProtectionRunEnd(address, address + windows_allocation_granularity));
+    const calls = space.gpu_tracker.protection_calls;
+    _ = try space.trackGpuRead(address, windows_allocation_granularity);
+    try testing.expectEqual(calls + 4, space.gpu_tracker.protection_calls);
+    space.notifyGuestWrite(address, windows_allocation_granularity);
+    try testing.expect(isHostRangeWritable(address, windows_allocation_granularity));
+}
+
+test "a rejected grouped watch operation falls back without claiming later pages" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const bytes = 2 * windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, bytes);
+    defer space.deinit();
+    const address = user.start;
+    try space.mapFixed(address, bytes, .read_write, .direct_memory, 0);
+    // Deliberately bypass the region-bound helper to exercise rejection.
+    const protected_end = try space.gpu_tracker.protectRun(address, address + bytes, .read_only);
+    try testing.expectEqual(address + page_size, protected_end);
+    try testing.expectEqual(@as(u64, 2), space.gpu_tracker.protection_calls);
+    try testing.expect(!isHostRangeWritable(address, page_size));
+    try testing.expect(isHostRangeWritable(address + page_size, bytes - page_size));
 }
 
 test "GPU page tracker advances generations on HLE and native writes" {
