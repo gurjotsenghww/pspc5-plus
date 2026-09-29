@@ -304,7 +304,7 @@ pub const Pool = struct {
                 if (self.evaluation) |nested| allocator.destroy(nested);
                 self.evaluation = evaluation;
             }
-            scalar.evaluateDecodedResourceStateAtCheckpointsInto(evaluation, reader, bindings, instructions, pcs, snapshots, steps);
+            scalar.evaluateDecodedResourceSnapshotsInto(evaluation, reader, bindings, instructions, pcs, snapshots, steps);
             walked = evaluation.instruction_count;
         }
         return .{

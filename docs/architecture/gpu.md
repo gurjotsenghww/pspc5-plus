@@ -103,6 +103,16 @@ invalid 48-bit addresses stop the walk explicitly instead of inventing state.
 Draw/dispatch diagnostics expose this load plan together with the direct and
 vertex tables, ready for the shader translator to consume.
 
+Resource checkpoint preparation uses a register-snapshot mode of the same
+evaluator. It performs the same checked reads, register updates and control-flow
+walk, including loop merges and failure handling, but omits the load history
+used by specialization. Only the snapshot pool selects this mode; full scalar
+evaluation still records loads. Its history searches run only when a load PC
+does not exceed the highest recorded PC. A first forward visit cannot duplicate
+an existing record; revisits still compare address, values and provenance.
+The high-water mark follows copied evaluations and resets with each new walk.
+It may remain conservatively high when a loop discards old records.
+
 [`gpu.shader_analysis`](../../src/gpu/shader_analysis.zig) incrementally reads only
 the guest words required by the RDNA2 decoder, including literals and MIMG NSA
 words. When a relocated AGC header is available, decoding is bounded by its
