@@ -1,5 +1,9 @@
 # Yotei overlapping buffer rebinds
 
+Follow-up: [sparse buffer publication](yotei-buffer-write-spans-2026-09-30.md)
+fixes the literal-store incoming-eviction reproduction described below. This
+report preserves the earlier runner's measurements and failure evidence.
+
 ## Reproduced renderer defect
 
 The earlier publication fix protects a newer nested buffer when an older,
@@ -107,9 +111,9 @@ particular game write.
 
 Run the passing suite with
 `zig build vulkan-smoke -Doptimize=ReleaseFast -- --buffer-range-publication`.
-The separate
+At the revision documented here, the separate
 `zig build vulkan-smoke -Doptimize=ReleaseFast -- --buffer-incoming-eviction`
-currently exits with `TestExpectedEqual`; that failure is the retained
+exited with `TestExpectedEqual`; that failure was the retained
 reproduction, not a passing validation result.
 
 This remaining case needs correct CPU/GPU write ownership at resource

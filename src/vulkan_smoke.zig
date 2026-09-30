@@ -2268,7 +2268,12 @@ fn runBufferRangePublicationProbe(allocator: std.mem.Allocator, incoming_evictio
         for ([_][2]u12{ .{ 0, 124 }, .{ 32, 60 } }, 0..) |offsets, index| {
             const first = mubuf(0x1c, offsets[0], 0, 0, 0);
             const last = mubuf(0x1c, offsets[1], 0, 0, 0);
-            const code = [_]u32{ vop1(1, 0, 4), first[0] & ~@as(u32, 1 << 13), first[1], vop1(1, 0, 5), last[0] & ~@as(u32, 1 << 13), last[1], 0xbf81_0000 };
+            // Keep the earlier alias suite on whole-buffer publication. IDXEN
+            // with zero descriptor stride addresses the same two words, but
+            // deliberately takes the conservative footprint path. Otherwise
+            // sparse writes would stop exercising newer-alias clipping here.
+            const clear_index: u32 = if (incoming_eviction) 1 << 13 else 0;
+            const code = [_]u32{ vop1(1, 0, 4), first[0] & ~clear_index, first[1], vop1(1, 0, 5), last[0] & ~clear_index, last[1], 0xbf81_0000 };
             const program: u32 = 0x100 + @as(u32, @intCast(index)) * 0x100;
             for (code, 0..) |word, i| guest.word(program + i * 4, word);
             if (index == 1) {
