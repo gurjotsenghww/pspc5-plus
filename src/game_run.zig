@@ -616,6 +616,14 @@ fn run(init: std.process.Init) !bool {
     const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
     const dump_graphics_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_GRAPHICS_SPIRV") catch false;
     const trace_resource_failures = init.minimal.environ.containsUnempty(allocator, "PS5_TRACE_RESOURCE_FAILURES") catch false;
+    const trace_buffer_range: struct { address: u64 = 0, size: usize = 0 } = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_BUFFER_RANGE")) |text| parse: {
+        defer allocator.free(text);
+        var parts = std.mem.splitScalar(u8, text, ':');
+        const address = std.fmt.parseInt(u64, parts.next() orelse break :parse .{}, 0) catch break :parse .{};
+        const size = std.fmt.parseInt(usize, parts.next() orelse break :parse .{}, 0) catch break :parse .{};
+        if (parts.next() != null or size == 0 or address > std.math.maxInt(u64) - size) break :parse .{};
+        break :parse .{ .address = address, .size = size };
+    } else |_| .{};
     const capture_extended_progress_frames = init.minimal.environ.containsUnempty(
         allocator,
         "PS5_CAPTURE_PROGRESS_FRAMES",
@@ -875,6 +883,8 @@ fn run(init: std.process.Init) !bool {
             .dump_compute_spirv = dump_compute_spirv,
             .dump_graphics_spirv = dump_graphics_spirv,
             .trace_resource_failures = trace_resource_failures,
+            .trace_buffer_address = trace_buffer_range.address,
+            .trace_buffer_size = trace_buffer_range.size,
             .capture_extended_progress_frames = capture_extended_progress_frames,
             .enable_shader_ir = enable_shader_ir,
             .enable_shader_ssa_optimization = enable_shader_ssa,

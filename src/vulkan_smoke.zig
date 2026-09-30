@@ -2348,6 +2348,86 @@ fn runBufferRangePublicationProbe(allocator: std.mem.Allocator, incoming_evictio
     }
 }
 
+fn runBufferCommandWriteProbe(allocator: std.mem.Allocator) !void {
+    for (0..40) |scenario| {
+        const order = scenario / 8;
+        const dma = scenario % 2 != 0;
+        const local = (scenario / 2) % 2 != 0;
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = true, .retain_clean_storage_buffers = true });
+        defer renderer.deinit();
+        renderer.device_storage_budget_bytes = if (local) 1024 * 1024 else 0;
+        renderer.device_storage_min_bytes = 4;
+        var guest = SizedGuestMemory(0x20000){ .watch_generation = 1 };
+        var memory = guest.interface();
+        if (scenario % 8 >= 4) {
+            memory.track_gpu_read = @TypeOf(guest).track;
+            memory.gpu_generation = @TypeOf(guest).generation;
+        }
+        const backend = renderer.dcbBackend(memory);
+        for (0..32) |i| guest.word(0x10000 + i * 4, 0xdeadbeef);
+        // Unknown indexed footprint retains whole-buffer publication. A later
+        // command-processor write still owns its exact overlapping bytes.
+        const first = mubuf(0x1c, 0, 0, 0, 0);
+        const last = mubuf(0x1c, 124, 0, 0, 0);
+        const code = [_]u32{ vop1(1, 0, 4), first[0], first[1], vop1(1, 0, 5), last[0], last[1], 0xbf810000 };
+        for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 6 << 1);
+        for ([_]u32{ 0x10000, 0, 128, 0, 0x11223344, 0x55667788 }, 0..) |word, i|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        const before = renderer.frame_profile.storage_readback_bytes;
+        const replacement = [_]u8{ 0x71, 0x92, 0x35, 0xab, 0x71, 0x92, 0x35 };
+        if (dma) {
+            var command_info = std.mem.zeroes(gpu.state.DmaData);
+            command_info.source = 2;
+            command_info.source_address = 0xab359271;
+            command_info.destination = 0;
+            command_info.destination_address = 0x10035;
+            command_info.byte_count = replacement.len;
+            try std.testing.expect(backend.vtable.dma_data.?(backend.context, command_info));
+        } else try std.testing.expect(backend.vtable.write(backend.context, 0x10035, &replacement));
+        try std.testing.expectEqual(before, renderer.frame_profile.storage_readback_bytes);
+        var expected: [128]u8 = undefined;
+        for (0..32) |i| std.mem.writeInt(u32, expected[i * 4 ..][0..4], 0xdeadbeef, .little);
+        std.mem.writeInt(u32, expected[0..4], 0x11223344, .little);
+        std.mem.writeInt(u32, expected[124..128], 0x55667788, .little);
+        @memcpy(expected[0x35..][0..replacement.len], &replacement);
+        if (order == 1) {
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 128);
+        } else if (order == 2) {
+            var prefix: [32]u8 = undefined;
+            try std.testing.expect(backend.vtable.read(backend.context, 0x10000, &prefix));
+            try std.testing.expectEqualSlices(u8, expected[0..32], &prefix);
+        } else if (order == 3) {
+            // Nine separate holes overflow the bounded exclusion list. Drain
+            // the old result before losing any exclusions or GPU-written tail.
+            for ([_]usize{ 4, 12, 20, 28, 36, 64, 72, 80, 88 }) |offset| {
+                const value = [_]u8{0x6d};
+                try std.testing.expect(backend.vtable.write(backend.context, 0x10000 + offset, &value));
+                expected[offset] = value[0];
+            }
+        } else if (order == 4) {
+            const overwrite = mubuf(0x1c, 56, 0, 0, 0);
+            const later = [_]u32{ vop1(1, 0, 4), overwrite[0] & ~@as(u32, 1 << 13), overwrite[1], 0xbf810000 };
+            for (later, 0..) |word, i| guest.word(0x200 + i * 4, word);
+            try state.writeRegister(.shader, 0x20c, 2);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            std.mem.writeInt(u32, expected[56..60], 0x11223344, .little);
+        }
+        try renderer.flushPendingGuestWrites();
+        std.debug.print("command buffer write scenario={d} dma={any} device_local={any} order={d}\n", .{ scenario, dma, local, order });
+        try std.testing.expectEqualSlices(u8, &expected, guest.bytes[0x10000..0x10080]);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 128);
+        var observed: [128]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &observed);
+        try std.testing.expectEqualSlices(u8, &expected, &observed);
+    }
+    std.debug.print("command writes passed: exact bytes, both backings/tracking modes, rebind, partial readback, span overflow and subsequent GPU overwrite\n", .{});
+}
+
 fn runBufferWriteFootprintProbe(allocator: std.mem.Allocator) !void {
     for (0..20) |scenario| {
         const kind = scenario % 5;
@@ -11936,6 +12016,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-write-footprints")) {
         try runBufferWriteFootprintProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-command-writes")) {
+        try runBufferCommandWriteProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-layout-rebind")) {

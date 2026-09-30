@@ -242,6 +242,9 @@ pub const Options = struct {
     dump_graphics_spirv: bool = false,
     /// Dumps the first failing descriptor snapshot at each program/PC.
     trace_resource_failures: bool = false,
+    /// Opt-in small-buffer lifecycle snapshots inside this guest address range.
+    trace_buffer_address: u64 = 0,
+    trace_buffer_size: usize = 0,
     /// Extends automatic PPM checkpoints beyond the small startup set. This is
     /// diagnostic I/O and remains opt-in for normal game runs.
     capture_extended_progress_frames: bool = false,
@@ -1410,6 +1413,9 @@ const GuestBufferEntry = struct {
     last_gpu_use: u64 = 0,
     gpu_dirty: bool = false,
     pending_writes: buffer_write_ranges.Ranges = .{ .whole = true },
+    /// Exact later command-processor writes that an older readback must spare.
+    /// Overflow is drained before accepting another write, never widened.
+    pending_host_writes: buffer_write_ranges.Ranges = .{},
     write_origin: BufferWriteOrigin = .{},
     last_writer_program: u64 = 0,
     /// Ordered fingerprint of the 16 KiB guest pages copied into device_local.
@@ -2705,6 +2711,10 @@ const FrameProfile = struct {
     storage_stage_ns: u64 = 0,
     storage_commit_ns: u64 = 0,
     storage_commit_lookups: u64 = 0,
+    command_buffer_write_ns: u64 = 0,
+    command_buffer_write_checks: u64 = 0,
+    command_buffer_write_overlaps: u64 = 0,
+    command_buffer_write_drains: u64 = 0,
     storage_commit_candidates: u64 = 0,
     storage_commit_linear_steps: u64 = 0,
     target_materialize_ns: u64 = 0,
@@ -4619,6 +4629,11 @@ pub const Renderer = struct {
     dump_compute_spirv: bool,
     dump_graphics_spirv: bool,
     trace_resource_failures: bool,
+    trace_buffer_address: u64 = 0,
+    trace_buffer_size: usize = 0,
+    trace_buffer_watches: [64]struct { address: u64 = 0, size: usize = 0 } = @splat(.{}),
+    trace_buffer_watch_next: usize = 0,
+    trace_buffer_reports: usize = 0,
     sampled_image_nonuniform_indexing: bool,
     storage_buffer_nonuniform_indexing: bool,
     capture_extended_progress_frames: bool,
@@ -5577,6 +5592,8 @@ pub const Renderer = struct {
             .dump_compute_spirv = options.dump_compute_spirv,
             .dump_graphics_spirv = options.dump_graphics_spirv,
             .trace_resource_failures = options.trace_resource_failures,
+            .trace_buffer_address = options.trace_buffer_address,
+            .trace_buffer_size = options.trace_buffer_size,
             .sampled_image_nonuniform_indexing = sampled_image_nonuniform_indexing,
             .storage_buffer_nonuniform_indexing = storage_buffer_nonuniform_indexing,
             .capture_extended_progress_frames = options.capture_extended_progress_frames,
@@ -6679,6 +6696,7 @@ pub const Renderer = struct {
     }
 
     fn uploadStorageBacking(self: *Renderer, entry: *GuestBufferEntry, size: usize, upload: ?DrawUploadSlice) (Error || std.mem.Allocator.Error)!void {
+        self.traceBufferLifetime("upload", entry.guest_address, size, null, entry.write_origin);
         if (entry.host_transfer == null and upload == null) return;
         errdefer {
             entry.page_generation = 0;
@@ -6768,6 +6786,7 @@ pub const Renderer = struct {
         if (size > maximum_staged_buffer_bytes) return Error.GuestBufferTooLarge;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         try self.drainInternalReleasesForRange(guest_address, size);
+        self.traceBufferLifetime("bind", guest_address, size, null, .{});
         // V# ranges at one allocation base can change between commands. An
         // exact resident hit keeps its GPU result, but a differently sized
         // view uploads guest bytes and must first observe the earlier writer.
@@ -6827,6 +6846,7 @@ pub const Renderer = struct {
                         changed.write_origin = .{};
                         changed.last_writer_program = 0;
                         changed.gpu_dirty = false;
+                        changed.pending_host_writes = .{};
                         changed.page_generation = 0;
                         changed.content_hash = null;
                         recycled_entry = true;
@@ -6934,6 +6954,7 @@ pub const Renderer = struct {
                 victim.write_origin = .{};
                 victim.last_writer_program = 0;
                 victim.gpu_dirty = false;
+                victim.pending_host_writes = .{};
                 victim.page_generation = 0;
                 victim.content_hash = null;
                 entry_index = victim_index;
@@ -6946,7 +6967,13 @@ pub const Renderer = struct {
             self.frame_profile.buffer_cache_hits +|= 1;
         }
 
-        if (cache_hit and !recycled_entry) try self.synchronizeGuestBufferAliases(entry_index.?);
+        if (cache_hit and !recycled_entry) {
+            // Merge explicit CP bytes before another shader uses the old
+            // backing. Deferred publication preserves them in guest memory.
+            if (self.guest_buffers.items[entry_index.?].pending_host_writes.count != 0)
+                try self.flushGuestStorageBuffer(entry_index.?);
+            try self.synchronizeGuestBufferAliases(entry_index.?);
+        }
         const entry = &self.guest_buffers.items[entry_index.?];
         entry.last_alias_sync_sequence = self.guest_buffer_sequence;
         entry.last_used_sequence = self.guest_buffer_sequence;
@@ -7260,6 +7287,7 @@ pub const Renderer = struct {
             }
             if (size == entry_size) {
                 entry.gpu_dirty = false;
+                entry.pending_host_writes = .{};
                 self.deferred_shader_metadata_slots.unset(index);
             }
             return;
@@ -7280,6 +7308,7 @@ pub const Renderer = struct {
         }
         if (size == entry_size) {
             entry.gpu_dirty = false;
+            entry.pending_host_writes = .{};
             self.deferred_shader_metadata_slots.unset(index);
             // The protected subranges remain newer in guest memory than in
             // this old backing. A clean rebind must upload them again.
@@ -7308,6 +7337,7 @@ pub const Renderer = struct {
     /// even when the newer result has already been published and is clean.
     fn publishGuestStorageBytes(self: *Renderer, index: usize, bytes: []const u8, writes: []const buffer_write_ranges.Span) (Error || std.mem.Allocator.Error)!bool {
         const entry = self.guest_buffers.items[index];
+        self.traceBufferLifetime("readback", entry.guest_address, bytes.len, bytes, entry.write_origin);
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const end = entry.guest_address + bytes.len;
         const Span = struct {
@@ -7321,6 +7351,9 @@ pub const Renderer = struct {
         const allocator = stack.get();
         var protected: std.ArrayList(Span) = .empty;
         defer protected.deinit(allocator);
+        for (entry.pending_host_writes.spans[0..entry.pending_host_writes.count]) |span| {
+            if (span.first < bytes.len) try protected.append(allocator, .{ .first = span.first, .end = @min(span.end, bytes.len) });
+        }
         for (self.guest_buffers.items) |other| {
             if (other.last_gpu_write_sequence <= entry.last_gpu_write_sequence or
                 other.guest_address >= end or other.guest_address + other.size <= entry.guest_address) continue;
@@ -7345,7 +7378,46 @@ pub const Renderer = struct {
         // Unpublished bytes can contain newer CPU data. Never certify the
         // complete old backing from the generation/hash of these sparse writes.
         const partial = writes.len != 1 or writes[0].first != 0 or writes[0].end != bytes.len;
+        self.traceBufferLifetime("published", entry.guest_address, bytes.len, null, entry.write_origin);
         return partial or protected.items.len != 0;
+    }
+
+    /// Diagnostic snapshots only: no waits, GPU reads, or changes to publication.
+    /// Track up to 64 small views, including one about to evict an older alias.
+    fn traceBufferLifetime(self: *Renderer, comptime event: []const u8, address: u64, size: usize, readback: ?[]const u8, origin: BufferWriteOrigin) void {
+        if (self.trace_buffer_size == 0 or self.trace_buffer_reports >= 20000 or
+            !byteRangesOverlap(address, size, self.trace_buffer_address, self.trace_buffer_size)) return;
+        const memory = self.guest_memory orelse return;
+        if (comptime std.mem.eql(u8, event, "bind")) {
+            if (size != 0 and size <= 64) {
+                const found = for (self.trace_buffer_watches) |watch| {
+                    if (watch.address == address and watch.size == size) break true;
+                } else false;
+                if (!found) {
+                    self.trace_buffer_watches[self.trace_buffer_watch_next] = .{ .address = address, .size = size };
+                    self.trace_buffer_watch_next = (self.trace_buffer_watch_next + 1) % self.trace_buffer_watches.len;
+                }
+            }
+        }
+        for (self.trace_buffer_watches) |watch| {
+            if (watch.size == 0 or !byteRangesOverlap(address, size, watch.address, watch.size)) continue;
+            var guest: [64]u8 = undefined;
+            if (!memory.read(memory.context, watch.address, guest[0..watch.size])) continue;
+            const gpu_bytes: []const u8 = if (readback) |bytes| blk: {
+                if (watch.address < address or watch.address + watch.size > address + bytes.len) break :blk &.{};
+                const offset: usize = @intCast(watch.address - address);
+                break :blk bytes[offset .. offset + watch.size];
+            } else &.{};
+            std.debug.print("[gpu buffer lifetime] event={s} flip={d} seq={d} view=0x{x}/{d} watch=0x{x}/{d} program=0x{x} pc=0x{x} reason={s} guest={x} gpu={x}\n", .{
+                event,          self.flip_callbacks, self.guest_buffer_sequence, address,              size,      watch.address, watch.size,
+                origin.program, origin.pc,           @tagName(origin.reason),    guest[0..watch.size], gpu_bytes,
+            });
+            self.trace_buffer_reports += 1;
+            if (self.trace_buffer_reports == 20000) {
+                std.debug.print("[gpu buffer lifetime] report limit reached\n", .{});
+                return;
+            }
+        }
     }
 
     /// A clean newer writer still protects overlapping bytes. Publish older
@@ -7361,6 +7433,50 @@ pub const Renderer = struct {
             }
         }
         try self.flushGuestStorageBuffer(index);
+    }
+
+    /// WRITE_DATA and DMA writes are exact, ordered ownership evidence. Keep
+    /// their bytes out of older GPU snapshots without waiting at every label.
+    fn writeGuestCommandBytes(self: *Renderer, address: u64, bytes: []const u8) anyerror!void {
+        const started = hostTimestampNs();
+        defer self.frame_profile.command_buffer_write_ns +|= elapsedHostNanoseconds(started);
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        var stack = std.heap.stackFallback(@sizeOf(usize) * 32, self.allocator);
+        const allocator = stack.get();
+        var overlapping: std.ArrayList(usize) = .empty;
+        defer overlapping.deinit(allocator);
+        for (self.guest_buffers.items, 0..) |entry, index| {
+            self.frame_profile.command_buffer_write_checks += 1;
+            if (!byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) continue;
+            self.frame_profile.command_buffer_write_overlaps += 1;
+            try overlapping.append(allocator, index);
+            if (!entry.gpu_dirty) continue;
+            var combined = entry.pending_host_writes;
+            combined.include(.{
+                .first = @intCast(@max(address, entry.guest_address) - entry.guest_address),
+                .end = @intCast(@min(address + bytes.len, entry.guest_address + entry.size) - entry.guest_address),
+            });
+            // Losing an exclusion must never drop unrelated pending GPU bytes.
+            // Publish with the previous exclusions while they are still known.
+            if (combined.whole) {
+                self.frame_profile.command_buffer_write_drains += 1;
+                try self.flushGuestStorageBuffer(index);
+            }
+        }
+        if (!memory.write(memory.context, address, bytes)) return Error.GuestMemoryWriteFailed;
+        for (overlapping.items) |index| {
+            const entry = &self.guest_buffers.items[index];
+            if (entry.gpu_dirty) entry.pending_host_writes.include(.{
+                .first = @intCast(@max(address, entry.guest_address) - entry.guest_address),
+                .end = @intCast(@min(address + bytes.len, entry.guest_address + entry.size) - entry.guest_address),
+            });
+            std.debug.assert(!entry.pending_host_writes.whole);
+            entry.page_generation = 0;
+            entry.page_observation = .{};
+            entry.content_hash = null;
+            self.advanceGuestBufferContents(entry);
+        }
+        self.traceBufferLifetime("cp-write", address, bytes.len, null, .{});
     }
 
     fn flushGuestStorageRange(self: *Renderer, address: u64, size: usize) (Error || std.mem.Allocator.Error)!void {
@@ -11703,6 +11819,7 @@ pub const Renderer = struct {
     }
 
     fn markGuestBufferRangesWritten(self: *Renderer, entry: *GuestBufferEntry, ranges: *const buffer_write_ranges.Ranges, origin: BufferWriteOrigin) void {
+        self.traceBufferLifetime("gpu-write", entry.guest_address, entry.size, null, origin);
         if (!entry.gpu_dirty) entry.pending_writes = .{};
         const was_whole = entry.pending_writes.whole;
         if (!was_whole) entry.write_origin = origin;
@@ -27037,8 +27154,7 @@ pub const Renderer = struct {
         self.flushGuestStorageRange(address, bytes.len) catch return false;
         self.prepareCmaskWrite(address, bytes.len) catch return false;
         self.prepareHtileWrite(address, bytes.len);
-        const memory = self.guest_memory orelse return false;
-        if (!memory.write(memory.context, address, bytes)) return false;
+        self.writeGuestCommandBytes(address, bytes) catch return false;
         self.image_aliases.markGuestWrite(aliasRange(address, bytes.len));
         // Explicit writes are stronger evidence than the sparse content
         // probe, which can miss pixels behind tiled mip-tail padding. This
@@ -27633,7 +27749,7 @@ pub const Renderer = struct {
                 self.waitForMappedReaders(dma.destination_address, byte_count) catch return false;
                 self.prepareCmaskWrite(dma.destination_address, byte_count) catch return false;
                 self.prepareHtileWrite(dma.destination_address, byte_count);
-                if (!memory.write(memory.context, dma.destination_address, bytes)) return false;
+                self.writeGuestCommandBytes(dma.destination_address, bytes) catch return false;
                 self.invalidateDmaDestination(dma.destination_address, byte_count);
                 self.applyUniformHtileWrite(dma.destination_address, bytes) catch return false;
                 self.applyUniformDccWrite(dma.destination_address, bytes) catch return false;
@@ -28211,6 +28327,8 @@ pub const Renderer = struct {
                 std.debug.print("[gpu buffer waits] flip={d} waits={d} avoided={d}\n", .{ self.flip_callbacks, profile.storage_buffer_waits, profile.storage_buffer_waits_avoided });
             if (profile.storage_commit_lookups != 0)
                 std.debug.print("[gpu buffer lookup] flip={d} commits={d} candidates={d} linear_equivalent={d}\n", .{ self.flip_callbacks, profile.storage_commit_lookups, profile.storage_commit_candidates, profile.storage_commit_linear_steps });
+            if (profile.command_buffer_write_checks != 0)
+                std.debug.print("[gpu command writes] flip={d} us={d} checks={d} overlaps={d} overflow_drains={d}\n", .{ self.flip_callbacks, profile.command_buffer_write_ns / std.time.ns_per_us, profile.command_buffer_write_checks, profile.command_buffer_write_overlaps, profile.command_buffer_write_drains });
             for (profile.wait_sites) |site| {
                 if (site.count == 0) continue;
                 std.debug.print("[gpu wait site] flip={d} caller=0x{x} waits={d} us={d}\n", .{
