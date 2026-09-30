@@ -2415,6 +2415,66 @@ fn runBufferWriteFootprintProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("buffer write footprints passed: literal and accumulated stores, indexed/SGPR/missing-resource fallbacks, incoming GPU results and exact readback sizes across both backings/tracking modes\n", .{});
 }
 
+/// The same SGPR quartet and allocation may describe different record layouts
+/// at successive accesses. Reusing the first stride writes a different word.
+fn runBufferLayoutRebindProbe(allocator: std.mem.Allocator) !void {
+    for (0..8) |scenario| {
+        const local = scenario & 1 != 0;
+        var renderer = try vulkan.Renderer.init(allocator, .{
+            .enable_timeline_scheduler = true,
+            .defer_small_storage_writes = true,
+            .retain_clean_storage_buffers = true,
+            .enable_shader_ir = scenario & 2 != 0,
+        });
+        defer renderer.deinit();
+        renderer.device_storage_budget_bytes = if (local) 1024 * 1024 else 0;
+        renderer.device_storage_min_bytes = 4;
+        var guest = GuestMemory{ .watch_generation = 1 };
+        var memory = guest.interface();
+        if (scenario & 4 != 0) {
+            memory.track_gpu_read = GuestMemory.track;
+            memory.gpu_generation = GuestMemory.generation;
+        }
+        _ = renderer.dcbBackend(memory);
+        for (0..32) |i| guest.word(0x1000 + i * 4, 0xdeadbeef);
+        const store = mubuf(0x1c, 0, 1, 0, 0);
+        const code = [_]u32{
+            vop1(1, 0, 129), vop1(1, 1, 4), // index 1, first value
+            store[0], store[1], // byte 8 using stride 8
+            sop1(3, 1, 255), 4 << 16, // stride 4
+            sop1(3, 2, 160), // 32 records: still 128 bytes
+            vop1(1, 1, 5), store[0], store[1], // byte 4
+            sop1(3, 1, 255), 8 << 16, // restore stride 8
+            sop1(3, 2, 144), // restore 16 records
+            vop1(1, 1, 6), store[0], store[1], // byte 8 again
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 7 << 1);
+        for ([_]u32{ 0x1000, 8 << 16, 16, 0, 0x11223344, 0x55667788, 0x12345678 }, 0..) |word, i|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        const report = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expect(report.spirv_words != 0);
+        try std.testing.expectEqual(@as(usize, 1), renderer.guest_buffers.items.len);
+        try std.testing.expectEqual(local, renderer.guest_buffers.items[0].host_transfer != null);
+        try renderer.flushPendingGuestWrites();
+        for (0..32) |i| {
+            const expected: u32 = switch (i) {
+                1 => 0x55667788,
+                2 => 0x12345678,
+                else => 0xdeadbeef,
+            };
+            const actual = std.mem.readInt(u32, guest.bytes[0x1000 + i * 4 ..][0..4], .little);
+            if (actual != expected) std.debug.print("buffer layout rebind scenario={d} word={d}: expected=0x{x} actual=0x{x}\n", .{ scenario, i, expected, actual });
+            try std.testing.expectEqual(expected, actual);
+        }
+    }
+    std.debug.print("buffer layout rebind passed: stride 8/4/8 on one allocation, both backings, decoded/typed IR and tracked/untracked pages\n", .{});
+}
+
 fn runBufferAtomicProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -11876,6 +11936,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-write-footprints")) {
         try runBufferWriteFootprintProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-layout-rebind")) {
+        try runBufferLayoutRebindProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-logical-scc")) {

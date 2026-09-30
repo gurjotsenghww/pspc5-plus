@@ -1359,6 +1359,39 @@ const BufferPageObservation = struct {
 
 const buffer_write_ranges = @import("buffer_write_ranges.zig");
 
+/// Attribution only: this never relaxes publication coverage. Keep the
+/// instruction that forced a full snapshot available after the dispatch and
+/// after readback, so an alias failure can be traced without per-store logging.
+const BufferWriteOrigin = struct {
+    const Reason = enum(u8) {
+        external,
+        literal,
+        opcode,
+        indexed,
+        vector_offset,
+        negative_offset,
+        swizzled,
+        thread_id,
+        runtime_descriptor,
+        modified_offset,
+        register_offset,
+        bounds,
+        mapping,
+        span_budget,
+        incomplete_preparation,
+    };
+    program: u64 = 0,
+    pc: u32 = 0,
+    opcode: u32 = 0,
+    resource_sgpr: u32 = 0,
+    stride: u32 = 0,
+    reason: Reason = .external,
+
+    fn instruction(program: u64, inst: gpu.ShaderInstruction, reason: Reason) BufferWriteOrigin {
+        return .{ .program = program, .pc = inst.pc, .opcode = @intFromEnum(inst.opcode), .resource_sgpr = inst.src1.reg, .reason = reason };
+    }
+};
+
 const GuestBufferEntry = struct {
     descriptor_index: u32,
     guest_address: u64,
@@ -1377,6 +1410,8 @@ const GuestBufferEntry = struct {
     last_gpu_use: u64 = 0,
     gpu_dirty: bool = false,
     pending_writes: buffer_write_ranges.Ranges = .{ .whole = true },
+    write_origin: BufferWriteOrigin = .{},
+    last_writer_program: u64 = 0,
     /// Ordered fingerprint of the 16 KiB guest pages copied into device_local.
     /// Zero selects the legacy upload path when tracking is unavailable.
     page_generation: u64 = 0,
@@ -2669,6 +2704,9 @@ const FrameProfile = struct {
     flip_ns: u64 = 0,
     storage_stage_ns: u64 = 0,
     storage_commit_ns: u64 = 0,
+    storage_commit_lookups: u64 = 0,
+    storage_commit_candidates: u64 = 0,
+    storage_commit_linear_steps: u64 = 0,
     target_materialize_ns: u64 = 0,
     resident_storage_bytes: u64 = 0,
     texture_hits: u64 = 0,
@@ -3446,6 +3484,8 @@ const compute_watch_addresses = [_]u64{
 const ComputeResources = struct {
     scalar_reuse_safe: bool = true,
     store_preparation_incomplete: bool = false,
+    program_address: u64 = 0,
+    incomplete_store_origin: BufferWriteOrigin = .{},
     vertex_index_proof: VertexIndexProof = .{},
     mappings: [maximum_storage_mappings]gpu.ShaderSpirvStorageBufferBinding = undefined,
     mapping_count: usize = 0,
@@ -3456,6 +3496,7 @@ const ComputeResources = struct {
     occupied: [maximum_storage_descriptors]bool = @splat(false),
     writable: [maximum_storage_descriptors]bool = @splat(false),
     write_ranges: [maximum_storage_descriptors]buffer_write_ranges.Ranges = @splat(.{}),
+    write_origins: [maximum_storage_descriptors]BufferWriteOrigin = @splat(.{}),
     specialized_scalar_prefix_end: u32 = 0,
     scalar_memories: [maximum_storage_mappings]rdna2.spirv.ScalarMemoryBinding = undefined,
     scalar_memory_count: usize = 0,
@@ -3494,6 +3535,9 @@ const ComputeResources = struct {
         const result = renderer.free_compute_resources[renderer.free_compute_resource_count];
         result.scalar_reuse_safe = true;
         result.store_preparation_incomplete = false;
+        result.program_address = 0;
+        result.incomplete_store_origin = .{};
+        @memset(&result.write_origins, .{});
         result.vertex_index_proof = .{};
         // Only occupied slots and the prefixes named by these counts are read.
         // Preserve the unused multi-megabyte arrays across draws/dispatches.
@@ -3543,6 +3587,7 @@ const ComputeResources = struct {
     fn noteBufferStore(self: *ComputeResources, slot: u32, inst: gpu.ShaderInstruction) void {
         self.writable[slot] = true;
         if (self.write_ranges[slot].whole) return;
+        self.write_origins[slot] = BufferWriteOrigin.instruction(self.program_address, inst, .mapping);
         // Match the translator's PC-qualified selection, including a reused
         // mapping. Descriptor flags from a different access are not a proof.
         const binding = blk: {
@@ -3556,8 +3601,11 @@ const ComputeResources = struct {
             return;
         };
         if (binding.descriptor_index == slot) {
+            self.write_origins[slot].stride = binding.stride;
+            self.write_origins[slot].reason = bufferWriteRangeReason(inst, binding, self.sizes[slot]);
             if (constantBufferWriteRange(inst, binding, self.sizes[slot])) |span| {
                 self.write_ranges[slot].include(span);
+                if (self.write_ranges[slot].whole) self.write_origins[slot].reason = .span_budget;
                 return;
             }
         }
@@ -3800,8 +3848,15 @@ fn validateVertexIndexMappings(
     }
 }
 
-fn canReuseStorageMapping(attribute_specific: bool, previous: ?u32, current: u32) bool {
-    return !attribute_specific and previous != null and previous.? == current;
+fn canReuseStorageMapping(attribute_specific: bool, previous: ?gpu.ShaderSpirvStorageBufferBinding, current: gpu.ShaderSpirvStorageBufferBinding) bool {
+    const original = previous orelse return false;
+    if (attribute_specific or original.instruction_pc != null) return false;
+    // Equal allocations need not have equal record layouts. Only a matching
+    // unqualified association can serve another instruction through fallback.
+    // Compare every addressing/format field, excluding the new instruction PC.
+    var unqualified = current;
+    unqualified.instruction_pc = null;
+    return std.meta.eql(original, unqualified);
 }
 
 /// AGC's attribute table uses the sparse VertexAttribFormat numbering while a
@@ -3936,29 +3991,48 @@ fn constantBufferFetchExtent(descriptor: gpu.BufferDescriptor, inst: gpu.ShaderI
 /// Only literal-address untyped stores qualify. In particular, a scalar
 /// checkpoint value need not be invariant across a shader loop or workgroup.
 fn constantBufferWriteRange(inst: gpu.ShaderInstruction, binding: gpu.ShaderSpirvStorageBufferBinding, size: usize) ?buffer_write_ranges.Span {
+    if (bufferWriteRangeReason(inst, binding, size) != .literal) return null;
     const bytes: u32 = switch (inst.opcode) {
         .buffer_store_dword => 4,
         .buffer_store_dwordx2 => 8,
         .buffer_store_dwordx3 => 12,
         .buffer_store_dwordx4 => 16,
-        else => return null,
+        else => unreachable,
     };
-    if (inst.family != .mubuf or inst.index_enable or inst.offset_enable or inst.memory_offset < 0 or
-        binding.swizzled or binding.add_thread_id or binding.candidate_words != null or binding.lookup != null) return null;
+    const scalar_offset = binding.soffset_value orelse if (inst.src2.kind == .null) 0 else inst.src2.value;
+    const first = @as(u64, scalar_offset) + @as(u32, @intCast(inst.memory_offset));
+    return .{ .first = @intCast(first), .end = @intCast(first + bytes) };
+}
+
+fn bufferWriteRangeReason(inst: gpu.ShaderInstruction, binding: gpu.ShaderSpirvStorageBufferBinding, size: usize) BufferWriteOrigin.Reason {
+    const bytes: u32 = switch (inst.opcode) {
+        .buffer_store_dword => 4,
+        .buffer_store_dwordx2 => 8,
+        .buffer_store_dwordx3 => 12,
+        .buffer_store_dwordx4 => 16,
+        else => return .opcode,
+    };
+    if (inst.family != .mubuf) return .opcode;
+    if (inst.index_enable) return .indexed;
+    if (inst.offset_enable) return .vector_offset;
+    if (inst.memory_offset < 0) return .negative_offset;
+    if (binding.swizzled) return .swizzled;
+    if (binding.add_thread_id) return .thread_id;
+    if (binding.candidate_words != null or binding.lookup != null) return .runtime_descriptor;
     const operand = inst.src2;
     if (operand.negate or operand.negate_hi or operand.absolute or operand.op_sel or operand.op_sel_hi or
-        operand.sdwa_sel != 6 or operand.sdwa_sext or operand.omod != 0 or operand.clamp or operand.dpp or operand.dpp8) return null;
+        operand.sdwa_sel != 6 or operand.sdwa_sext or operand.omod != 0 or operand.clamp or operand.dpp or operand.dpp8) return .modified_offset;
     const scalar_offset = binding.soffset_value orelse switch (operand.kind) {
         .null => @as(u32, 0),
         .integer_inline_constant, .literal_constant => operand.value,
-        else => return null,
+        else => return .register_offset,
     };
     const first = @as(u64, scalar_offset) + @as(u32, @intCast(inst.memory_offset));
     const end = first + bytes;
     // Dword alignment also makes the Vulkan readback regions exact. Preserve
     // the existing full path for wraparound, subword and out-of-range accesses.
-    if (first % 4 != 0 or end > size or end > std.math.maxInt(u32)) return null;
-    return .{ .first = @intCast(first), .end = @intCast(end) };
+    if (first % 4 != 0 or end > size or end > std.math.maxInt(u32)) return .bounds;
+    return .literal;
 }
 
 const DrawFetchBounds = struct {
@@ -6750,6 +6824,8 @@ pub const Renderer = struct {
                         changed.last_written_sequence = 0;
                         changed.last_gpu_write_sequence = 0;
                         changed.last_alias_sync_sequence = 0;
+                        changed.write_origin = .{};
+                        changed.last_writer_program = 0;
                         changed.gpu_dirty = false;
                         changed.page_generation = 0;
                         changed.content_hash = null;
@@ -6855,6 +6931,8 @@ pub const Renderer = struct {
                 victim.last_written_sequence = 0;
                 victim.last_gpu_write_sequence = 0;
                 victim.last_alias_sync_sequence = 0;
+                victim.write_origin = .{};
+                victim.last_writer_program = 0;
                 victim.gpu_dirty = false;
                 victim.page_generation = 0;
                 victim.content_hash = null;
@@ -10286,6 +10364,8 @@ pub const Renderer = struct {
             result.mapping_count += 1;
             if (writable) {
                 result.writable[slot] = true;
+                if (!result.write_ranges[slot].whole)
+                    result.write_origins[slot] = BufferWriteOrigin.instruction(bindings.program_address, access, .runtime_descriptor);
                 result.write_ranges[slot] = .{ .whole = true };
             }
         }
@@ -10728,6 +10808,7 @@ pub const Renderer = struct {
     ) anyerror!*ComputeResources {
         const result = try ComputeResources.acquire(self);
         errdefer result.deinit(self);
+        result.program_address = bindings.program_address;
         result.specialized_scalar_prefix_end = specialized_scalar_prefix_end;
         if (reserved_resources) |reserved| {
             for (reserved.occupied, 0..) |used, index| {
@@ -10873,6 +10954,8 @@ pub const Renderer = struct {
             // SGPR mapping in the translator. Do not certify partial coverage
             // when any store's resource preparation was incomplete.
             defer if (is_store and !store_prepared) {
+                if (!result.store_preparation_incomplete)
+                    result.incomplete_store_origin = BufferWriteOrigin.instruction(bindings.program_address, candidate.*, .incomplete_preparation);
                 result.store_preparation_incomplete = true;
             };
             const inst = candidate.*;
@@ -11043,32 +11126,14 @@ pub const Renderer = struct {
                 result.sizes[free] = size;
                 break :blk free;
             };
-            const previous_descriptor_index = result.mappingForSgpr(resource_sgpr);
-            // Constant-buffer mappings are interchangeable when the SGPR and
-            // staged range match. Vertex attributes are not: several fetches
-            // commonly share one V# and buffer while using different table
-            // offsets, so every instruction needs its own PC-qualified entry.
-            if (canReuseStorageMapping(
-                vertex_attribute != null,
-                previous_descriptor_index,
-                descriptor_index,
-            )) {
-                if (is_store) result.noteBufferStore(descriptor_index, inst);
-                store_prepared = true;
-                continue;
-            }
-            if (result.mapping_count >= result.mappings.len) {
-                if (log_verbose_gpu) std.debug.print(
-                    "[vulkan dcb] no free V# mapping for pc=0x{x} s{d}; soft-skip\n",
-                    .{ inst.pc, resource_sgpr },
-                );
-                continue;
-            }
-            result.mappings[result.mapping_count] = .{
+            const previous_mapping = for (result.mappings[0..result.mapping_count]) |mapping| {
+                if (mapping.resource_sgpr == resource_sgpr) break mapping;
+            } else null;
+            const mapping: gpu.ShaderSpirvStorageBufferBinding = .{
                 .resource_sgpr = resource_sgpr,
                 .descriptor_index = descriptor_index,
                 .instruction_pc = if (vertex_attribute != null or
-                    previous_descriptor_index != null)
+                    previous_mapping != null)
                     inst.pc
                 else
                     null,
@@ -11095,6 +11160,19 @@ pub const Renderer = struct {
                 // inside on its own.
                 .extent_bytes = std.math.cast(u32, staged_extent),
             };
+            if (canReuseStorageMapping(vertex_attribute != null, previous_mapping, mapping)) {
+                if (is_store) result.noteBufferStore(descriptor_index, inst);
+                store_prepared = true;
+                continue;
+            }
+            if (result.mapping_count >= result.mappings.len) {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] no free V# mapping for pc=0x{x} s{d}; soft-skip\n",
+                    .{ inst.pc, resource_sgpr },
+                );
+                continue;
+            }
+            result.mappings[result.mapping_count] = mapping;
             result.mapping_count += 1;
             if (is_store) result.noteBufferStore(descriptor_index, inst);
             store_prepared = true;
@@ -11553,14 +11631,25 @@ pub const Renderer = struct {
             // bind must seed from its result, including deferred writes, and
             // an older completed frame must not publish over the new bytes.
             self.invalidateBufferColorTarget(resources.addresses[index]);
-            const buffer_index = for (self.guest_buffers.items, 0..) |*entry, slot| {
-                if (entry.guest_address != resources.addresses[index] or entry.size != resources.sizes[index]) continue;
-                if (resources.store_preparation_incomplete)
-                    self.markGuestBufferWritten(entry)
-                else
-                    self.markGuestBufferRangesWritten(entry, &resources.write_ranges[index]);
-                break slot;
-            } else return Error.GuestBufferNotStaged;
+            self.frame_profile.storage_commit_lookups += 1;
+            const buffer_index = found: {
+                // Staging already maintains these address buckets through
+                // append, replacement and removal. Keep the exact size check
+                // and original ascending slot order for differently sized views.
+                var candidates = self.guest_buffer_address_index.candidates(self.guest_buffers.items, resources.addresses[index]);
+                while (candidates.next()) |slot| {
+                    self.frame_profile.storage_commit_candidates += 1;
+                    const entry = &self.guest_buffers.items[slot];
+                    if (entry.guest_address != resources.addresses[index] or entry.size != resources.sizes[index]) continue;
+                    self.frame_profile.storage_commit_linear_steps += slot + 1;
+                    if (resources.store_preparation_incomplete)
+                        self.markGuestBufferRangesWritten(entry, &.{ .whole = true }, resources.incomplete_store_origin)
+                    else
+                        self.markGuestBufferRangesWritten(entry, &resources.write_ranges[index], resources.write_origins[index]);
+                    break :found slot;
+                }
+                return Error.GuestBufferNotStaged;
+            };
             try self.flushComputedMetadata(buffer_index);
             if (self.defer_small_storage_writes_enabled or
                 resources.sizes[index] >= deferred_storage_write_min_bytes)
@@ -11610,16 +11699,21 @@ pub const Renderer = struct {
     }
 
     fn markGuestBufferWritten(self: *Renderer, entry: *GuestBufferEntry) void {
-        self.markGuestBufferRangesWritten(entry, &.{ .whole = true });
+        self.markGuestBufferRangesWritten(entry, &.{ .whole = true }, .{});
     }
 
-    fn markGuestBufferRangesWritten(self: *Renderer, entry: *GuestBufferEntry, ranges: *const buffer_write_ranges.Ranges) void {
+    fn markGuestBufferRangesWritten(self: *Renderer, entry: *GuestBufferEntry, ranges: *const buffer_write_ranges.Ranges, origin: BufferWriteOrigin) void {
         if (!entry.gpu_dirty) entry.pending_writes = .{};
+        const was_whole = entry.pending_writes.whole;
+        if (!was_whole) entry.write_origin = origin;
+        entry.last_writer_program = origin.program;
         // A writable binding without a footprint must remain conservative.
         if (!ranges.whole and ranges.count == 0)
             entry.pending_writes = .{ .whole = true }
         else
             entry.pending_writes.merge(ranges);
+        if (!was_whole and !ranges.whole and ranges.count != 0 and entry.pending_writes.whole)
+            entry.write_origin.reason = .span_budget;
         self.advanceGuestBufferContents(entry);
         entry.last_gpu_write_sequence = entry.last_written_sequence;
         self.guest_buffer_write_history.record(entry.guest_address, entry.size, entry.last_gpu_write_sequence);
@@ -28115,6 +28209,8 @@ pub const Renderer = struct {
             );
             if (profile.storage_buffer_waits + profile.storage_buffer_waits_avoided != 0)
                 std.debug.print("[gpu buffer waits] flip={d} waits={d} avoided={d}\n", .{ self.flip_callbacks, profile.storage_buffer_waits, profile.storage_buffer_waits_avoided });
+            if (profile.storage_commit_lookups != 0)
+                std.debug.print("[gpu buffer lookup] flip={d} commits={d} candidates={d} linear_equivalent={d}\n", .{ self.flip_callbacks, profile.storage_commit_lookups, profile.storage_commit_candidates, profile.storage_commit_linear_steps });
             for (profile.wait_sites) |site| {
                 if (site.count == 0) continue;
                 std.debug.print("[gpu wait site] flip={d} caller=0x{x} waits={d} us={d}\n", .{
@@ -37696,11 +37792,26 @@ test "graphics SRT slots preserve first-use order across repeated and out-of-ban
         try std.testing.expectEqual(expected, graphicsSrtSamplerSlot(&mappings, reg));
 }
 
-test "vertex attributes keep distinct PC-qualified storage mappings" {
-    try std.testing.expect(canReuseStorageMapping(false, 3, 3));
-    try std.testing.expect(!canReuseStorageMapping(false, 3, 4));
-    try std.testing.expect(!canReuseStorageMapping(false, null, 3));
-    try std.testing.expect(!canReuseStorageMapping(true, 3, 3));
+test "storage mapping reuse preserves record layouts and instruction scope" {
+    const original = gpu.ShaderSpirvStorageBufferBinding{ .resource_sgpr = 0, .descriptor_index = 3, .stride = 8, .extent_bytes = 128 };
+    var current = original;
+    current.instruction_pc = 24;
+    try std.testing.expect(canReuseStorageMapping(false, original, current));
+    try std.testing.expect(!canReuseStorageMapping(true, original, current));
+    try std.testing.expect(!canReuseStorageMapping(false, null, current));
+    // A PC-qualified table candidate is not a fallback for another access.
+    try std.testing.expect(!canReuseStorageMapping(false, current, current));
+    current.stride = 4;
+    try std.testing.expect(!canReuseStorageMapping(false, original, current));
+    current = original;
+    current.unified_format = 14;
+    try std.testing.expect(!canReuseStorageMapping(false, original, current));
+    current = original;
+    current.dst_select = .{ 6, 5, 4, 7 };
+    try std.testing.expect(!canReuseStorageMapping(false, original, current));
+    current = original;
+    current.descriptor_index = 4;
+    try std.testing.expect(!canReuseStorageMapping(false, original, current));
 }
 
 test "vertex index range batches checked reads and preserves signed bounds" {
