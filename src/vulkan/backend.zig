@@ -4684,6 +4684,7 @@ pub const Renderer = struct {
     guest_buffer_backing_bytes: u64 = 0,
     guest_buffer_device_bytes: u64 = 0,
     guest_buffer_address_index: @import("sampled_image_index.zig").Index(maximum_retained_buffer_entries) = .{},
+    guest_buffer_overlap_index: @import("buffer_overlap_index.zig").Index(maximum_retained_buffer_entries) = .{},
     guest_buffer_write_history: @import("buffer_write_history.zig").History(128) = .{},
     guest_buffer_recency: @import("buffer_recency.zig").Index(maximum_retained_buffer_entries) = .{},
     active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
@@ -6685,6 +6686,7 @@ pub const Renderer = struct {
                 if (bound.* == index) bound.* = null else if (bound.* == last_index) bound.* = index;
             }
             self.guest_buffer_address_index.invalidate();
+            self.guest_buffer_overlap_index.invalidate();
             self.guest_buffer_recency.removeSwap(index);
             _ = self.guest_buffers.swapRemove(index);
             self.frame_profile.buffer_cache_evictions +|= 1;
@@ -6906,6 +6908,7 @@ pub const Renderer = struct {
                 const backing = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, null), guest_address, host_identity);
                 self.accountStorageBacking(backing.device, backing.transfer, true);
                 self.guest_buffer_address_index.insert(self.guest_buffers.items.len, guest_address);
+                self.guest_buffer_overlap_index.insert(self.guest_buffers.items.len, guest_address, size);
                 self.guest_buffers.appendAssumeCapacity(.{
                     .descriptor_index = descriptor_index,
                     .guest_address = guest_address,
@@ -6945,6 +6948,7 @@ pub const Renderer = struct {
                 }
                 victim.descriptor_index = descriptor_index;
                 self.guest_buffer_address_index.replace(victim_index, victim.guest_address, guest_address);
+                self.guest_buffer_overlap_index.replace(victim_index, victim.guest_address, victim.size, guest_address, size);
                 victim.guest_address = guest_address;
                 victim.size = size;
                 victim.last_used_sequence = self.guest_buffer_sequence;
@@ -7445,7 +7449,9 @@ pub const Renderer = struct {
         const allocator = stack.get();
         var overlapping: std.ArrayList(usize) = .empty;
         defer overlapping.deinit(allocator);
-        for (self.guest_buffers.items, 0..) |entry, index| {
+        var candidates = self.guest_buffer_overlap_index.candidates(self.guest_buffers.items, address, bytes.len);
+        while (candidates.next()) |index| {
+            const entry = self.guest_buffers.items[index];
             self.frame_profile.command_buffer_write_checks += 1;
             if (!byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) continue;
             self.frame_profile.command_buffer_write_overlaps += 1;
