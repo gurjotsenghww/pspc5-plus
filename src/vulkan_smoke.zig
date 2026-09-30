@@ -2250,11 +2250,20 @@ fn runBufferAtomicResourcesProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runBufferRangePublicationProbe(allocator: std.mem.Allocator) !void {
-    for (0..3) |read_order| {
+    for (0..20) |scenario| {
+        const read_order = scenario % 5;
+        const device_backing = (scenario / 5) % 2 != 0;
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = true, .retain_clean_storage_buffers = true });
         defer renderer.deinit();
+        renderer.device_storage_budget_bytes = if (device_backing) 1024 * 1024 else 0;
+        renderer.device_storage_min_bytes = 4;
         var guest = GuestMemory{ .watch_generation = 1 };
-        const backend = renderer.dcbBackend(guest.interface());
+        var memory = guest.interface();
+        if (scenario >= 10) {
+            memory.track_gpu_read = GuestMemory.track;
+            memory.gpu_generation = GuestMemory.generation;
+        }
+        const backend = renderer.dcbBackend(memory);
         for (0..32) |i| guest.word(0x1000 + i * 4, 0x3f72_603a);
         for ([_][2]u12{ .{ 0, 124 }, .{ 32, 60 } }, 0..) |offsets, index| {
             const first = mubuf(0x1c, offsets[0], 0, 0, 0);
@@ -2270,10 +2279,28 @@ fn runBufferRangePublicationProbe(allocator: std.mem.Allocator) !void {
             const descriptor = if (index == 0) [_]u32{ 0x1000, 0, 128, 0, 0x11223344, 0x55667788 } else [_]u32{ 0x1020, 0, 64, 0, 487, 0x12345678 };
             for (descriptor, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
             _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            for (renderer.guest_buffers.items) |entry|
+                try std.testing.expectEqual(device_backing, entry.host_transfer != null);
         }
         var expected: [64]u8 = @splat(0);
         std.mem.writeInt(u32, expected[32..36], 487, .little);
         std.mem.writeInt(u32, expected[60..64], 0x12345678, .little);
+        if (read_order >= 3) {
+            if (read_order == 4) {
+                var header: [64]u8 = undefined;
+                try std.testing.expect(backend.vtable.read(backend.context, 0x1020, &header));
+                try std.testing.expectEqualSlices(u8, &expected, &header);
+            }
+            // Reusing the wide allocation for another partial write must first
+            // incorporate the newer nested header, including a published one.
+            var state = gpu.State{};
+            try state.writeRegister(.shader, 0x20c, 1);
+            try state.writeRegister(.shader, 0x20d, 0);
+            try state.writeRegister(.shader, 0x213, 6 << 1);
+            for ([_]u32{ 0x1000, 0, 128, 0, 0x11223344, 0x55667788 }, 0..) |word, i|
+                try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        }
         if (read_order == 1) {
             // The wide view is observed while the newer header is still dirty.
             var wide: [128]u8 = undefined;
@@ -2303,7 +2330,7 @@ fn runBufferRangePublicationProbe(allocator: std.mem.Allocator) !void {
         try renderer.readbackGuestStorageBuffer(0x1000, &merged);
         try std.testing.expectEqualSlices(u8, guest.bytes[0x1000..0x1080], &merged);
     }
-    std.debug.print("buffer range publication passed: both read orders, clean newer eviction, disjoint writes and merged rebind\n", .{});
+    std.debug.print("buffer range publication passed: both backings, tracked/untracked pages, both read orders, clean newer eviction, dirty/clean nested writer rebinds and disjoint writes\n", .{});
 }
 
 fn runBufferAtomicProbe(allocator: std.mem.Allocator) !void {

@@ -1369,6 +1369,8 @@ const GuestBufferEntry = struct {
     /// Publication order of actual GPU producers. Ordinary CPU uploads also
     /// change the content epoch, but cannot supersede a pending GPU writer.
     last_gpu_write_sequence: u64 = 0,
+    /// Last bind that incorporated newer resident aliases into this backing.
+    last_alias_sync_sequence: u64 = 0,
     /// Pending until the recorded consumer receives a submission timeline tick.
     last_gpu_use: u64 = 0,
     gpu_dirty: bool = false,
@@ -2726,6 +2728,9 @@ const FrameProfile = struct {
     staged_images: StagedResourceCensus = .{},
     stage_materialize_ns: u64 = 0,
     stage_views_ns: u64 = 0,
+    buffer_alias_ns: u64 = 0,
+    buffer_alias_scans: u64 = 0,
+    buffer_alias_merges: u64 = 0,
     compute_sampled_stage_ns: u64 = 0,
     compute_sampled_stages: u64 = 0,
     sampled_generation_scan_ns: u64 = 0,
@@ -4526,6 +4531,7 @@ pub const Renderer = struct {
     guest_buffer_backing_bytes: u64 = 0,
     guest_buffer_device_bytes: u64 = 0,
     guest_buffer_address_index: @import("sampled_image_index.zig").Index(maximum_retained_buffer_entries) = .{},
+    guest_buffer_write_history: @import("buffer_write_history.zig").History(128) = .{},
     guest_buffer_recency: @import("buffer_recency.zig").Index(maximum_retained_buffer_entries) = .{},
     active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
     active_storage_offsets: [maximum_storage_descriptors]vk.DeviceSize = @splat(0),
@@ -6670,6 +6676,7 @@ pub const Renderer = struct {
                         changed.last_gpu_use = 0;
                         changed.last_written_sequence = 0;
                         changed.last_gpu_write_sequence = 0;
+                        changed.last_alias_sync_sequence = 0;
                         changed.gpu_dirty = false;
                         changed.page_generation = 0;
                         changed.content_hash = null;
@@ -6774,6 +6781,7 @@ pub const Renderer = struct {
                 victim.last_used_sequence = self.guest_buffer_sequence;
                 victim.last_written_sequence = 0;
                 victim.last_gpu_write_sequence = 0;
+                victim.last_alias_sync_sequence = 0;
                 victim.gpu_dirty = false;
                 victim.page_generation = 0;
                 victim.content_hash = null;
@@ -6787,7 +6795,9 @@ pub const Renderer = struct {
             self.frame_profile.buffer_cache_hits +|= 1;
         }
 
+        if (cache_hit and !recycled_entry) try self.synchronizeGuestBufferAliases(entry_index.?);
         const entry = &self.guest_buffers.items[entry_index.?];
+        entry.last_alias_sync_sequence = self.guest_buffer_sequence;
         entry.last_used_sequence = self.guest_buffer_sequence;
         self.guest_buffer_recency.touch(entry_index.?);
         if (entry.device_local.host_mapping != null) {
@@ -7001,6 +7011,34 @@ pub const Renderer = struct {
             .size = entry.size,
             .allocation_cache_hit = cache_hit,
         };
+    }
+
+    /// A partial write to an old backing must not make its stale interior
+    /// newer than an intervening writer. Publish and merge those aliases
+    /// before the backing is rebound, while the old writer order still holds.
+    fn synchronizeGuestBufferAliases(self: *Renderer, index: usize) (Error || std.mem.Allocator.Error)!void {
+        const started = hostTimestampNs();
+        defer self.frame_profile.buffer_alias_ns +|= elapsedHostNanoseconds(started);
+        const entry = self.guest_buffers.items[index];
+        const since = @max(entry.last_alias_sync_sequence, entry.last_gpu_write_sequence);
+        if (!self.guest_buffer_write_history.mayOverlapSince(entry.guest_address, entry.size, since)) return;
+        self.frame_profile.buffer_alias_scans +|= 1;
+        var changed = false;
+        for (self.guest_buffers.items, 0..) |other, candidate| {
+            if (candidate == index or other.last_gpu_write_sequence <= since or
+                other.guest_address >= entry.guest_address + entry.size or
+                other.guest_address + other.size <= entry.guest_address) continue;
+            if (!changed) try self.flushGuestStorageBuffer(index);
+            try self.flushGuestStorageBuffer(candidate);
+            changed = true;
+        }
+        if (changed) {
+            self.frame_profile.buffer_alias_merges +|= 1;
+            const current = &self.guest_buffers.items[index];
+            current.page_generation = 0;
+            current.page_observation = .{};
+            current.content_hash = null;
+        }
     }
 
     pub fn readbackGuestStorageBuffer(self: *Renderer, guest_address: u64, destination: []u8) (Error || std.mem.Allocator.Error)!void {
@@ -11463,6 +11501,7 @@ pub const Renderer = struct {
     fn markGuestBufferWritten(self: *Renderer, entry: *GuestBufferEntry) void {
         self.advanceGuestBufferContents(entry);
         entry.last_gpu_write_sequence = entry.last_written_sequence;
+        self.guest_buffer_write_history.record(entry.guest_address, entry.size, entry.last_gpu_write_sequence);
         entry.gpu_dirty = true;
         entry.content_hash = null;
         if (entry.size >= deferred_storage_write_min_bytes) return;
@@ -28024,8 +28063,8 @@ pub const Renderer = struct {
                 },
             );
             std.debug.print(
-                "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d} materialize_ms={d} views_ms={d} page_ms={d} page_reused_kib={d} vertex_trim_kib={d} vertex_trim_fetches={d}\n",
-                .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms, profile.stage_materialize_ns / std.time.ns_per_ms, profile.stage_views_ns / std.time.ns_per_ms, profile.buffer_page_ns / std.time.ns_per_ms, profile.page_reused_bytes / 1024, profile.bounded_vertex_bytes / 1024, profile.bounded_vertex_fetches },
+                "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d} materialize_ms={d} views_ms={d} page_ms={d} page_reused_kib={d} vertex_trim_kib={d} vertex_trim_fetches={d} alias_ms={d} alias_scans={d} alias_merges={d}\n",
+                .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms, profile.stage_materialize_ns / std.time.ns_per_ms, profile.stage_views_ns / std.time.ns_per_ms, profile.buffer_page_ns / std.time.ns_per_ms, profile.page_reused_bytes / 1024, profile.bounded_vertex_bytes / 1024, profile.bounded_vertex_fetches, profile.buffer_alias_ns / std.time.ns_per_ms, profile.buffer_alias_scans, profile.buffer_alias_merges },
             );
             std.debug.print("[gpu buffer cache] flip={d} hit={d} miss={d} evict={d} limit={d} victim_steps={d}\n", .{
                 self.flip_callbacks,                                                                                 profile.buffer_cache_hits,         profile.buffer_cache_misses, profile.buffer_cache_evictions,
