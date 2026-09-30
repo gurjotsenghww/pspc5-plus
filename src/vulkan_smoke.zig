@@ -2249,17 +2249,17 @@ fn runBufferAtomicResourcesProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("floating buffer atomic resources passed: min/max, decoded/typed IR, automatic staging and published writes\n", .{});
 }
 
-fn runBufferRangePublicationProbe(allocator: std.mem.Allocator) !void {
-    for (0..20) |scenario| {
-        const read_order = scenario % 5;
-        const device_backing = (scenario / 5) % 2 != 0;
+fn runBufferRangePublicationProbe(allocator: std.mem.Allocator, incoming_eviction: bool) !void {
+    for (0..@as(usize, if (incoming_eviction) 4 else 20)) |scenario| {
+        const read_order = if (incoming_eviction) 5 else scenario % 5;
+        const device_backing = if (incoming_eviction) scenario % 2 != 0 else (scenario / 5) % 2 != 0;
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = true, .retain_clean_storage_buffers = true });
         defer renderer.deinit();
         renderer.device_storage_budget_bytes = if (device_backing) 1024 * 1024 else 0;
         renderer.device_storage_min_bytes = 4;
         var guest = GuestMemory{ .watch_generation = 1 };
         var memory = guest.interface();
-        if (scenario >= 10) {
+        if (scenario >= @as(usize, if (incoming_eviction) 2 else 10)) {
             memory.track_gpu_read = GuestMemory.track;
             memory.gpu_generation = GuestMemory.generation;
         }
@@ -2271,7 +2271,13 @@ fn runBufferRangePublicationProbe(allocator: std.mem.Allocator) !void {
             const code = [_]u32{ vop1(1, 0, 4), first[0] & ~@as(u32, 1 << 13), first[1], vop1(1, 0, 5), last[0] & ~@as(u32, 1 << 13), last[1], 0xbf81_0000 };
             const program: u32 = 0x100 + @as(u32, @intCast(index)) * 0x100;
             for (code, 0..) |word, i| guest.word(program + i * 4, word);
-            if (index == 1) @memset(guest.bytes[0x1020..0x1060], 0);
+            if (index == 1) {
+                @memset(guest.bytes[0x1020..0x1060], 0);
+                guest.changed();
+                // Allocating the incoming header must not let eviction of the
+                // old wide backing replace its already initialized CPU bytes.
+                if (incoming_eviction) renderer.storage_buffer_cache_budget_bytes = 0;
+            }
             var state = gpu.State{};
             try state.writeRegister(.shader, 0x20c, program >> 8);
             try state.writeRegister(.shader, 0x20d, 0);
@@ -2285,7 +2291,7 @@ fn runBufferRangePublicationProbe(allocator: std.mem.Allocator) !void {
         var expected: [64]u8 = @splat(0);
         std.mem.writeInt(u32, expected[32..36], 487, .little);
         std.mem.writeInt(u32, expected[60..64], 0x12345678, .little);
-        if (read_order >= 3) {
+        if (read_order == 3 or read_order == 4) {
             if (read_order == 4) {
                 var header: [64]u8 = undefined;
                 try std.testing.expect(backend.vtable.read(backend.context, 0x1020, &header));
@@ -2330,7 +2336,11 @@ fn runBufferRangePublicationProbe(allocator: std.mem.Allocator) !void {
         try renderer.readbackGuestStorageBuffer(0x1000, &merged);
         try std.testing.expectEqualSlices(u8, guest.bytes[0x1000..0x1080], &merged);
     }
-    std.debug.print("buffer range publication passed: both backings, tracked/untracked pages, both read orders, clean newer eviction, dirty/clean nested writer rebinds and disjoint writes\n", .{});
+    if (incoming_eviction) {
+        std.debug.print("incoming buffer initialization survives eviction: both backings and tracking modes\n", .{});
+    } else {
+        std.debug.print("buffer range publication passed: both backings, tracked/untracked pages, both read orders, clean newer eviction, dirty/clean nested writer rebinds and disjoint writes\n", .{});
+    }
 }
 
 fn runBufferAtomicProbe(allocator: std.mem.Allocator) !void {
@@ -11783,7 +11793,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-range-publication")) {
-        try runBufferRangePublicationProbe(allocator);
+        try runBufferRangePublicationProbe(allocator, false);
+        return;
+    }
+    // Opt-in reproducer for the remaining CPU-initialization/eviction gap.
+    // Until CPU write ownership is tracked, this is expected to report failure.
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-incoming-eviction")) {
+        try runBufferRangePublicationProbe(allocator, true);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-logical-scc")) {

@@ -1,5 +1,9 @@
 # Ghost of Yōtei: bounded compute warmup catalog replacement
 
+Follow-up: [overlapping buffer rebinds](yotei-buffer-rebind-2026-09-30.md)
+records the recovered billion-record loop bound and a separate native Vulkan
+reproduction of stale metadata after another partial write.
+
 September 30, 2026. Follow-up to the
 [scalar-buffer table investigation](yotei-scalar-tables-2026-09-30.md).
 This change addresses retention of compiled compute modules across launches.

@@ -49,7 +49,10 @@ old `0x3f72603a` data.
 The corrected renderer passes three cases: publish the header first, read the
 wide range first, and evict the clean newer header while the old range remains
 bound. Each case checks all header bytes, preserved disjoint GPU writes, and
-readback after rebinding the merged wide range with page tracking enabled.
+readback after rebinding the merged wide range. A September 30 review found
+that this initial fixture set a generation counter without attaching its
+tracking callbacks. The [rebind follow-up](yotei-buffer-rebind-2026-09-30.md)
+adds explicit tracked and untracked variants, plus both storage backings.
 
 Native Vulkan checks also pass for differently sized buffer views, CPU reuse
 of storage images, clean buffer retention, cache byte budgets, buffer/target
