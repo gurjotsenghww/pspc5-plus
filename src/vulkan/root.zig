@@ -39,4 +39,5 @@ test {
     _ = pipeline_compiler;
     _ = @import("pipeline_warmup.zig");
     _ = @import("buffer_write_history.zig");
+    _ = @import("buffer_write_ranges.zig");
 }

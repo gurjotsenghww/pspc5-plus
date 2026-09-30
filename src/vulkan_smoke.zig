@@ -2343,6 +2343,73 @@ fn runBufferRangePublicationProbe(allocator: std.mem.Allocator, incoming_evictio
     }
 }
 
+fn runBufferWriteFootprintProbe(allocator: std.mem.Allocator) !void {
+    for (0..20) |scenario| {
+        const kind = scenario % 5;
+        const conservative = kind == 1 or kind == 2 or kind == 4;
+        const local = (scenario / 5) % 2 != 0;
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = true, .retain_clean_storage_buffers = true });
+        defer renderer.deinit();
+        renderer.device_storage_budget_bytes = if (local) 1024 * 1024 else 0;
+        renderer.device_storage_min_bytes = 4;
+        var guest = GuestMemory{ .watch_generation = 1 };
+        var memory = guest.interface();
+        if (scenario >= 10) {
+            memory.track_gpu_read = GuestMemory.track;
+            memory.gpu_generation = GuestMemory.generation;
+        }
+        _ = renderer.dcbBackend(memory);
+        for (0..32) |i| guest.word(0x1000 + i * 4, 0xdeadbeef);
+        const first = mubuf(0x1c, 64, 1, 0, 0);
+        // A missing second V# invalidates the dispatch-wide write proof even
+        // though its first store has a fully resolved literal address.
+        var second = mubuf(0x1c, if (kind == 1 or kind == 2) 0 else 124, 1, 0, if (kind == 4) 8 else 0);
+        if (kind != 1) second[0] &= ~@as(u32, 1 << 13);
+        if (kind == 2) second[1] = (second[1] & 0x00ffffff) | (6 << 24); // SOFFSET=s6
+        const code = [_]u32{
+            vop1(1, 0, 136), // v0=8; indexed store addresses byte 32
+            vop1(1, 1, 4),
+            first[0] & ~@as(u32, 1 << 13),
+            first[1],
+            if (kind == 3) 0xbf81_0000 else 0xbf80_0000,
+            vop1(1, 1, 5),
+            second[0],
+            second[1],
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        const later = [_]u32{ vop1(1, 1, 5), second[0], second[1], 0xbf81_0000 };
+        for (later, 0..) |word, i| guest.word(0x200 + i * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 7 << 1);
+        for ([_]u32{ 0x1000, 4 << 16, 32, 0, 487, 0x12345678, 32 }, 0..) |word, i|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        if (kind == 3) {
+            try state.writeRegister(.shader, 0x20c, 2);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        }
+        try std.testing.expectEqual(conservative, renderer.guest_buffers.items[0].pending_writes.whole);
+        const before = renderer.frame_profile.storage_readback_bytes;
+        renderer.storage_buffer_cache_budget_bytes = 0;
+        // The incoming narrow view must receive real GPU output from the
+        // evicted wider producer, even though guest RAM still holds sentinels.
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x1020, 64);
+        const transferred = renderer.frame_profile.storage_readback_bytes - before;
+        try std.testing.expectEqual(@as(u64, if (conservative) 128 else 8), transferred);
+        var header: [64]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x1020, &header);
+        for (0..16) |i| {
+            const expected: u32 = if (i == 8) 487 else if (i == 0 and (kind == 1 or kind == 2)) 0x12345678 else 0xdeadbeef;
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, header[i * 4 ..][0..4], .little));
+        }
+        if (kind == 0 or kind == 3) try std.testing.expectEqual(@as(u32, 0x12345678), std.mem.readInt(u32, guest.bytes[0x107c..][0..4], .little));
+    }
+    std.debug.print("buffer write footprints passed: literal and accumulated stores, indexed/SGPR/missing-resource fallbacks, incoming GPU results and exact readback sizes across both backings/tracking modes\n", .{});
+}
+
 fn runBufferAtomicProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -11796,10 +11863,14 @@ pub fn main(init: std.process.Init) !void {
         try runBufferRangePublicationProbe(allocator, false);
         return;
     }
-    // Opt-in reproducer for the remaining CPU-initialization/eviction gap.
-    // Until CPU write ownership is tracked, this is expected to report failure.
+    // Regression for incoming CPU initialization between statically addressed
+    // writes in an old wider backing, evicted before the new view is staged.
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-incoming-eviction")) {
         try runBufferRangePublicationProbe(allocator, true);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-write-footprints")) {
+        try runBufferWriteFootprintProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-logical-scc")) {
