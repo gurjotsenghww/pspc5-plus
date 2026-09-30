@@ -1,5 +1,9 @@
 # Sparse publication of proven buffer writes
 
+Follow-up: [buffer layout identity and indexed write commits](yotei-buffer-layout-2026-09-30.md)
+adds a separate native shader-addressing correction and records a later
+attribution run. The observations below describe the earlier sparse-write build.
+
 ## Reproduced defect and shared correction
 
 The incoming-buffer eviction regression from the [rebind investigation](yotei-buffer-rebind-2026-09-30.md)
