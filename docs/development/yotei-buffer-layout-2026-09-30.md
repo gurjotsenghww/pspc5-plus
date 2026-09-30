@@ -1,5 +1,9 @@
 # Buffer layout identity and compute write lookup
 
+Follow-up: [ordered command writes and indexed overlap checks](yotei-command-buffer-writes-2026-09-30.md)
+reproduces and fixes loss of interior command-processor writes during deferred
+publication. The observations below describe the preceding layout revision.
+
 ## Reproduced shader addressing defect
 
 Resource preparation previously reused a storage-buffer association when its
