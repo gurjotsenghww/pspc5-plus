@@ -8159,6 +8159,81 @@ fn runPipelineCacheProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("pipeline cache persistence passed: background snapshot, concurrent compilation, later generation saved and unchanged cache preserved\n", .{});
 }
 
+fn runSrgbColorProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const vertex = [_]u32{
+        vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+        vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+        vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+        0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+        0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+    };
+    const fragment = [_]u32{
+        vop1(1, 0, 255), 0x3e800000,  vop1(1, 1, 255), 0x3f000000,
+        vop1(1, 2, 255), 0x3f400000,  vop1(1, 3, 255), 0x3f000000,
+        0xf800_080f,     0x0302_0100, 0xbf81_0000,
+    };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x048, 7);
+    try state.writeRegister(.shader, 0x049, 0);
+    try state.writeRegister(.shader, 0x008, 9);
+    try state.writeRegister(.shader, 0x009, 0);
+    for ([_][2]u32{
+        .{ 0x319, 3 }, .{ 0x390, 0 },                       .{ 0x3b0, (31 << 14) | 31 }, .{ 0x3b8, 1 << 24 },         .{ 0x08e, 15 },
+        .{ 0x00c, 0 }, .{ 0x00d, 32 | (32 << 16) },         .{ 0x094, 1 << 31 },         .{ 0x095, 32 | (32 << 16) }, .{ 0x1e0, 0 },
+        .{ 0x200, 0 }, .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },               .{ 0x205, 0 },
+    }) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 16, 16, 16, 16, 1, 0 }, 0..) |value, i|
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    const sample = [_]u32{
+        vop1(1, 0, 255), 0x3ec00000,  vop1(1, 1, 255), 0x3ec00000,
+        0xf09c_0f0a,     0x0040_0200, 1,               0xe078_0000,
+        0x8003_0200,     0xbf81_0000,
+    };
+    for (sample, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var compute_state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try compute_state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try compute_state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try compute_state.writeRegister(.shader, 0x213, 16 << 1);
+    for ([_]bool{ false, true }) |srgb| {
+        const address: u32 = if (srgb) 0x8000 else 0x4000;
+        try state.writeRegister(.context, 0x318, address >> 8);
+        try state.writeRegister(.context, 0x31c, (10 << 2) | (if (srgb) @as(u32, 6 << 8) else 0));
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        var image = sampledImageDescriptorWords(address, 32, 32);
+        image[1] = (image[1] & ~(@as(u32, 0xff) << 20)) | (@as(u32, if (srgb) 130 else 56) << 20);
+        const userdata = image ++ [_]u32{ 0x92, 0, 0, 0, 0x1c000, 16 << 16, 1, 0 };
+        for (userdata, 0..) |word, i|
+            try compute_state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        const uploads = renderer.sampled_image_uploads;
+        const readbacks = renderer.frame_profile.target_readbacks;
+        _ = try renderer.dispatchRdna2State(&compute_state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var output: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x1c000, &output);
+        for ([_]f32{ 0.25, 0.5, 0.75, 0.5 }, 0..) |expected, channel| {
+            const actual: f32 = @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(expected, actual, 0.005);
+        }
+        try std.testing.expectEqual(uploads, renderer.sampled_image_uploads);
+        try std.testing.expectEqual(readbacks, renderer.frame_profile.target_readbacks);
+        try renderer.flushPendingGuestWrites();
+        const pixel = (12 * 32 + 12) * 4;
+        const expected: [4]u8 = if (srgb) .{ 137, 188, 225, 128 } else .{ 64, 128, 191, 128 };
+        for (expected, guest.bytes[address + pixel ..][0..4]) |want, actual|
+            try std.testing.expect(@abs(@as(i16, actual) - want) <= 1);
+        try renderer.probeColorTargetTransfer(address, expected);
+    }
+    std.debug.print("sRGB colour attachments passed: encoded RGB, linear alpha, resident sampled round trip, raw scanout transfer and UNORM control\n", .{});
+}
+
 fn runMippedColorProbe(allocator: std.mem.Allocator) !void {
     for ([_]bool{ false, true }) |tracked| for ([_]bool{ false, true }) |tiled|
         try runMippedColorCase(allocator, tracked, tiled);
@@ -12496,6 +12571,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--mipped-color")) {
         try runMippedColorProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--srgb-color")) {
+        try runSrgbColorProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-tables")) {

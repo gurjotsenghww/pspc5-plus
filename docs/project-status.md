@@ -17,7 +17,7 @@ supplied locally and is not included in this repository.
 
 | Title | Status | Notes |
 |---|---|---|
-| **Subnautica: Below Zero**<br><img src="images/subnautica-below-zero-new-game-world.png" width="240" alt="Subnautica Below Zero snowy opening area with the survival HUD"> | **Playable · Completable** | October 1, 2026 development build, PPSA02457 v1.022.125. New Game / Survival reaches the intro and the snowy opening area; camera movement and walking were verified. Deferred GPU writeback preserves repurposed CPU memory, released storage buffers no longer trigger repeated failed readbacks, and depth-only draws respect explicit zero colour masks. D16 shadow bias, RG32F colour attachments and 2D mip views are supported. An earlier stationary world sample recorded 313 flips in 30.01 seconds (10.43 FPS); long transition pauses, dark lighting and rendering artifacts remain. The 30 FPS target is unmet. This validation did not include a full playthrough, save recovery or audio correctness. [World capture](images/subnautica-below-zero-new-game-world.png) · [New-game investigation and validation](development/subnautica-new-game-2026-10-01.md) · [Earlier menu performance](development/subnautica-scalar-scratch-2026-09-28.md) · [Subsequent mip-sampling checks and loading failures](development/subnautica-lighting-2026-10-01.md). The latest mip-coherence check removes 2730 KiB of repeated colour-target transfers in each direction per frame and records 8.66 FPS over 30.01 seconds in the snowy scene; no overall FPS gain is established. [Latest capture](images/subnautica-below-zero-mip-coherence.png). Later repeat runs exposed intermittent loading corruption; the earlier successful run does not establish stable loading. |
+| **Subnautica: Below Zero**<br><img src="images/subnautica-below-zero-srgb.png" width="240" alt="Subnautica Below Zero snowy opening area after the sRGB lighting fix"> | **Playable · Completable** | October 1, 2026 development build, PPSA02457 v1.022.125. New Game / Survival reaches the intro and snowy opening area; earlier checks verified walking and camera input. The latest renderer fixes missing sRGB attachment encoding: snow, rocks and materials are visibly brighter in the new world capture. Cached mip backing ranges remove repeated layout walks, while the previous coherence fix retains zero colour-target uploads/readbacks in sampled frames. A foreground sample records 285 flips in 30.05 seconds (**9.49 FPS**), versus 9.13 FPS in the preceding baseline; changing weather and effects prevent a controlled speedup claim. Graphics resource preparation, buffer/index copying and submissions remain expensive. The 30 FPS target is unmet. Sampled world frames have zero draw/dispatch failures and unsupported compute programs, but one unresolved scalar binding remains. This successful run does not resolve earlier intermittent loading corruption or establish complete rendering accuracy. Full playthrough, save recovery and audio correctness were not tested. [Latest capture](images/subnautica-below-zero-srgb.png) · [sRGB fix, profiling and validation](development/subnautica-backing-spans-2026-10-01.md) · [Mip-coherence checks and loading failures](development/subnautica-lighting-2026-10-01.md) · [New-game investigation](development/subnautica-new-game-2026-10-01.md) · [Earlier menu performance](development/subnautica-scalar-scratch-2026-09-28.md) |
 | **Terminator 2D: No Fate**<br><img src="images/live-gameplay.png" width="240" alt="Terminator 2D gameplay with the player character, HUD and desert scene"> | **Playable · Completable** | Completed without reported problems. Correct backgrounds, characters, HUD, textures and colors; warmed-up startup frames measure 22–65 ms on the current test host. [Gameplay capture](images/live-gameplay.png) |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
@@ -36,14 +36,15 @@ supplied locally and is not included in this repository.
 
 ## Screenshots
 
-![Subnautica Below Zero snowy opening area with the survival HUD](images/subnautica-below-zero-new-game-world.png)
+![Subnautica Below Zero snowy opening area after the sRGB lighting fix](images/subnautica-below-zero-srgb.png)
 
 *Subnautica: Below Zero, PPSA02457 v1.022.125, October 1, 2026. An unedited
 1765×993 client-window capture with 1080p guest output after starting a new
-Survival game. The intro completes, the opening area and HUD render, and camera
-movement and walking respond to input. Dark lighting and other rendering
-artifacts remain. The linked investigation records the fixes, validation and
-remaining performance limits; this run did not test a full playthrough.*
+Survival game. Correct sRGB attachment encoding restores visible material
+detail and brighter lighting. The following 30.05-second world sample records
+9.49 FPS. Rendering defects, an unresolved scalar binding and intermittent
+loading failures remain under investigation; this run did not test a full
+playthrough. [Run report](development/subnautica-backing-spans-2026-10-01.md).*
 
 ![Big Helmet Heroes opening movie playing in PS5PCEM](images/big-helmet-heroes-intro.png)
 

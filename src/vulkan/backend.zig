@@ -2063,9 +2063,11 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
             null,
         // DATA_FORMAT_8_8_8_8. NUMBER_TYPE 1 is SNORM: Quake II's deferred
         // G-buffer stores packed normals that way and later samples them as
-        // unified format 57. Other number types keep the UNORM path.
+        // unified format 57. SRGB attachments must encode linear shader
+        // exports before a later sRGB sampled view decodes their contents.
         10 => switch (descriptor.number_type) {
             1 => .{ .vulkan = vk.format_r8g8b8a8_snorm, .bytes_per_texel = 4 },
+            6 => .{ .vulkan = vk.format_r8g8b8a8_srgb, .bytes_per_texel = 4 },
             else => .{ .vulkan = vk.format_r8g8b8a8_unorm, .bytes_per_texel = 4 },
         },
         // DATA_FORMAT_32_32. Unity's two-channel float reduction chain uses
@@ -2984,6 +2986,10 @@ const CachedFrame = struct {
 const ColorBackingSnapshot = struct {
     hash: ?u64 = null,
     generation: u64 = 0,
+    // The layout belongs to this snapshot's target. Packed-tail span discovery
+    // can walk thousands of texels; repeat it only when capturing a new target,
+    // not at every resident-image lookup or sibling publication.
+    range: ColorBackingRange = .{ .offset = 0, .size = 0 },
 
     fn capture(memory: GuestMemory, target: GuestColorTarget) ColorBackingSnapshot {
         const range = colorTargetBackingRange(target);
@@ -2992,12 +2998,12 @@ const ColorBackingSnapshot = struct {
         // Arm before hashing so a concurrent native write invalidates the proof.
         const generation = if (memory.track_gpu_read) |track| track(memory.context, address, size) else 0;
         const hash = if (memory.fingerprint) |fingerprint| fingerprint(memory.context, address, size) else null;
-        return .{ .hash = hash, .generation = generation };
+        return .{ .hash = hash, .generation = generation, .range = range };
     }
 
     fn changed(self: ColorBackingSnapshot, memory: GuestMemory, target: GuestColorTarget) bool {
         const previous_hash = self.hash orelse return false;
-        const range = colorTargetBackingRange(target);
+        const range = self.range;
         const address = target.descriptor.address + range.offset;
         const size = range.size;
         if (self.generation != 0) if (memory.gpu_generation) |generation| {
@@ -3054,7 +3060,7 @@ const ColorPublicationBaseline = struct {
         const b = target.layout.subresource orelse return null;
         if (a.kind != b.kind or a.source_layer_bytes != b.source_layer_bytes or a.first_slice != b.first_slice or
             a.depth_or_layers != b.depth_or_layers or a.block.family != b.block.family) return null;
-        const range = colorTargetBackingRange(sibling);
+        const range = snapshot.range;
         if (range.offset > before.len or range.size > before.len - range.offset) return null;
         const hash = snapshot.hash orelse return null;
         if (gpu.parallel_copy.fingerprint(before[range.offset..][0..range.size]) != hash) return null;
@@ -6528,7 +6534,7 @@ pub const Renderer = struct {
         if (!target.initialized or target.target.descriptor.fragments_log2 != 0) {
             return Error.MissingPresentedFrame;
         }
-        const swap_red_blue = target.target.format.vulkan == vk.format_r8g8b8a8_unorm and
+        const swap_red_blue = (target.target.format.vulkan == vk.format_r8g8b8a8_unorm or target.target.format.vulkan == vk.format_r8g8b8a8_srgb) and
             self.scanoutSwapsRedBlue(
                 target.target.descriptor.address,
                 target.color_export_generation != 0,
@@ -13553,6 +13559,7 @@ pub const Renderer = struct {
             a.descriptor.base_array_slice == b.descriptor.base_array_slice and
             a.descriptor.last_array_slice == b.descriptor.last_array_slice and
             a.descriptor.mip_level == b.descriptor.mip_level and
+            a.descriptor.maximum_mip == b.descriptor.maximum_mip and
             a.format.vulkan == b.format.vulkan and
             a.format.bytes_per_texel == b.format.bytes_per_texel and
             a.layout.required_source_bytes == b.layout.required_source_bytes and
@@ -14108,6 +14115,11 @@ pub const Renderer = struct {
         const frame_bytes = try colorTargetFrameBytes(target);
         const samples = rasterSampleCount(target.descriptor.fragments_log2) orelse
             return Error.UnsupportedColorTarget;
+        // Keep encoded bytes in a mutable UNORM allocation. The sRGB view
+        // performs attachment encoding, while storage views and VideoOut
+        // transfer blits retain the raw bytes (sRGB images cannot be storage
+        // images, and an sRGB-to-UNORM blit would decode the display again).
+        const srgb = target.format.vulkan == vk.format_r8g8b8a8_srgb;
         const image = try self.createImageWithExtent(
             target.descriptor.width,
             target.descriptor.height,
@@ -14115,7 +14127,7 @@ pub const Renderer = struct {
             target.layout.layers,
             vk.image_type_2d,
             vk.image_create_mutable_format_bit,
-            target.format.vulkan,
+            if (srgb) vk.format_r8g8b8a8_unorm else target.format.vulkan,
             vk.image_usage_color_attachment_bit |
                 vk.image_usage_transfer_src_bit |
                 vk.image_usage_transfer_dst_bit |
@@ -14128,7 +14140,9 @@ pub const Renderer = struct {
         try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, 1, target.layout.layers);
         errdefer self.image_states.forgetImage(image.handle);
 
+        const view_usage = vk.ImageViewUsageCreateInfo{ .usage = vk.image_usage_color_attachment_bit | vk.image_usage_sampled_bit };
         const view_info = vk.ImageViewCreateInfo{
+            .p_next = if (srgb) &view_usage else null,
             .image = image.handle,
             .view_type = if (target.layout.layers > 1) vk.image_view_type_2d_array else vk.image_view_type_2d,
             .format = target.format.vulkan,
@@ -15286,7 +15300,7 @@ pub const Renderer = struct {
                 vk.format_r16g16b16a16_sfloat => {
                     for (0..4) |channel| clear.float32[channel] = @as(f16, @bitCast(std.mem.readInt(u16, texel.bytes[channel * 2 ..][0..2], .little)));
                 },
-                vk.format_r8g8b8a8_unorm, vk.format_b8g8r8a8_unorm => {
+                vk.format_r8g8b8a8_unorm, vk.format_r8g8b8a8_srgb, vk.format_b8g8r8a8_unorm => {
                     for (0..4) |channel| clear.float32[channel] = @as(f32, @floatFromInt(texel.bytes[channel])) / 255.0;
                 },
                 vk.format_b10g11r11_ufloat_pack32 => {
@@ -17806,6 +17820,49 @@ pub const Renderer = struct {
         const cached = self.depth_targets.items[index];
         try std.testing.expectEqual(@as(u64, 2), cached.gpu_generation);
         return self.readDepthProbeValues(index, false);
+    }
+
+    /// A VideoOut transfer must preserve the attachment's encoded bytes.
+    /// Reading through an sRGB sampled view is tested separately by the caller.
+    pub fn probeColorTargetTransfer(self: *Renderer, address: u64, expected: [4]u8) anyerror!void {
+        const source = for (self.render_targets.items) |cached| {
+            if (cached.initialized and cached.target.descriptor.address == address) break cached;
+        } else return error.TestFailed;
+        const width = source.target.descriptor.width;
+        const height = source.target.descriptor.height;
+        const bytes = @as(usize, width) * height * 4;
+        const destination = try self.createImageWithExtent(width, height, 1, 1, vk.image_type_2d, 0, vk.format_r8g8b8a8_unorm, vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit, vk.sample_count_1_bit, 1);
+        defer self.destroyImage(destination);
+        try self.registerTrackedImage(destination.handle, vk.image_aspect_color_bit, 1, 1);
+        defer self.image_states.forgetImage(destination.handle);
+        const readback = try self.createBuffer(bytes, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        const previous = self.image_states.current(source.image.handle, vk.image_aspect_color_bit, 0, 0).?;
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+        const commands = try self.beginOneShot();
+        defer self.releaseOneShot(commands);
+        try self.transitionTrackedImage(commands, source.image.handle, range, image_state.transfer_source_usage);
+        try self.transitionTrackedImage(commands, destination.handle, range, image_state.transfer_destination_usage);
+        const blit = vk.ImageBlit{
+            .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .source_offsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = @intCast(width), .y = @intCast(height), .z = 1 } },
+            .destination_offsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = @intCast(width), .y = @intCast(height), .z = 1 } },
+        };
+        self.device_functions.cmd_blit_image(commands, source.image.handle, vk.image_layout_transfer_src_optimal, destination.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&blit), vk.filter_nearest);
+        try self.transitionTrackedImage(commands, source.image.handle, range, previous);
+        try self.transitionTrackedImage(commands, destination.handle, range, image_state.transfer_source_usage);
+        const copy = vk.BufferImageCopy{ .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit }, .image_extent = .{ .width = width, .height = height, .depth = 1 } };
+        self.device_functions.cmd_copy_image_to_buffer(commands, destination.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+        const barrier = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = readback.handle, .offset = 0, .size = bytes };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        try self.submitOneShot(commands);
+        const output = try self.allocator.alloc(u8, bytes);
+        defer self.allocator.free(output);
+        try self.readMapped(readback, output);
+        const pixel = (@as(usize, height * 3 / 8) * width + width * 3 / 8) * 4;
+        for (expected, output[pixel..][0..4]) |want, actual|
+            try std.testing.expect(@abs(@as(i16, actual) - want) <= 1);
     }
 
     /// Exercises resident-image presentation in the window smoke test, without
@@ -21255,7 +21312,7 @@ pub const Renderer = struct {
         target: GuestColorTarget,
         video: PlanarVideoPass,
     ) anyerror!void {
-        if (target.format.vulkan != vk.format_r8g8b8a8_unorm or target.format.bytes_per_texel != 4) {
+        if ((target.format.vulkan != vk.format_r8g8b8a8_unorm and target.format.vulkan != vk.format_r8g8b8a8_srgb) or target.format.bytes_per_texel != 4) {
             return Error.UnsupportedSampledImage;
         }
         const luma = video.luma;
@@ -28420,7 +28477,7 @@ pub const Renderer = struct {
             // Keep this in step with presentationPixels: a frame it can
             // convert is presentable, and excluding one here hides a
             // fully rendered composite behind a black exact-address hit.
-            if (format != vk.format_r8g8b8a8_unorm and
+            if (format != vk.format_r8g8b8a8_unorm and format != vk.format_r8g8b8a8_srgb and
                 format != vk.format_b10g11r11_ufloat_pack32 and
                 format != vk.format_a2b10g10r10_unorm_pack32) continue;
             const area = @as(u64, frame.width) * frame.height;
@@ -28433,7 +28490,7 @@ pub const Renderer = struct {
             }
             if (frame.width != buffer.width or frame.height != buffer.height) continue;
             if (frame.target != null and
-                frame.target.?.format.vulkan == vk.format_r8g8b8a8_unorm and
+                (frame.target.?.format.vulkan == vk.format_r8g8b8a8_unorm or frame.target.?.format.vulkan == vk.format_r8g8b8a8_srgb) and
                 (matching_rgba == null or frame.sequence > matching_rgba_sequence))
             {
                 matching_rgba = index;
@@ -28449,7 +28506,7 @@ pub const Renderer = struct {
 
     fn presentationPixels(self: *Renderer, frame: *const CachedFrame, flip: gpu.state.Flip) ?[]const u8 {
         const target = frame.target orelse return frame.pixels.items;
-        if (target.format.vulkan == vk.format_r8g8b8a8_unorm) {
+        if (target.format.vulkan == vk.format_r8g8b8a8_unorm or target.format.vulkan == vk.format_r8g8b8a8_srgb) {
             if (!self.scanoutSwapsRedBlue(frame.guest_address, null, flip)) {
                 self.reportPresentedChannelMeans(frame.pixels.items);
                 return frame.pixels.items;
@@ -32695,7 +32752,9 @@ fn packedBufferClearColor(image_format: u32, words: [4]u32) ?vk.ClearColorValue 
         }
         return .{ .float32 = values };
     }
-    if (image_format != vk.format_r8_unorm and image_format != vk.format_r8g8b8a8_unorm and image_format != vk.format_r8g8b8a8_snorm) return null;
+    // sRGB render targets have a UNORM backing image: these raw buffer
+    // patterns are already encoded and must not pass through sRGB again.
+    if (image_format != vk.format_r8_unorm and image_format != vk.format_r8g8b8a8_unorm and image_format != vk.format_r8g8b8a8_srgb and image_format != vk.format_r8g8b8a8_snorm) return null;
     for (words[1..]) |word| if (word != words[0]) return null;
     var bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &bytes, words[0], .little);
@@ -33414,7 +33473,7 @@ fn peakColorValue(linear: []const u8, format: ColorTargetFormat) u32 {
             highest = @max(highest, (word >> 20) & 0x3ff);
             continue;
         }
-        if (stride == 4 and format.vulkan == vk.format_r8g8b8a8_unorm) {
+        if (stride == 4 and (format.vulkan == vk.format_r8g8b8a8_unorm or format.vulkan == vk.format_r8g8b8a8_srgb)) {
             for (texel[0..3]) |byte| highest = @max(highest, @as(u32, byte));
             continue;
         }
@@ -33553,7 +33612,7 @@ fn forceDestinationAlphaOne(rgba: []u8) void {
 
 fn forceColorTargetAlphaOne(linear: []u8, format: ColorTargetFormat) void {
     switch (format.vulkan) {
-        vk.format_r8g8b8a8_unorm => forceDestinationAlphaOne(linear),
+        vk.format_r8g8b8a8_unorm, vk.format_r8g8b8a8_srgb => forceDestinationAlphaOne(linear),
         vk.format_r16g16b16a16_sfloat => {
             var index: usize = 0;
             while (index + 7 < linear.len) : (index += 8) {
@@ -37776,6 +37835,15 @@ test "resident colour views keep mip and array identity" {
         sampled.base_array = 0;
         sampled.image_type = .color_2d;
     }
+    // Different pyramids can share the same padded byte size. Their target
+    // identities must remain distinct when retaining a backing span.
+    descriptor.tile_mode = .render_target;
+    descriptor.mip_level = 1;
+    const complete = try guestColorTarget(descriptor);
+    descriptor.maximum_mip = 4;
+    const shorter = try guestColorTarget(descriptor);
+    try std.testing.expectEqual(complete.layout.required_source_bytes, shorter.layout.required_source_bytes);
+    try std.testing.expect(!Renderer.sameRenderTarget(complete, shorter));
 }
 
 test "colour mip backing spans preserve neighbouring levels and CPU replacements" {
@@ -37817,6 +37885,7 @@ test "colour mip backing spans preserve neighbouring levels and CPU replacements
         for (targets, &snapshots) |target, *snapshot| snapshot.* = ColorBackingSnapshot.capture(memory, target);
         for (targets, 0..) |target, level| {
             const range = colorTargetBackingRange(target);
+            try std.testing.expectEqualDeep(range, snapshots[level].range);
             const pixel: usize = @intCast(try target.layout.sourceByteOffset(0, 0, 0));
             try std.testing.expect(pixel >= range.offset and pixel < range.offset + range.size);
             bytes[pixel] = 0xa5;
