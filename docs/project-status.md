@@ -9,15 +9,15 @@ title. What the emulator can do subsystem by subsystem is listed separately in
 ## Compatibility and progress
 
 
-Playability and completion reports below were confirmed by the project
-maintainer on September 8, 2026. **Playable · Completable** means the title
+Compatibility grades are maintained by the project maintainer; dated notes
+below distinguish playthrough reports from development checks. **Playable · Completable** means the title
 can be played through; other entries describe the furthest observed milestone.
 Performance measurements refer to the current test host. Title content is
 supplied locally and is not included in this repository.
 
 | Title | Status | Notes |
 |---|---|---|
-| **Subnautica: Below Zero**<br><img src="images/subnautica-below-zero-new-game-loading.png" width="240" alt="Subnautica Below Zero world-loading screen with a ship above the planet"> | **New Game reaches loading · gameplay blocked** | October 1, 2026 development build, PPSA02457 v1.022.125. The runner now mounts writable per-title temporary storage: choosing Survival proceeds beyond the mode panel and creates the temporary save workspace. Shared signal delivery preserves the interrupted guest stack and register roots during garbage collection. Deferred frame writeback also checks for loss of previously accessible backing. Earlier runs reached main-scene objects and a larger render workload but presented a black screen. The final retest still faults in a worker during world loading; the runtime correction does not fully resolve that failure. Playable gameplay is not established. Shader/resource failures, rendering artifacts and low FPS remain under investigation. Save persistence and audio correctness are unverified. Earlier September 28 menu measurements remain about 17 FPS; these startup fixes are not an FPS benchmark. The 30 FPS target remains unmet. [Loading capture](images/subnautica-below-zero-new-game-loading.png) · [New-game investigation and validation](development/subnautica-new-game-2026-10-01.md) · [Earlier menu performance](development/subnautica-scalar-scratch-2026-09-28.md) |
+| **Subnautica: Below Zero**<br><img src="images/subnautica-below-zero-new-game-world.png" width="240" alt="Subnautica Below Zero snowy opening area with the survival HUD"> | **Playable · Completable** | October 1, 2026 development build, PPSA02457 v1.022.125. New Game / Survival reaches the intro and the snowy opening area; camera movement and walking were verified. Deferred GPU writeback preserves repurposed CPU memory, released storage buffers no longer trigger repeated failed readbacks, and depth-only draws respect explicit zero colour masks. D16 shadow bias, RG32F colour attachments and 2D mip views are supported. A stationary world sample records 313 flips in 30.01 seconds (10.43 FPS); long transition pauses, dark lighting and rendering artifacts remain. The 30 FPS target is unmet. This validation did not include a full playthrough, save recovery or audio correctness. [World capture](images/subnautica-below-zero-new-game-world.png) · [New-game investigation and validation](development/subnautica-new-game-2026-10-01.md) · [Earlier menu performance](development/subnautica-scalar-scratch-2026-09-28.md) |
 | **Terminator 2D: No Fate**<br><img src="images/live-gameplay.png" width="240" alt="Terminator 2D gameplay with the player character, HUD and desert scene"> | **Playable · Completable** | Completed without reported problems. Correct backgrounds, characters, HUD, textures and colors; warmed-up startup frames measure 22–65 ms on the current test host. [Gameplay capture](images/live-gameplay.png) |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
@@ -36,14 +36,14 @@ supplied locally and is not included in this repository.
 
 ## Screenshots
 
-![Subnautica Below Zero world-loading screen with a ship above the planet](images/subnautica-below-zero-new-game-loading.png)
+![Subnautica Below Zero snowy opening area with the survival HUD](images/subnautica-below-zero-new-game-world.png)
 
 *Subnautica: Below Zero, PPSA02457 v1.022.125, October 1, 2026. An unedited
-1765×993 client-window capture during the new-game investigation with 1080p
-guest output. Writable temporary storage allows Survival to leave the mode
-selection panel and start loading. This final run later faults in a worker; earlier runs also presented a black screen. This
-image does not establish playable gameplay. See the linked investigation for
-the runtime and deferred-writeback fixes, validation, and remaining limits.*
+1765×993 client-window capture with 1080p guest output after starting a new
+Survival game. The intro completes, the opening area and HUD render, and camera
+movement and walking respond to input. Dark lighting and other rendering
+artifacts remain. The linked investigation records the fixes, validation and
+remaining performance limits; this run did not test a full playthrough.*
 
 ![Big Helmet Heroes opening movie playing in PS5PCEM](images/big-helmet-heroes-intro.png)
 

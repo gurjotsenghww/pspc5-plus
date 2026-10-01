@@ -650,8 +650,9 @@ pub const HtileLayout = struct {
 };
 
 pub const Layout = struct {
-    /// Volume attachments use the same 3D swizzle as their sampled image.
-    volume: ?SubresourceLayout = null,
+    /// Mipped and volume attachments share the sampled image's subresource
+    /// addressing, including packed mip tails and array-layer strides.
+    subresource: ?SubresourceLayout = null,
     block: BlockLayout,
     width: u32,
     height: u32,
@@ -760,17 +761,17 @@ pub const Layout = struct {
         if (target.samples_log2 != 0 or target.fragments_log2 != 0) {
             return Error.UnsupportedMultisample;
         }
-        if (target.resource_type == 2) {
+        if (target.resource_type == 2 or target.maximum_mip != 0 or target.mip_level != 0) {
             const texture = try TextureLayout.fromColorTarget(target);
-            const volume = try texture.subresource(target.mip_level, 0, 1);
+            const view = try texture.subresource(target.mip_level, 0, texture.layers);
             var layout = try init(.{
                 .tile_mode = .linear,
-                .width = volume.width,
-                .height = volume.height,
-                .layers = volume.depth_or_layers,
+                .width = view.width,
+                .height = view.height,
+                .layers = view.depth_or_layers,
             }, bytes);
-            layout.volume = volume;
-            layout.required_source_bytes = volume.required_source_bytes;
+            layout.subresource = view;
+            layout.required_source_bytes = view.required_source_bytes;
             return layout;
         }
         const layers: u32 = if (target.last_array_slice >= target.base_array_slice)
@@ -817,7 +818,7 @@ pub const Layout = struct {
     }
 
     pub fn sourceByteOffset(self: Layout, x: u32, y: u32, layer: u32) Error!u64 {
-        if (self.volume) |volume| return volume.sourceByteOffset(x, y, layer, 0);
+        if (self.subresource) |view| return view.sourceByteOffset(x, y, layer, 0);
         if (x >= self.width or y >= self.height or layer >= self.layers) {
             return Error.CoordinateOutOfRange;
         }
@@ -861,7 +862,7 @@ pub const Layout = struct {
 
     /// Copies guest tiled bytes into tightly packed layer-major staging bytes.
     pub fn detile(self: Layout, source: []const u8, destination: []u8) Error!void {
-        if (self.volume) |volume| return volume.detile(source, destination);
+        if (self.subresource) |view| return view.detile(source, destination);
         try self.validateCopies(source.len, destination.len);
         return switch (self.block.bytes_per_element) {
             1 => self.copyElements(false, 1, source, destination),
@@ -876,7 +877,7 @@ pub const Layout = struct {
     /// Copies tightly packed staging bytes back to guest layout. Padding and
     /// slices outside the view are intentionally left untouched.
     pub fn tile(self: Layout, source: []const u8, destination: []u8) Error!void {
-        if (self.volume) |volume| return volume.tile(source, destination);
+        if (self.subresource) |view| return view.tile(source, destination);
         if (@as(u64, source.len) < self.staging_bytes) return Error.SourceTooSmall;
         if (@as(u64, destination.len) < self.required_source_bytes) return Error.DestinationTooSmall;
         return switch (self.block.bytes_per_element) {
@@ -1037,7 +1038,7 @@ pub const Layout = struct {
     /// Reads directly from checked guest memory without allocating an
     /// intermediate copy of the tiled allocation.
     pub fn stage(self: Layout, reader: shaders.MemoryReader, address: u64, destination: []u8) StageError!void {
-        if (self.volume) |volume| return volume.stage(reader, address, destination);
+        if (self.subresource) |view| return view.stage(reader, address, destination);
         if (@as(u64, destination.len) < self.staging_bytes) return Error.DestinationTooSmall;
         _ = try self.sourceRange(address);
         const bytes = self.block.bytes_per_element;
@@ -3529,6 +3530,51 @@ test "compute source offsets match CPU detile for standard 64 KiB textures" {
                 try view.sourceByteOffset(x, y, 0, 0),
                 computeSourceOffset(plan.params, x, y, 0, 0),
             );
+        }
+    }
+}
+
+test "mipped color attachments preserve neighboring levels including the packed tail" {
+    const allocator = testing.allocator;
+    for ([_]resources.TileMode{ .linear, .render_target }) |mode| {
+        var target = std.mem.zeroes(resources.ColorTarget);
+        target.width = 512;
+        target.height = 512;
+        target.depth = 1;
+        target.resource_type = 1;
+        target.format = 11;
+        target.maximum_mip = 9;
+        target.tile_mode = mode;
+        var image = std.mem.zeroInit(resources.ImageDescriptor, .{ .image_type = .color_2d });
+        image.width = 512;
+        image.height = 512;
+        image.depth_or_layers = 1;
+        image.unified_format = 64;
+        image.tile_mode = mode;
+        image.max_mip = 9;
+        image.last_level = 9;
+        image.extended = true;
+        const texture = try TextureLayout.fromImage(image);
+        const sampled_base = try texture.base();
+        const allocation = try allocator.alloc(u8, @intCast(sampled_base.required_source_bytes));
+        defer allocator.free(allocation);
+        @memset(allocation, 0xa5);
+        for (0..10) |level| {
+            target.mip_level = @intCast(level);
+            const attachment = try Layout.fromColorTarget(target);
+            const pixels = try allocator.alloc(u8, @intCast(attachment.staging_bytes));
+            defer allocator.free(pixels);
+            @memset(pixels, @intCast(level + 1));
+            try attachment.tile(pixels, allocation);
+        }
+        // Read every level after all later writes, through the sampled-image
+        // path. The old attachment layout repeatedly overwrote level zero.
+        for (0..10) |level| {
+            const sampled = try texture.subresource(@intCast(level), 0, 1);
+            const pixels = try allocator.alloc(u8, @intCast(try sampled.stagingBytes()));
+            defer allocator.free(pixels);
+            try sampled.detile(allocation, pixels);
+            try testing.expect(std.mem.allEqual(u8, pixels, @intCast(level + 1)));
         }
     }
 }

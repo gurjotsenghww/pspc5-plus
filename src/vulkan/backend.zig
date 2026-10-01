@@ -1415,6 +1415,8 @@ const GuestBufferEntry = struct {
     /// Pending until the recorded consumer receives a submission timeline tick.
     last_gpu_use: u64 = 0,
     gpu_dirty: bool = false,
+    /// A deferred result belongs to the allocation that existed when written.
+    backing_was_accessible: bool = false,
     pending_writes: buffer_write_ranges.Ranges = .{ .whole = true },
     /// Exact later command-processor writes that an older readback must spare.
     /// Overflow is drained before accepting another write, never widened.
@@ -1427,6 +1429,62 @@ const GuestBufferEntry = struct {
     page_observation: BufferPageObservation = .{},
     content_hash: ?u64 = null,
 };
+
+test "deferred storage retires released backing before submitting a readback" {
+    const Fixture = struct {
+        mapped_bytes: usize = 4096,
+        fn accessible(raw: ?*anyopaque, address: u64, size: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return address == 0x1000 and size <= self.mapped_bytes;
+        }
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    var fixture = Fixture{};
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.* = undefined; // No Vulkan device: retirement must not submit.
+    renderer.guest_memory = .{ .context = &fixture, .read = Fixture.read, .write = Fixture.write, .range_accessible = Fixture.accessible };
+    var entries = [_]GuestBufferEntry{.{
+        .descriptor_index = 0,
+        .guest_address = 0x1000,
+        .size = 4096,
+        .device_local = .{ .handle = 1, .memory = 0, .size = 4096 },
+        .last_used_sequence = 1,
+        .last_gpu_write_sequence = 2,
+        .gpu_dirty = true,
+        .backing_was_accessible = true,
+        .page_generation = 3,
+    }};
+    renderer.guest_buffers = .{ .items = &entries, .capacity = entries.len };
+    renderer.deferred_shader_metadata_slots = .initEmpty();
+    renderer.deferred_shader_metadata_slots.set(0);
+    // Ordinary write failures in a still-resident allocation stay errors.
+    try std.testing.expect(!renderer.discardUnmappedGuestBuffer(0));
+    fixture.mapped_bytes = 2048;
+    entries[0].backing_was_accessible = false;
+    try std.testing.expect(!renderer.discardUnmappedGuestBuffer(0));
+    entries[0].backing_was_accessible = true;
+    renderer.guest_memory.?.range_accessible = null;
+    try std.testing.expect(!renderer.discardUnmappedGuestBuffer(0));
+    renderer.guest_memory.?.range_accessible = Fixture.accessible;
+    try renderer.flushGuestStoragePrefix(0, std.math.maxInt(usize));
+    try std.testing.expect(!entries[0].gpu_dirty);
+    try std.testing.expect(!entries[0].pending_writes.whole);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].page_generation);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].last_gpu_write_sequence);
+    try std.testing.expect(!renderer.deferred_shader_metadata_slots.isSet(0));
+    // A dependency selected by the ordered worklist takes the same guard.
+    entries[0].gpu_dirty = true;
+    entries[0].backing_was_accessible = true;
+    try renderer.flushGuestStoragePrefixOrdered(0, 4096);
+    try std.testing.expect(!entries[0].gpu_dirty);
+    try renderer.flushGuestStoragePrefix(0, 4096);
+}
 
 test "buffer victims follow recency while preserving dirty and active bindings" {
     const renderer = try std.testing.allocator.create(Renderer);
@@ -2010,6 +2068,12 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
             1 => .{ .vulkan = vk.format_r8g8b8a8_snorm, .bytes_per_texel = 4 },
             else => .{ .vulkan = vk.format_r8g8b8a8_unorm, .bytes_per_texel = 4 },
         },
+        // DATA_FORMAT_32_32. Unity's two-channel float reduction chain uses
+        // this attachment before the final scene compositor samples it.
+        11 => if (descriptor.number_type == 7)
+            .{ .vulkan = vk.format_r32g32_sfloat, .bytes_per_texel = 8 }
+        else
+            null,
         // DATA_FORMAT_16_16_16_16.
         12 => switch (descriptor.number_type) {
             0 => .{ .vulkan = vk.format_r16g16b16a16_unorm, .bytes_per_texel = 8 },
@@ -2034,7 +2098,7 @@ const color_export_identity: u8 = 0xe4;
 fn colorTargetComponentCount(format: u8) ?usize {
     return switch (format) {
         1, 2, 4 => 1,
-        3, 5 => 2,
+        3, 5, 11 => 2,
         6 => 3,
         9, 10, 12, 14 => 4,
         else => null,
@@ -2170,7 +2234,7 @@ fn recoverResetDepthExtent(
     if (!bound.htile_enabled or bound.htile_address == 0) {
         if (!render_state.depth_control.test_enabled or !render_state.depth_control.write_enabled or
             bound.write_address == 0 or bound.depth_read_only) return false;
-        if (render_state.color_control.allowsAttachmentWrites(render_state.target_mask, render_state.depth_control.stencil_enabled)) {
+        if (render_state.color_control.allowsAttachmentWrites(render_state.target_mask)) {
             for (render_state.color_targets) |candidate| {
                 if (candidate) |color| if (color.isActive()) return false;
             }
@@ -2180,7 +2244,7 @@ fn recoverResetDepthExtent(
     var max_color_height: u32 = 0;
     for (render_state.color_targets) |candidate| {
         if (candidate) |color| {
-            if (render_state.color_control.allowsAttachmentWrites(render_state.target_mask, render_state.depth_control.stencil_enabled) and
+            if (render_state.color_control.allowsAttachmentWrites(render_state.target_mask) and
                 color.isActive() and color.width > 1 and color.height > 1)
             {
                 if (color.width > max_color_width) max_color_width = color.width;
@@ -2299,7 +2363,7 @@ fn hostColorTargetDescriptor(descriptor: gpu.resources.ColorTarget) gpu.resource
 
 fn guestColorTarget(descriptor_: gpu.resources.ColorTarget) anyerror!GuestColorTarget {
     _ = colorTargetSamplesLog2(descriptor_) orelse return Error.UnsupportedColorTarget;
-    const descriptor = hostColorTargetDescriptor(descriptor_);
+    var descriptor = hostColorTargetDescriptor(descriptor_);
     const format = colorTargetFormat(descriptor) orelse return Error.UnsupportedColorTarget;
     // CPU tiling still names one sample per pixel. The host image carries the
     // real sample count; this layout is only identity and 1x staging size.
@@ -2307,9 +2371,13 @@ fn guestColorTarget(descriptor_: gpu.resources.ColorTarget) anyerror!GuestColorT
     layout_descriptor.samples_log2 = 0;
     layout_descriptor.fragments_log2 = 0;
     const layout = try gpu.SurfaceLayout.fromColorTarget(layout_descriptor);
-    if ((layout.layers != 1 and layout.volume == null) or layout.block.bytes_per_element != format.bytes_per_texel) {
+    if ((layout.layers != 1 and descriptor.resource_type != 2) or layout.block.bytes_per_element != format.bytes_per_texel) {
         return Error.UnsupportedColorTarget;
     }
+    // The register dimensions describe the allocation's base level. Vulkan
+    // renders the selected view; keep its allocation addressing in layout.
+    descriptor.width = layout.width;
+    descriptor.height = layout.height;
     return .{ .descriptor = descriptor, .layout = layout, .format = format };
 }
 
@@ -2354,6 +2422,7 @@ const CachedRenderTarget = struct {
     /// Capture residency when the attachment is created, before a later
     /// eviction/readback can outlive the title's allocation.
     backing_was_accessible: bool = false,
+    backing_snapshot: ColorBackingSnapshot = .{},
     shader_read_layout: bool = false,
     gpu_generation: u64 = 0,
     host_generation: u64 = 0,
@@ -2889,6 +2958,36 @@ const CachedFrame = struct {
     /// has not been tiled back into guest memory yet.
     needs_writeback: bool = false,
     backing_was_accessible: bool = false,
+    backing_snapshot: ColorBackingSnapshot = .{},
+};
+
+/// A deferred colour write belongs to the guest contents observed before the
+/// render. Residency alone is insufficient: freed image pages can remain mapped
+/// and be reused for CPU objects before a cache eviction publishes the pixels.
+const ColorBackingSnapshot = struct {
+    hash: ?u64 = null,
+    generation: u64 = 0,
+
+    fn capture(memory: GuestMemory, target: GuestColorTarget) ColorBackingSnapshot {
+        const address = target.descriptor.address;
+        const size = target.layout.required_source_bytes;
+        // Arm before hashing so a concurrent native write invalidates the proof.
+        const generation = if (memory.track_gpu_read) |track| track(memory.context, address, size) else 0;
+        const hash = if (memory.fingerprint) |fingerprint| fingerprint(memory.context, address, size) else null;
+        return .{ .hash = hash, .generation = generation };
+    }
+
+    fn changed(self: ColorBackingSnapshot, memory: GuestMemory, target: GuestColorTarget) bool {
+        const previous_hash = self.hash orelse return false;
+        const address = target.descriptor.address;
+        const size = target.layout.required_source_bytes;
+        if (self.generation != 0) if (memory.gpu_generation) |generation| {
+            if (generation(memory.context, address, size) == self.generation) return false;
+        };
+        const fingerprint = memory.fingerprint orelse return false;
+        const current_hash = fingerprint(memory.context, address, size) orelse return false;
+        return current_hash != previous_hash;
+    }
 };
 
 fn discardUnmappedCompletedFrame(cached: *CachedFrame, memory: GuestMemory) bool {
@@ -2941,6 +3040,82 @@ test "deferred frames retire only after proven loss of guest backing" {
     try std.testing.expectEqual(@as(u64, 0), cached.guest_address);
     try std.testing.expectEqual(@as(u64, 0), cached.sequence);
     try std.testing.expect(!discardUnmappedCompletedFrame(&cached, memory));
+}
+
+test "deferred frames preserve CPU replacements in still-mapped image memory" {
+    const Fixture = struct {
+        bytes: [4096]u8 = @splat(0),
+        epoch: u64 = 1,
+        writes: usize = 0,
+        hashes: usize = 0,
+        fn from(raw: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw.?));
+        }
+        fn read(raw: ?*anyopaque, address: u64, output: []u8) bool {
+            if (address != 0x1000 or output.len != 4096) return false;
+            @memcpy(output, &from(raw).bytes);
+            return true;
+        }
+        fn write(raw: ?*anyopaque, address: u64, input: []const u8) bool {
+            if (address != 0x1000 or input.len != 4096) return false;
+            const self = from(raw);
+            @memcpy(&self.bytes, input);
+            self.epoch += 1;
+            self.writes += 1;
+            return true;
+        }
+        fn fingerprint(raw: ?*anyopaque, _: u64, _: usize) ?u64 {
+            const self = from(raw);
+            self.hashes += 1;
+            return gpu.parallel_copy.fingerprint(&self.bytes);
+        }
+        fn generation(raw: ?*anyopaque, _: u64, _: usize) u64 {
+            return from(raw).epoch;
+        }
+    };
+    const testing = std.testing;
+    var fixture = Fixture{};
+    const memory = GuestMemory{ .context = &fixture, .read = Fixture.read, .write = Fixture.write, .fingerprint = Fixture.fingerprint, .track_gpu_read = Fixture.generation, .gpu_generation = Fixture.generation };
+    const descriptor = displayColorTarget(.{ .address = 0x1000, .width = 32, .height = 32, .pitch_in_pixels = 32, .tiling_mode = 1 }).?;
+    const target = try guestColorTarget(descriptor);
+    const renderer = try testing.allocator.create(Renderer);
+    defer testing.allocator.destroy(renderer);
+    renderer.* = undefined;
+    renderer.allocator = testing.allocator;
+    renderer.guest_memory = memory;
+    renderer.image_scratch = .{};
+    renderer.image_aliases = .{};
+    renderer.render_targets = .empty;
+    renderer.guest_color_target_writes = 0;
+    defer renderer.image_scratch.deinit(testing.allocator);
+    defer renderer.image_aliases.deinit(testing.allocator);
+    var pixels = [_]u8{0x7f} ** 4096;
+    var cached = CachedFrame{ .guest_address = 0x1000, .sequence = 7, .target = target, .needs_writeback = true, .backing_snapshot = ColorBackingSnapshot.capture(memory, target), .pixels = .{ .items = &pixels, .capacity = pixels.len } };
+    const hashes = fixture.hashes;
+    try testing.expect(!cached.backing_snapshot.changed(memory, target));
+    try testing.expectEqual(hashes, fixture.hashes);
+    // A write elsewhere in a shared watched page does not change this image.
+    fixture.epoch += 1;
+    try testing.expect(!cached.backing_snapshot.changed(memory, target));
+    try renderer.commitCompletedFrame(&cached);
+    try testing.expectEqual(@as(usize, 1), fixture.writes);
+    try testing.expectEqualSlices(u8, &pixels, &fixture.bytes);
+    // Publishing another GPU result must accept our previous writeback.
+    @memset(&pixels, 0x55);
+    cached.needs_writeback = true;
+    try renderer.commitCompletedFrame(&cached);
+    try testing.expectEqual(@as(usize, 2), fixture.writes);
+    // The allocation remains readable, but now holds a live CPU object.
+    fixture.bytes[128] = 0xa5;
+    fixture.epoch += 1;
+    cached.needs_writeback = true;
+    try renderer.commitCompletedFrame(&cached);
+    try testing.expectEqual(@as(usize, 2), fixture.writes);
+    try testing.expectEqual(@as(u8, 0xa5), fixture.bytes[128]);
+    try testing.expect(!cached.needs_writeback and cached.target == null);
+    var unknown = memory;
+    unknown.fingerprint = null;
+    try testing.expect(!cached.backing_snapshot.changed(unknown, target));
 }
 
 const WindowPresentation = struct {
@@ -4451,8 +4626,8 @@ fn colorTargetAliasSignature(target: GuestColorTarget) image_alias.Signature {
         .format = target.format.vulkan,
         .width = target.descriptor.width,
         .height = target.descriptor.height,
-        .depth = if (target.layout.volume != null) target.layout.layers else 1,
-        .layers = if (target.layout.volume != null) 1 else @intCast(target.layout.layers),
+        .depth = if (target.descriptor.resource_type == 2) target.layout.layers else 1,
+        .layers = if (target.descriptor.resource_type == 2) 1 else @intCast(target.layout.layers),
         .tile_mode = @intFromEnum(target.descriptor.tile_mode),
         .samples_log2 = target.descriptor.fragments_log2,
     };
@@ -6905,6 +7080,7 @@ pub const Renderer = struct {
                         changed.write_origin = .{};
                         changed.last_writer_program = 0;
                         changed.gpu_dirty = false;
+                        changed.backing_was_accessible = false;
                         changed.pending_host_writes = .{};
                         changed.page_generation = 0;
                         changed.content_hash = null;
@@ -7015,6 +7191,7 @@ pub const Renderer = struct {
                 victim.write_origin = .{};
                 victim.last_writer_program = 0;
                 victim.gpu_dirty = false;
+                victim.backing_was_accessible = false;
                 victim.pending_host_writes = .{};
                 victim.page_generation = 0;
                 victim.content_hash = null;
@@ -7290,9 +7467,32 @@ pub const Renderer = struct {
         self.frame_profile.storage_readback_bytes +%= destination.len;
     }
 
+    fn discardUnmappedGuestBuffer(self: *Renderer, index: usize) bool {
+        const entry = &self.guest_buffers.items[index];
+        if (!entry.gpu_dirty or !entry.backing_was_accessible) return false;
+        const memory = self.guest_memory orelse return false;
+        const accessible = memory.range_accessible orelse return false;
+        const size = std.math.cast(usize, entry.size) orelse return false;
+        if (accessible(memory.context, entry.guest_address, size)) return false;
+        // A partially released allocation cannot receive its old GPU result.
+        // Retire before queuing a readback: otherwise every eviction retries
+        // the same failed write and blocks unrelated resource bindings.
+        entry.gpu_dirty = false;
+        entry.backing_was_accessible = false;
+        entry.pending_writes = .{};
+        entry.pending_host_writes = .{};
+        entry.page_generation = 0;
+        entry.page_observation = .{};
+        entry.content_hash = null;
+        entry.last_gpu_write_sequence = 0;
+        self.deferred_shader_metadata_slots.unset(index);
+        return true;
+    }
+
     fn flushGuestStoragePrefix(self: *Renderer, index: usize, requested_size: usize) (Error || std.mem.Allocator.Error)!void {
         if (index >= self.guest_buffers.items.len) return Error.GuestBufferNotStaged;
         if (!self.guest_buffers.items[index].gpu_dirty or requested_size == 0) return;
+        if (self.discardUnmappedGuestBuffer(index)) return;
         // An older view can be observed before an overlapping newer writer.
         // Publish those dependencies first, including their transitive overlaps.
         // Use an iterative worklist: a long alias chain must not recurse on the
@@ -7327,6 +7527,7 @@ pub const Renderer = struct {
     }
 
     fn flushGuestStoragePrefixOrdered(self: *Renderer, index: usize, requested_size: usize) (Error || std.mem.Allocator.Error)!void {
+        if (self.discardUnmappedGuestBuffer(index)) return;
         const entry = &self.guest_buffers.items[index];
         if (!entry.gpu_dirty) return;
         entry.content_hash = null;
@@ -11886,6 +12087,13 @@ pub const Renderer = struct {
     }
 
     fn markGuestBufferRangesWritten(self: *Renderer, entry: *GuestBufferEntry, ranges: *const buffer_write_ranges.Ranges, origin: BufferWriteOrigin) void {
+        if (!entry.backing_was_accessible) {
+            if (self.guest_memory) |memory| {
+                if (memory.range_accessible) |accessible| {
+                    entry.backing_was_accessible = accessible(memory.context, entry.guest_address, @intCast(entry.size));
+                }
+            }
+        }
         self.traceBufferLifetime("gpu-write", entry.guest_address, entry.size, null, origin);
         if (!entry.gpu_dirty) entry.pending_writes = .{};
         const was_whole = entry.pending_writes.whole;
@@ -12554,7 +12762,6 @@ pub const Renderer = struct {
             // Stencil-only draws also keep their color attachment untouched.
             result.color_write_masks[slot] = if (render.color_control.allowsAttachmentWrites(
                 render.target_mask,
-                render.depth_control.stencil_enabled,
             ))
                 mapColorWriteMask(
                     color.descriptor.write_mask,
@@ -12621,7 +12828,7 @@ pub const Renderer = struct {
             result.scissor_height = bottom - top;
         }
         if (render.raster.polygon_mode != 0) return Error.UnsupportedGraphicsState;
-        try applyGuestDepthBias(&result, render.raster, if (render.depth_target) |depth| depth.format else 0);
+        try applyGuestDepthBias(&result, render.raster, if (render.depth_target) |depth| depthTargetFormat(depth) orelse 0 else 0);
         result.cull_mode = @as(u32, @intFromBool(render.raster.cull_front)) |
             (@as(u32, @intFromBool(render.raster.cull_back)) << 1);
         // PA_SU_SC_MODE_CNTL.FACE and VkFrontFace use the same encoding.
@@ -12632,21 +12839,33 @@ pub const Renderer = struct {
         return result;
     }
 
-    fn applyGuestDepthBias(result: *GraphicsPipelineState, raster: gpu.resources.RasterState, depth_format: u8) Error!void {
+    fn applyGuestDepthBias(result: *GraphicsPipelineState, raster: gpu.resources.RasterState, depth_format: u32) Error!void {
         if (!raster.depth_bias_front and !raster.depth_bias_back) return;
-        // Vulkan exposes one bias for both faces. Match the captured D32
-        // floating-point (-23 mantissa bits) mode; other representations and
-        // unequal face settings need separate handling. Clamp=0 needs no
-        // optional depthBiasClamp device feature.
+        // Vulkan exposes one bias for both faces. Unequal face settings need
+        // separate handling. Clamp=0 needs no optional depthBiasClamp feature.
         if (!raster.depth_bias_front or !raster.depth_bias_back or
-            raster.depth_bias_format != 0x1e9 or depth_format != 3 or
             raster.depth_bias_clamp != 0 or
             raster.depth_bias_front_scale != raster.depth_bias_back_scale or
             raster.depth_bias_front_offset != raster.depth_bias_back_offset or
             !std.math.isFinite(raster.depth_bias_front_scale) or
             !std.math.isFinite(raster.depth_bias_front_offset)) return Error.UnsupportedGraphicsState;
+        const constant_scale: f32 = switch (raster.depth_bias_format) {
+            // Floating-point mode, NEG_NUM_DB_BITS = -23.
+            0x1e9 => switch (depth_format) {
+                vk.format_d32_sfloat, vk.format_d32_sfloat_s8_uint => 1,
+                else => return Error.UnsupportedGraphicsState,
+            },
+            // Fixed-point mode, NEG_NUM_DB_BITS = -16. A packed host D24/S8
+            // attachment needs 2^(24-16) units for each guest D16 bias unit.
+            0xf0 => switch (depth_format) {
+                vk.format_d16_unorm => 1,
+                vk.format_d24_unorm_s8_uint => 256,
+                else => return Error.UnsupportedGraphicsState,
+            },
+            else => return Error.UnsupportedGraphicsState,
+        };
         result.depth_bias_enable = 1;
-        result.depth_bias_constant_bits = @bitCast(raster.depth_bias_front_offset);
+        result.depth_bias_constant_bits = @bitCast(raster.depth_bias_front_offset * constant_scale);
         // PA_SU_POLY_OFFSET_*_SCALE measures slope at 1/16 pixel precision.
         result.depth_bias_slope_bits = @bitCast(raster.depth_bias_front_scale / 16.0);
     }
@@ -13416,7 +13635,7 @@ pub const Renderer = struct {
         reader: gpu.ShaderMemoryReader,
         frame: []u8,
     ) anyerror!void {
-        if (target.layout.volume == null and target.layout.block.tile_mode.isLinear()) {
+        if (target.layout.subresource == null and target.layout.block.tile_mode.isLinear()) {
             try target.layout.stage(reader, target.descriptor.address, frame);
             return;
         }
@@ -13871,6 +14090,7 @@ pub const Renderer = struct {
             .framebuffer = framebuffer,
             .readback = readback,
             .backing_was_accessible = self.colorTargetBackingAccessible(target),
+            .backing_snapshot = if (self.guest_memory) |memory| ColorBackingSnapshot.capture(memory, target) else .{},
         };
     }
 
@@ -15076,6 +15296,14 @@ pub const Renderer = struct {
                 );
             }
             const cached = &self.render_targets.items[index];
+            if (self.guest_memory) |memory| {
+                if (cached.backing_snapshot.changed(memory, target)) {
+                    invalidateResidentTarget(cached);
+                    self.invalidateCompletedFrames(target.descriptor.address, target.layout.required_source_bytes);
+                    cached.backing_snapshot = ColorBackingSnapshot.capture(memory, target);
+                    cached.backing_was_accessible = self.colorTargetBackingAccessible(target);
+                }
+            }
             // DCC/CMASK register bindings describe how guest memory would be
             // interpreted, but a resident VkImage already contains the
             // decompressed colour result. Merely rebinding metadata must not
@@ -15228,7 +15456,7 @@ pub const Renderer = struct {
         if (snapshot.target.descriptor.force_destination_alpha_one) {
             forceColorTargetAlphaOne(frame, snapshot.target.format);
         }
-        try self.recordGuestColorTarget(snapshot.target, frame, snapshot.backing_was_accessible);
+        try self.recordGuestColorTarget(snapshot.target, frame, snapshot.backing_was_accessible, snapshot.backing_snapshot);
         self.render_targets.items[index].host_generation = snapshot.gpu_generation;
         self.render_targets.items[index].shader_read_layout = false;
 
@@ -15450,7 +15678,7 @@ pub const Renderer = struct {
         const frame_index = resolved_index orelse return Error.MissingPresentedFrame;
         const pixels = try self.allocator.dupe(u8, self.completed_frames.items[frame_index].pixels.items);
         defer self.allocator.free(pixels);
-        try self.recordGuestColorTarget(destination, pixels, false);
+        try self.recordGuestColorTarget(destination, pixels, false, null);
 
         for (self.render_targets.items) |*cached| {
             if (cached.target.descriptor.address != destination.descriptor.address) continue;
@@ -16381,7 +16609,7 @@ pub const Renderer = struct {
         try self.readMapped(readback, frame);
         if (guest_target) |target| {
             if (target.descriptor.force_destination_alpha_one) forceDestinationAlphaOne(frame);
-            try self.recordGuestColorTarget(target, frame, false);
+            try self.recordGuestColorTarget(target, frame, false, null);
         }
         if (frame.len == self.graphics_probe_frame.len) @memcpy(&self.graphics_probe_frame, frame);
 
@@ -16498,6 +16726,16 @@ pub const Renderer = struct {
 
     fn commitCompletedFrame(self: *Renderer, cached: *CachedFrame) anyerror!void {
         const target = cached.target orelse return;
+        if (self.guest_memory) |memory| {
+            if (discardUnmappedCompletedFrame(cached, memory)) return;
+            if (cached.backing_snapshot.changed(memory, target)) {
+                cached.needs_writeback = false;
+                cached.guest_address = 0;
+                cached.sequence = 0;
+                cached.target = null;
+                return;
+            }
+        }
         self.commitGuestColorTarget(target, cached.pixels.items) catch |err| {
             // A read failure alone is not evidence of deallocation. Keep
             // reporting errors unless the embedding proves the old mapping
@@ -16510,6 +16748,19 @@ pub const Renderer = struct {
             return err;
         };
         cached.needs_writeback = false;
+        // Our own publication changes watched pages too. Keep the resident
+        // image's baseline in sync so its next render is not mistaken for a
+        // CPU replacement. Do not refresh overlapping, independently rendered
+        // views: their pending output must still be checked against guest RAM.
+        if (self.guest_memory) |memory| {
+            const previous = cached.backing_snapshot;
+            cached.backing_snapshot = ColorBackingSnapshot.capture(memory, target);
+            for (self.render_targets.items) |*resident| {
+                if (sameRenderTarget(resident.target, target) and
+                    resident.backing_snapshot.hash == previous.hash)
+                    resident.backing_snapshot = cached.backing_snapshot;
+            }
+        }
     }
 
     /// Host rendering publishes ordinary base-surface texels. Mark every
@@ -16555,7 +16806,7 @@ pub const Renderer = struct {
         return accessible(memory.context, target.descriptor.address, target.layout.required_source_bytes);
     }
 
-    fn recordGuestColorTarget(self: *Renderer, target: GuestColorTarget, frame: []const u8, backing_was_accessible: bool) anyerror!void {
+    fn recordGuestColorTarget(self: *Renderer, target: GuestColorTarget, frame: []const u8, backing_was_accessible: bool, backing_snapshot: ?ColorBackingSnapshot) anyerror!void {
         var frame_index: ?usize = null;
         for (self.completed_frames.items, 0..) |cached, index| {
             if (cached.guest_address != target.descriptor.address) continue;
@@ -16601,6 +16852,7 @@ pub const Renderer = struct {
         cached.target = target;
         cached.needs_writeback = true;
         cached.backing_was_accessible = backing_was_accessible or self.colorTargetBackingAccessible(target);
+        cached.backing_snapshot = backing_snapshot orelse if (self.guest_memory) |memory| ColorBackingSnapshot.capture(memory, target) else .{};
         self.latest_frame_index = frame_index;
     }
 
@@ -17363,7 +17615,7 @@ pub const Renderer = struct {
             try registers.writeRegister(.context, 0x2de, 0x1e9);
             for ([_]u32{ 0x2e1, 0x2e3 }) |reg|
                 try registers.writeRegister(.context, reg, @bitCast(@as(f32, -16384)));
-            try applyGuestDepthBias(&state, gpu.resources.decodeRasterState(&registers), 3);
+            try applyGuestDepthBias(&state, gpu.resources.decodeRasterState(&registers), target.format);
             state.viewport_min_depth_bits = @bitCast(@as(f32, 0.5));
             state.viewport_max_depth_bits = @bitCast(@as(f32, 0.5));
         }
@@ -18864,7 +19116,7 @@ pub const Renderer = struct {
             bound_color_count = 1;
         } else {
             for (render_state.color_targets) |candidate| {
-                if (!render_state.color_control.allowsAttachmentWrites(render_state.target_mask, render_state.depth_control.stencil_enabled)) break;
+                if (!render_state.color_control.allowsAttachmentWrites(render_state.target_mask)) break;
                 const descriptor = candidate orelse continue;
                 if (!descriptor.isActive()) {
                     if (self.skipped_extra_color_reports < 8) {
@@ -19397,7 +19649,7 @@ pub const Renderer = struct {
             vertex_instructions,
             &parameter_components,
             &ngg_lds_exports,
-            target.layout.volume != null,
+            target.descriptor.resource_type == 2,
         );
         if (ngg_lds_export_count != 0) {
             for (ngg_lds_exports[0..ngg_lds_export_count]) |ngg_export| {
@@ -27650,7 +27902,7 @@ pub const Renderer = struct {
         const layout = cached.target.layout;
         if (!cached.initialized or self.recording_command_buffer != null or
             descriptor.fragments_log2 != 0 or descriptor.cmask_fast_clear or
-            layout.volume != null or layout.layers != 1 or layout.first_slice != 0 or
+            layout.subresource != null or layout.layers != 1 or layout.first_slice != 0 or
             layout.source_base_offset != 0 or layout.block.tile_mode.isLinear() or
             layout.block.bytes > zero_block_bytes or zero_block_bytes % @as(u32, layout.block.bytes_per_element) != 0)
         {
@@ -29504,7 +29756,6 @@ pub const Renderer = struct {
                 current_render_state.depth_control.stencil_clear_enabled);
         const color_writes = current_render_state.color_control.allowsAttachmentWrites(
             current_render_state.target_mask,
-            current_render_state.depth_control.stencil_enabled,
         );
         const vertex_only_depth = has_vertex and !has_fragment and depth_work and
             (!color_writes or current_render_state.active_color_count == 0);
@@ -37294,6 +37545,30 @@ test "R8 UNORM color targets use the matching single-channel attachment" {
     try std.testing.expect(colorTargetFormat(descriptor) == null);
 }
 
+test "captured RG32F color target retains its layout and two-channel exports" {
+    var state = gpu.State{};
+    for ([_][2]u32{
+        .{ 0x318, 0x2fbdd00 },  .{ 0x390, 0 },          .{ 0x31c, 0x4072c },
+        .{ 0x3b0, 0x907fc1ff }, .{ 0x3b8, 0x4dc6c000 },
+    }) |register| try state.writeRegister(.context, register[0], register[1]);
+    for (0..10) |mip| {
+        try state.writeRegister(.context, 0x31b, @as(u32, @intCast(mip)) << 26);
+        const descriptor = gpu.resources.decodeColorTarget(&state, 0, 3).?;
+        const target = try guestColorTarget(descriptor);
+        try std.testing.expectEqual(vk.format_r32g32_sfloat, target.format.vulkan);
+        try std.testing.expectEqual(@as(u8, 8), target.format.bytes_per_texel);
+        try std.testing.expectEqual(@as(u32, 512) >> @as(u5, @intCast(mip)), target.descriptor.width);
+        try std.testing.expectEqual(@as(u4, 9), target.descriptor.maximum_mip);
+        try std.testing.expectEqual(target.descriptor.width, target.layout.width);
+        try std.testing.expectEqual(@as(u8, 8), target.layout.block.bytes_per_element);
+        try std.testing.expectEqual(@as(?usize, 2), colorTargetComponentCount(descriptor.format));
+        try std.testing.expectEqual(@as(u32, 3), mapColorWriteMask(3, colorTargetExportMapping(descriptor)));
+    }
+    var descriptor = gpu.resources.decodeColorTarget(&state, 0, 3).?;
+    descriptor.number_type = 0;
+    try std.testing.expectEqual(null, colorTargetFormat(descriptor));
+}
+
 test "RG16F color targets use the matching two-channel attachment format" {
     var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
     descriptor.format = 5;
@@ -38353,6 +38628,7 @@ test "uncompressed depth-only writers recover reset extents without expanding UI
     bound.write_address = 0x1000;
     var render = std.mem.zeroes(gpu.resources.RenderState);
     render.color_control.mode = 1;
+    render.target_mask = 0xf;
     render.depth_control.test_enabled = true;
     render.depth_control.write_enabled = true;
     render.scissor = .{ .left = 0, .top = 0, .right = 1024, .bottom = 1024 };
@@ -38911,28 +39187,47 @@ test "captured D32 shadow depth bias preserves scale and rejects unequal faces" 
                 try registers.writeRegister(.context, reg, @bitCast(@as(f32, -1000)));
             const raster = gpu.resources.decodeRasterState(&registers);
             var pipeline = GraphicsPipelineState.default(32, 32);
-            try Renderer.applyGuestDepthBias(&pipeline, raster, 3);
+            try Renderer.applyGuestDepthBias(&pipeline, raster, vk.format_d32_sfloat);
             try std.testing.expectEqual(@as(u32, 1), pipeline.depth_bias_enable);
             try std.testing.expectEqual(@as(f32, -1000), @as(f32, @bitCast(pipeline.depth_bias_constant_bits)));
             try std.testing.expectEqual(scale / 16, @as(f32, @bitCast(pipeline.depth_bias_slope_bits)));
-            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, raster, 1));
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, raster, vk.format_d16_unorm));
             var unequal = raster;
             unequal.depth_bias_back_offset = 0;
-            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, unequal, 3));
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, unequal, vk.format_d32_sfloat));
             var one_face = raster;
             one_face.depth_bias_back = false;
-            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, one_face, 3));
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, one_face, vk.format_d32_sfloat));
             var clamped = raster;
             clamped.depth_bias_clamp = 1;
-            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, clamped, 3));
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, clamped, vk.format_d32_sfloat));
             var invalid = raster;
             invalid.depth_bias_front_offset = std.math.nan(f32);
-            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, invalid, 3));
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, invalid, vk.format_d32_sfloat));
             invalid = raster;
             invalid.depth_bias_format = 0;
-            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, invalid, 3));
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, invalid, vk.format_d32_sfloat));
         }
     }
+}
+
+test "captured D16 shadow depth bias follows the host attachment precision" {
+    var registers = gpu.State{};
+    try registers.writeRegister(.context, 0x205, 0x1a42);
+    try registers.writeRegister(.context, 0x2de, 0xf0);
+    for ([_]u32{ 0x2e0, 0x2e2 }) |reg|
+        try registers.writeRegister(.context, reg, @bitCast(@as(f32, -16)));
+    for ([_]u32{ 0x2e1, 0x2e3 }) |reg|
+        try registers.writeRegister(.context, reg, @bitCast(@as(f32, -4)));
+    const raster = gpu.resources.decodeRasterState(&registers);
+    var pipeline = GraphicsPipelineState.default(32, 32);
+    try Renderer.applyGuestDepthBias(&pipeline, raster, vk.format_d16_unorm);
+    try std.testing.expectEqual(@as(u32, 1), pipeline.depth_bias_enable);
+    try std.testing.expectEqual(@as(f32, -4), @as(f32, @bitCast(pipeline.depth_bias_constant_bits)));
+    try std.testing.expectEqual(@as(f32, -1), @as(f32, @bitCast(pipeline.depth_bias_slope_bits)));
+    try Renderer.applyGuestDepthBias(&pipeline, raster, vk.format_d24_unorm_s8_uint);
+    try std.testing.expectEqual(@as(f32, -1024), @as(f32, @bitCast(pipeline.depth_bias_constant_bits)));
+    try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, raster, vk.format_d32_sfloat));
 }
 
 test "guest depth compare selectors map onto the host operations" {

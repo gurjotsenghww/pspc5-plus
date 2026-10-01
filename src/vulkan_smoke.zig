@@ -5650,6 +5650,26 @@ fn runStencilOnlyUiProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expectEqual(@as(u32, if (pass % 2 == 0) 0xff0000ff else 0xffff0000), std.mem.readInt(u32, guest.bytes[right..][0..4], .little));
     }
     std.debug.print("stencil operation values passed: distinct REPLACE_OP/TEST, masked EQUAL/LESS, both face states and subsequent stencil consumers\n", .{});
+
+    // A depth reconstruction can keep both color attachments and a color
+    // export bound without enabling stencil. TARGET_MASK=0 must still keep
+    // every existing color byte while the depth plane receives the draw.
+    const saved_colors = guest.bytes[0x2000..0x6000].*;
+    for (0..64 * 64) |pixel| guest.word(0x10000 + pixel * 4, 0x3f800000);
+    try state.writeRegister(.shader, ps, 0xc); // red export would erase the blue UI
+    try state.writeRegister(.context, 0x08e, 0);
+    try state.writeRegister(.context, 0x08f, 0xf);
+    try state.writeRegister(.context, 0x010, 3); // linear D32
+    try state.writeRegister(.context, 0x011, 0);
+    try state.writeRegister(.context, 0x014, 0x100);
+    try state.writeRegister(.context, 0x200, (1 << 1) | (1 << 2) | (7 << 4)); // depth ALWAYS, writes on, stencil off
+    _ = try executor.execute(&draw);
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqualSlices(u8, &saved_colors, guest.bytes[0x2000..0x6000]);
+    const depth_value: f32 = @bitCast(std.mem.readInt(u32, guest.bytes[0x10000 + (32 * 64 + 32) * 4 ..][0..4], .little));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), depth_value, 0.0001);
+    std.debug.print("Zero-mask depth draw passed: color retained byte-for-byte, depth updated to {d}, stencil disabled\n", .{depth_value});
 }
 
 fn runIndirectDispatchProbe(allocator: std.mem.Allocator) !void {
@@ -5780,8 +5800,11 @@ fn runUiAttachmentProbe(allocator: std.mem.Allocator) !void {
         const actual = std.mem.readInt(u32, guest.bytes[center..][0..4], .little);
         if (actual != expected) std.debug.print("UI attachment case={d}: expected={x} actual={x}\n", .{ case, expected, actual });
         try std.testing.expectEqual(expected, actual);
-        try std.testing.expectEqual(@as(usize, if (htile) 1 else 0), renderer.depth_targets.items.len);
-        if (htile) {
+        // With color explicitly disabled this is an active depth-only
+        // writer, so the reset extent is recovered even without HTILE.
+        const active_depth = htile or disable_color;
+        try std.testing.expectEqual(@as(usize, if (active_depth) 1 else 0), renderer.depth_targets.items.len);
+        if (active_depth) {
             try std.testing.expectEqual(@as(u32, 64), renderer.depth_targets.items[0].target.width);
             try std.testing.expectEqual(@as(u32, 64), renderer.depth_targets.items[0].target.height);
         }
@@ -8031,6 +8054,21 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     try state.writeRegister(.context, 0x1c5, 0x6514);
     std.debug.print("RG16_SNORM attachment passed: positive/negative exports and UNORM/SNORM target reuse\n", .{});
 
+    // Subnautica's reduction passes use RG32F attachments. Exercise actual
+    // exports and readback after reusing the preceding two-channel target.
+    try state.writeRegister(.context, 0x33a, (11 << 2) | (7 << 8));
+    try state.writeRegister(.context, 0x1c5, 0x6414);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    for ([_]f32{ 2, -2 }, 0..) |expected, channel| {
+        const raw = std.mem.readInt(u32, guest.bytes[0x8000 + pixel * 8 + channel * 4 ..][0..4], .little);
+        try std.testing.expectEqual(expected, @as(f32, @bitCast(raw)));
+    }
+    try state.writeRegister(.context, 0x33a, 5 << 2);
+    try state.writeRegister(.context, 0x1c5, 0x6514);
+    std.debug.print("RG32F attachment passed: positive/negative exports, target reuse and guest readback\n", .{});
+
     // AGC attributes name s0:s3 at a later fetch. They must not replace the
     // NGG wave-count input in s3 before the guest loads that descriptor.
     var memory = guest.interface();
@@ -8119,6 +8157,64 @@ fn runPipelineCacheProbe(allocator: std.mem.Allocator) !void {
     renderer.pipeline_cache_saver.join();
     try std.testing.expectEqual(second_write, try pipelineCacheTimestamp(io));
     std.debug.print("pipeline cache persistence passed: background snapshot, concurrent compilation, later generation saved and unchanged cache preserved\n", .{});
+}
+
+fn runMippedColorProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const vertex = [_]u32{
+        vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+        vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+        vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+        0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+        0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+    };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x048, 7);
+    try state.writeRegister(.shader, 0x049, 0);
+    try state.writeRegister(.shader, 0x009, 0);
+    for ([_][2]u32{
+        .{ 0x318, 0x80 },                        .{ 0x390, 0 },                       .{ 0x31c, (11 << 2) | (7 << 8) },
+        .{ 0x3b0, (5 << 28) | (31 << 14) | 31 }, .{ 0x3b8, 1 << 24 },                 .{ 0x08e, 3 },
+        .{ 0x00c, 0 },                           .{ 0x094, 1 << 31 },                 .{ 0x1e0, 0 },
+        .{ 0x200, 0 },                           .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },
+        .{ 0x205, 0 },
+    }) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    for (0..6) |level| {
+        const value: f32 = @floatFromInt(level + 2);
+        const address: u32 = @intCast(0x900 + level * 0x100);
+        const fragment = [_]u32{ vop1(1, 0, 255), @bitCast(value), vop1(1, 1, 255), @bitCast(-value), 0xf800_0803, 0x0000_0100, 0xbf81_0000 };
+        for (fragment, 0..) |word, i| guest.word(address + i * 4, word);
+        try state.writeRegister(.shader, 0x008, address >> 8);
+        try state.writeRegister(.context, 0x31b, @as(u32, @intCast(level)) << 26);
+        const extent = @as(u32, 32) >> @as(u5, @intCast(level));
+        const half: f32 = @as(f32, @floatFromInt(extent)) / 2;
+        try state.writeRegister(.context, 0x00d, extent | (extent << 16));
+        try state.writeRegister(.context, 0x095, extent | (extent << 16));
+        for ([_]f32{ half, half, half, half, 1, 0 }, 0..) |value_, i|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value_));
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+    }
+    const descriptor = gpu.resources.decodeColorTarget(&state, 0, 3).?;
+    const texture = try gpu.TextureLayout.fromColorTarget(descriptor);
+    for (0..6) |level| {
+        const view = try texture.subresource(@intCast(level), 0, 1);
+        // At 4x4 the upper centre sample lies exactly on the triangle's
+        // excluded edge. The lower centre stays inside, including at 1x1.
+        const offset: usize = @intCast(try view.sourceByteOffset((view.width - 1) / 2, (view.height - 1) / 2, 0, 0));
+        const value: f32 = @floatFromInt(level + 2);
+        for ([_]f32{ value, -value }, 0..) |expected, channel| {
+            const raw = std.mem.readInt(u32, guest.bytes[0x8000 + offset + channel * 4 ..][0..4], .little);
+            try std.testing.expectEqual(expected, @as(f32, @bitCast(raw)));
+        }
+    }
+    std.debug.print("mipped RG32F attachments passed: six rendered levels through 1x1, distinct offsets and preserved earlier levels\n", .{});
 }
 
 fn runIntegerColorProbe(allocator: std.mem.Allocator) !void {
@@ -12314,6 +12410,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--integer-colors")) {
         try runIntegerColorProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--mipped-color")) {
+        try runMippedColorProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-tables")) {

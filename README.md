@@ -68,8 +68,8 @@ found, and can invoke the package extractor on a debug package directly.
       <sub>Ghost of Yotei — intro video, decoded and presented</sub>
     </td>
     <td width="50%" align="center">
-      <img src="docs/images/reanimal-menu-partial.png" alt="REANIMAL title menu rendered by PS5PCEM"><br>
-      <sub>REANIMAL — animated title menu (option labels incomplete)</sub>
+      <a href="docs/images/subnautica-below-zero-new-game-world.png"><img src="docs/images/subnautica-below-zero-new-game-world.png" alt="Subnautica Below Zero gameplay with the snowy opening area and survival HUD"></a><br>
+      <sub>Subnautica: Below Zero — opening-area gameplay and survival HUD</sub>
     </td>
   </tr>
   <tr>
