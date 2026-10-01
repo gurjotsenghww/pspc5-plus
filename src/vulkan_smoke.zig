@@ -8160,10 +8160,22 @@ fn runPipelineCacheProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runMippedColorProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |tracked| for ([_]bool{ false, true }) |tiled|
+        try runMippedColorCase(allocator, tracked, tiled);
+}
+
+fn runMippedColorCase(allocator: std.mem.Allocator, tracked: bool, tiled: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     var guest = GuestMemory{};
-    const backend = renderer.dcbBackend(guest.interface());
+    var memory = guest.interface();
+    if (tracked) {
+        guest.watch_generation = 1;
+        memory.fingerprint = GuestMemory.fingerprint;
+        memory.track_gpu_read = GuestMemory.track;
+        memory.gpu_generation = GuestMemory.generation;
+    }
+    const backend = renderer.dcbBackend(memory);
     const vertex = [_]u32{
         vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
         vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
@@ -8183,6 +8195,7 @@ fn runMippedColorProbe(allocator: std.mem.Allocator) !void {
         .{ 0x200, 0 },                           .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },
         .{ 0x205, 0 },
     }) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    if (tiled) try state.writeRegister(.context, 0x3b8, (1 << 24) | (0x1b << 14));
     var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
     for (0..6) |level| {
         const value: f32 = @floatFromInt(level + 2);
@@ -8199,8 +8212,52 @@ fn runMippedColorProbe(allocator: std.mem.Allocator) !void {
             try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value_));
         _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
         if (renderer.last_draw_error) |err| return err;
-        try renderer.flushPendingGuestWrites();
     }
+    // Sample all levels while their guest allocation still contains zeros.
+    // First use individual views, then the complete pyramid. The newest
+    // attachment is the 1x1 tail and must not replace another mip's contents.
+    const sample = [_]u32{
+        vop1(1, 0, 255), 0x3ec00000,  vop1(1, 1, 255), 0x3ec00000,
+        0xf09c_0f0a,     0x0040_0200, 1,               0xe078_0000,
+        0x8003_0200,     0xbf81_0000,
+    };
+    for (sample, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var compute_state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try compute_state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try compute_state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try compute_state.writeRegister(.shader, 0x213, 16 << 1);
+    var chain = sampledImageDescriptorWords(0x8000, 32, 32);
+    chain[1] = (chain[1] & ~(@as(u32, 0xff) << 20)) | (64 << 20);
+    chain[3] |= 5 << 16;
+    chain[5] = 5 << 4;
+    if (tiled) chain[3] = (chain[3] & ~@as(u32, 0x1f00000)) | (0x1b << 20);
+    const uploads = renderer.sampled_image_uploads;
+    const readbacks = renderer.frame_profile.target_readbacks;
+    for ([_]bool{ false, true }) |full_chain| {
+        for (0..6) |level| {
+            var image = chain;
+            if (!full_chain) image[3] = (image[3] & ~@as(u32, 0xff000)) | (@as(u32, @intCast(level)) << 12) | (@as(u32, @intCast(level)) << 16);
+            const lod: u32 = if (full_chain) @intCast(level * 256) else 0;
+            const userdata = image ++ [_]u32{ 0x92, lod | (lod << 12), 0, 0, 0x1c000, 16 << 16, 1, 0 };
+            for (userdata, 0..) |word, i| try compute_state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+            _ = try renderer.dispatchRdna2State(&compute_state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var output: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x1c000, &output);
+            const value: f32 = @floatFromInt(level + 2);
+            for ([_]f32{ value, -value }, 0..) |expected, channel| {
+                const actual: f32 = @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little));
+                std.testing.expectApproxEqAbs(expected, actual, 0.0001) catch |err| {
+                    std.debug.print("colour mip sample mismatch full={any} mip={d} channel={d} expected={d} actual={d}\n", .{ full_chain, level, channel, expected, actual });
+                    return err;
+                };
+            }
+            try std.testing.expectEqual(uploads, renderer.sampled_image_uploads);
+            try std.testing.expectEqual(readbacks, renderer.frame_profile.target_readbacks);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), renderer.assembled_mip_chains.items.len);
+    try renderer.flushPendingGuestWrites();
     const descriptor = gpu.resources.decodeColorTarget(&state, 0, 3).?;
     const texture = try gpu.TextureLayout.fromColorTarget(descriptor);
     for (0..6) |level| {
@@ -8214,7 +8271,32 @@ fn runMippedColorProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(expected, @as(f32, @bitCast(raw)));
         }
     }
-    std.debug.print("mipped RG32F attachments passed: six rendered levels through 1x1, distinct offsets and preserved earlier levels\n", .{});
+    // Update only one producer without a flip; the assembled image must be
+    // rebuilt from write generations while every untouched mip is preserved.
+    const previous_chain = renderer.assembled_mip_chains.items[0].image.handle;
+    const replacement = [_]u32{ vop1(1, 0, 255), @bitCast(@as(f32, 42)), vop1(1, 1, 255), @bitCast(@as(f32, -42)), 0xf800_0803, 0x0000_0100, 0xbf81_0000 };
+    for (replacement, 0..) |word, i| guest.word(0x1100 + i * 4, word);
+    try state.writeRegister(.shader, 0x008, 0x11);
+    try state.writeRegister(.context, 0x31b, 2 << 26);
+    try state.writeRegister(.context, 0x00d, 8 | (8 << 16));
+    try state.writeRegister(.context, 0x095, 8 | (8 << 16));
+    for ([_]f32{ 4, 4, 4, 4, 1, 0 }, 0..) |value, i|
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    for (0..6) |level| {
+        const lod: u32 = @intCast(level * 256);
+        const userdata = chain ++ [_]u32{ 0x92, lod | (lod << 12), 0, 0, 0x1c000, 16 << 16, 1, 0 };
+        for (userdata, 0..) |word, i| try compute_state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&compute_state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var output: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x1c000, &output);
+        const value: f32 = if (level == 2) 42 else @floatFromInt(level + 2);
+        for ([_]f32{ value, -value }, 0..) |expected, channel|
+            try std.testing.expectApproxEqAbs(expected, @as(f32, @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little))), 0.0001);
+    }
+    try std.testing.expect(previous_chain != renderer.assembled_mip_chains.items[0].image.handle);
+    std.debug.print("mipped RG32F attachments passed: six rendered levels through 1x1, separate sampled views, resident chain and same-frame rewrite, no target readbacks or texture uploads\n", .{});
 }
 
 fn runIntegerColorProbe(allocator: std.mem.Allocator) !void {

@@ -920,7 +920,7 @@ const command_buffer_pending_tick = std.math.maxInt(u64);
 // keeping hundreds of individual Vulkan allocations alive after the title has
 // moved its ring buffers on, while still covering every descriptor in a draw.
 const maximum_guest_buffers = maximum_storage_descriptors;
-const maximum_retained_buffer_entries = 4096;
+const maximum_retained_buffer_entries = 8192;
 pub const maximum_storage_descriptors = 64;
 const maximum_storage_images = rdna2.spirv.maximum_storage_images;
 const dynamic_scalar_descriptor_binding = 2 + maximum_storage_images;
@@ -2444,6 +2444,23 @@ const CachedRenderTarget = struct {
     }
 };
 
+fn renderTargetMatchesSampledSubresource(target: GuestColorTarget, descriptor: gpu.ImageDescriptor) bool {
+    const first: u32 = if (descriptor.image_type.isArray()) descriptor.base_array else 0;
+    const layers = if (descriptor.image_type.isArray()) @max(descriptor.depth_or_layers -| first, 1) else 1;
+    return target.descriptor.mip_level == descriptor.viewBaseLevel() and
+        descriptor.viewMipLevels() == 1 and
+        target.descriptor.base_array_slice == first and target.layout.layers == layers;
+}
+
+fn sampledViewAliasesColorTarget(descriptor: gpu.ImageDescriptor, target: GuestColorTarget) bool {
+    if (target.descriptor.address == 0 or target.descriptor.address != descriptor.address) return false;
+    const base = descriptor.viewBaseLevel();
+    if (target.descriptor.mip_level < base or target.descriptor.mip_level >= @as(u16, base) + descriptor.viewMipLevels()) return false;
+    const first: u32 = if (descriptor.image_type.isArray()) descriptor.base_array else 0;
+    const end = if (descriptor.image_type.isArray()) @max(descriptor.depth_or_layers, first + 1) else 1;
+    return target.descriptor.base_array_slice < end and target.descriptor.last_array_slice >= first;
+}
+
 /// A guest depth allocation reduced to what a Vulkan attachment needs.
 ///
 /// The guest describes depth as a base allocation plus an optional separate
@@ -2969,8 +2986,9 @@ const ColorBackingSnapshot = struct {
     generation: u64 = 0,
 
     fn capture(memory: GuestMemory, target: GuestColorTarget) ColorBackingSnapshot {
-        const address = target.descriptor.address;
-        const size = target.layout.required_source_bytes;
+        const range = colorTargetBackingRange(target);
+        const address = target.descriptor.address + range.offset;
+        const size = range.size;
         // Arm before hashing so a concurrent native write invalidates the proof.
         const generation = if (memory.track_gpu_read) |track| track(memory.context, address, size) else 0;
         const hash = if (memory.fingerprint) |fingerprint| fingerprint(memory.context, address, size) else null;
@@ -2979,14 +2997,75 @@ const ColorBackingSnapshot = struct {
 
     fn changed(self: ColorBackingSnapshot, memory: GuestMemory, target: GuestColorTarget) bool {
         const previous_hash = self.hash orelse return false;
-        const address = target.descriptor.address;
-        const size = target.layout.required_source_bytes;
+        const range = colorTargetBackingRange(target);
+        const address = target.descriptor.address + range.offset;
+        const size = range.size;
         if (self.generation != 0) if (memory.gpu_generation) |generation| {
             if (generation(memory.context, address, size) == self.generation) return false;
         };
         const fingerprint = memory.fingerprint orelse return false;
         const current_hash = fingerprint(memory.context, address, size) orelse return false;
         return current_hash != previous_hash;
+    }
+};
+
+/// Watch and publish only the selected mip when it owns a contiguous span.
+/// required_source_bytes includes all preceding mips; treating that prefix as
+/// this attachment invalidates neighbours and republishes their stale bytes.
+const ColorBackingRange = struct { offset: usize, size: usize };
+
+fn colorTargetBackingRange(target: GuestColorTarget) ColorBackingRange {
+    const fallback = ColorBackingRange{ .offset = 0, .size = @intCast(target.layout.required_source_bytes) };
+    const view = target.layout.subresource orelse return fallback;
+    if (view.kind != .array_2d or view.depth_or_layers != 1 or view.samples() != 1) return fallback;
+    if (!view.in_tail) {
+        const start: usize = @intCast(view.level_offset + view.source_layer_bytes * view.first_slice);
+        return .{ .offset = start, .size = fallback.size - start };
+    }
+    // Packed tails share a block. Narrow only if all selected texels cover
+    // exactly one span; unusual padded/interleaved views keep the safe path.
+    var first: u64 = std.math.maxInt(u64);
+    var end: u64 = 0;
+    for (0..view.height) |y| for (0..view.width) |x| {
+        const offset = view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0) catch return fallback;
+        first = @min(first, offset);
+        end = @max(end, offset + view.block.bytes_per_element);
+    };
+    if (end <= first or end - first != target.layout.staging_bytes) return fallback;
+    return .{ .offset = @intCast(first), .size = @intCast(end - first) };
+}
+
+const ColorPublicationBaseline = struct {
+    snapshot: *ColorBackingSnapshot,
+    range: ColorBackingRange,
+
+    fn prepare(snapshot: *ColorBackingSnapshot, sibling: GuestColorTarget, target: GuestColorTarget, before: []const u8) ?ColorPublicationBaseline {
+        if (sibling.descriptor.address != target.descriptor.address or
+            sibling.descriptor.mip_level == target.descriptor.mip_level or
+            sibling.descriptor.maximum_mip != target.descriptor.maximum_mip or
+            sibling.format.vulkan != target.format.vulkan) return null;
+        // Equal padded allocation sizes alone do not identify the same mip
+        // pyramid (several small resolutions can occupy one 64 KiB tile).
+        const sibling_shift: u6 = @intCast(sibling.descriptor.mip_level);
+        const target_shift: u6 = @intCast(target.descriptor.mip_level);
+        if ((@as(u64, sibling.descriptor.width) << sibling_shift) != (@as(u64, target.descriptor.width) << target_shift) or
+            (@as(u64, sibling.descriptor.height) << sibling_shift) != (@as(u64, target.descriptor.height) << target_shift)) return null;
+        const a = sibling.layout.subresource orelse return null;
+        const b = target.layout.subresource orelse return null;
+        if (a.kind != b.kind or a.source_layer_bytes != b.source_layer_bytes or a.first_slice != b.first_slice or
+            a.depth_or_layers != b.depth_or_layers or a.block.family != b.block.family) return null;
+        const range = colorTargetBackingRange(sibling);
+        if (range.offset > before.len or range.size > before.len - range.offset) return null;
+        const hash = snapshot.hash orelse return null;
+        if (gpu.parallel_copy.fingerprint(before[range.offset..][0..range.size]) != hash) return null;
+        return .{ .snapshot = snapshot, .range = range };
+    }
+
+    fn commit(self: ColorPublicationBaseline, after: []const u8) void {
+        self.snapshot.hash = gpu.parallel_copy.fingerprint(after[self.range.offset..][0..self.range.size]);
+        // This is the expected GPU publication, not a new observation of RAM.
+        // Rehash on the next check so a concurrent CPU replacement stays visible.
+        self.snapshot.generation = 0;
     }
 };
 
@@ -3086,6 +3165,7 @@ test "deferred frames preserve CPU replacements in still-mapped image memory" {
     renderer.image_scratch = .{};
     renderer.image_aliases = .{};
     renderer.render_targets = .empty;
+    renderer.completed_frames = .empty;
     renderer.guest_color_target_writes = 0;
     defer renderer.image_scratch.deinit(testing.allocator);
     defer renderer.image_aliases.deinit(testing.allocator);
@@ -3498,6 +3578,13 @@ test "cold storage collection preserves dirty, pinned, depth-derived and recent 
 /// in its own resident image, and then samples the whole chain as one texture.
 /// Copying resident levels avoids publishing, detiling and uploading the whole
 /// guest allocation just to bind a complete sampled view.
+const MipChainSource = struct {
+    image: vk.Image,
+    width: u32,
+    height: u32,
+    restore: image_state.Usage,
+};
+
 const AssembledMipChain = struct {
     address: u64,
     unified_format: u16,
@@ -14202,11 +14289,13 @@ pub const Renderer = struct {
             // image allocation. Reuse only a render target that describes the
             // same image exactly; overlap and equal texel size are insufficient
             // proof and can silently sample an unrelated attachment.
+            const shift: u5 = @intCast(descriptor.viewBaseLevel());
             if (cached.initialized and
                 cached.target.descriptor.fragments_log2 == 0 and
                 cached.target.descriptor.address == descriptor.address and
-                cached.target.descriptor.width == descriptor.width and
-                cached.target.descriptor.height == descriptor.height and
+                renderTargetMatchesSampledSubresource(cached.target, descriptor) and
+                cached.target.descriptor.width == @max(descriptor.width >> shift, 1) and
+                cached.target.descriptor.height == @max(descriptor.height >> shift, 1) and
                 self.renderTargetFormatCompatible(cached, image_format, descriptor))
             {
                 return index;
@@ -14238,6 +14327,9 @@ pub const Renderer = struct {
                 self.last_rt_reject = 4;
                 continue;
             }
+            // Mips share a base address, but are not alternate extents of the
+            // same image. A fresh 1x1 mip must not refresh a 512x512 base level.
+            if (!renderTargetMatchesSampledSubresource(cached.target, descriptor)) continue;
             if (!self.renderTargetFormatCompatible(cached, image_format, descriptor)) {
                 self.last_rt_reject = 5;
                 continue;
@@ -14334,6 +14426,68 @@ pub const Renderer = struct {
         self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
     }
 
+    /// Assemble a complete colour pyramid without publishing every mip to
+    /// guest RAM and detiling it back into another Vulkan image.
+    fn stageResidentColorMipChain(
+        self: *Renderer,
+        descriptor: gpu.ImageDescriptor,
+        sampler_descriptor: gpu.resources.SamplerDescriptor,
+        image_format: u32,
+        dimension: rdna2.spirv.SampledImageDimension,
+    ) anyerror!?PreparedSampledImage {
+        const levels = descriptor.viewMipLevels();
+        if (dimension != .two_d or descriptor.image_type != .color_2d or
+            descriptor.depth_or_layers != 1 or descriptor.base_array != 0 or
+            descriptor.viewBaseLevel() != 0 or levels < 2 or levels > maximum_assembled_mip_levels) return null;
+        var indices: [maximum_assembled_mip_levels]usize = undefined;
+        var images: [maximum_assembled_mip_levels]MipChainSource = undefined;
+        var signature_hash = std.hash.Wyhash.init(1);
+        var allocation_bytes: u64 = 0;
+        for (0..levels) |level| {
+            var view = descriptor;
+            view.base_level = @intCast(level);
+            view.last_level = @intCast(level);
+            const index = self.findResidentRenderTargetIndex(view, image_format) orelse return null;
+            const cached = self.render_targets.items[index];
+            if (cached.gpu_generation == 0) return null;
+            if (self.guest_memory) |memory| {
+                if (cached.backing_snapshot.changed(memory, cached.target)) return null;
+            }
+            indices[level] = index;
+            images[level] = .{
+                .image = cached.image.handle,
+                .width = cached.target.descriptor.width,
+                .height = cached.target.descriptor.height,
+                .restore = self.image_states.current(cached.image.handle, vk.image_aspect_color_bit, 0, 0) orelse return null,
+            };
+            allocation_bytes = @max(allocation_bytes, cached.target.layout.required_source_bytes);
+            const identity = [_]u64{ cached.image.handle, cached.gpu_generation };
+            signature_hash.update(std.mem.asBytes(&identity));
+        }
+        // A newer raw-buffer producer needs the normal coherence path.
+        for (self.guest_buffers.items) |buffer| {
+            if (buffer.gpu_dirty and byteRangesOverlap(descriptor.address, allocation_bytes, buffer.guest_address, buffer.size)) return null;
+        }
+        for (self.storage_image_cache.items) |cached| {
+            if (cached.valid and cached.gpu_dirty and byteRangesOverlap(descriptor.address, allocation_bytes, cached.descriptor.address, cached.allocation_bytes)) return null;
+        }
+        const signature = signature_hash.final();
+        for (self.assembled_mip_chains.items) |chain| {
+            if (chain.address != descriptor.address or chain.unified_format != descriptor.unified_format or
+                chain.width != descriptor.width or chain.height != descriptor.height or
+                chain.levels != levels or chain.image_format != image_format) continue;
+            if (chain.signature != signature) break;
+            return .{
+                .image = chain.image,
+                .view = try self.residentImageViewLevels(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select), vk.image_aspect_color_bit, 1, levels),
+                .sampler = try self.residentSampler(sampler_descriptor),
+            };
+        }
+        for (indices[0..levels]) |index| self.render_targets.items[index].pin_count += 1;
+        defer for (indices[0..levels]) |index| self.releaseRenderTarget(index);
+        return self.buildMipChainImages(descriptor, sampler_descriptor, image_format, images[0..levels], signature);
+    }
+
     fn stageResidentRenderTarget(
         self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
@@ -14342,6 +14496,11 @@ pub const Renderer = struct {
         dimension: rdna2.spirv.SampledImageDimension,
     ) anyerror!?PreparedSampledImage {
         if (descriptor.image_type == .color_3d) return null;
+        // Each cached attachment owns one mip, not the complete sampled chain.
+        if (descriptor.viewMipLevels() != 1) return null;
+        const shift: u5 = @intCast(descriptor.viewBaseLevel());
+        const width = @max(descriptor.width >> shift, 1);
+        const height = @max(descriptor.height >> shift, 1);
         const latest = self.latestRenderTargetAtAddress(descriptor, image_format) orelse return null;
         const exact = self.findResidentRenderTargetIndex(descriptor, image_format);
         const index = if (exact) |exact_index| blk: {
@@ -14365,15 +14524,16 @@ pub const Renderer = struct {
             break :blk exact_index;
         } else blk: {
             const source = self.render_targets.items[latest];
-            if (source.target.descriptor.width == descriptor.width and
-                source.target.descriptor.height == descriptor.height)
+            if (source.target.descriptor.width == width and
+                source.target.descriptor.height == height)
             {
                 break :blk latest;
             }
+            if (descriptor.viewBaseLevel() != 0) return null;
             const dest_target = self.resizedGuestColorTarget(
                 source.target,
-                descriptor.width,
-                descriptor.height,
+                width,
+                height,
             ) catch return null;
             self.render_target_sequence +%= 1;
             self.render_targets.items[latest].last_used_sequence = self.render_target_sequence;
@@ -16714,8 +16874,27 @@ pub const Renderer = struct {
         defer tiled_scratch.release();
         const tiled = tiled_scratch.bytes;
         if (!memory.read(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
+        var baselines: [128]ColorPublicationBaseline = undefined;
+        var baseline_count: usize = 0;
+        for (self.render_targets.items) |*resident| {
+            if (baseline_count == baselines.len) break;
+            if (ColorPublicationBaseline.prepare(&resident.backing_snapshot, resident.target, target, tiled)) |baseline| {
+                baselines[baseline_count] = baseline;
+                baseline_count += 1;
+            }
+        }
+        for (self.completed_frames.items) |*completed| {
+            if (baseline_count == baselines.len) break;
+            const sibling = completed.target orelse continue;
+            if (ColorPublicationBaseline.prepare(&completed.backing_snapshot, sibling, target, tiled)) |baseline| {
+                baselines[baseline_count] = baseline;
+                baseline_count += 1;
+            }
+        }
         try target.layout.tile(frame, tiled);
-        if (!memory.write(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryWriteFailed;
+        const range = colorTargetBackingRange(target);
+        if (!memory.write(memory.context, target.descriptor.address + range.offset, tiled[range.offset..][0..range.size])) return Error.GuestMemoryWriteFailed;
+        for (baselines[0..baseline_count]) |baseline| baseline.commit(tiled);
         try self.commitExpandedCmask(target);
         self.image_aliases.publishGuest(aliasRange(
             target.descriptor.address,
@@ -24228,6 +24407,22 @@ pub const Renderer = struct {
         // source alive until its copy has been recorded on the same queue.
         for (sources) |index| self.storage_image_cache.items[index].pin_count += 1;
         defer for (sources) |index| self.releaseStorageImage(index);
+        var images: [maximum_assembled_mip_levels]MipChainSource = undefined;
+        for (sources, 0..) |index, level| {
+            const cached = self.storage_image_cache.items[index];
+            images[level] = .{ .image = cached.image.handle, .width = cached.subresource.width, .height = cached.subresource.height, .restore = image_state.storage_usage };
+        }
+        return self.buildMipChainImages(descriptor, sampler_descriptor, image_format, images[0..sources.len], signature);
+    }
+
+    fn buildMipChainImages(
+        self: *Renderer,
+        descriptor: gpu.ImageDescriptor,
+        sampler_descriptor: gpu.resources.SamplerDescriptor,
+        image_format: u32,
+        sources: []const MipChainSource,
+        signature: u64,
+    ) anyerror!?PreparedSampledImage {
         const levels: u32 = @intCast(sources.len);
         const destination = try self.createImageWithExtent(
             descriptor.width,
@@ -24260,9 +24455,8 @@ pub const Renderer = struct {
         };
         self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_top_of_pipe_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&to_destination));
 
-        for (sources, 0..) |index, level| {
-            const cached = self.storage_image_cache.items[index];
-            try self.transitionTrackedImage(command_buffer, cached.image.handle, .{
+        for (sources, 0..) |source, level| {
+            try self.transitionTrackedImage(command_buffer, source.image, .{
                 .aspect_mask = vk.image_aspect_color_bit,
                 .layer_count = 1,
             }, image_state.transfer_source_usage);
@@ -24272,8 +24466,8 @@ pub const Renderer = struct {
             // against a 7x4 level -- and a copy sized from the source writes
             // past the image. The device reports that only by losing itself.
             const shift: u5 = @intCast(level);
-            const level_width = @min(cached.subresource.width, @max(descriptor.width >> shift, 1));
-            const level_height = @min(cached.subresource.height, @max(descriptor.height >> shift, 1));
+            const level_width = @min(source.width, @max(descriptor.width >> shift, 1));
+            const level_height = @min(source.height, @max(descriptor.height >> shift, 1));
             const copy = vk.ImageCopy{
                 .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 },
                 .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .mip_level = @intCast(level), .layer_count = 1 },
@@ -24285,7 +24479,7 @@ pub const Renderer = struct {
             };
             self.device_functions.cmd_copy_image(
                 command_buffer,
-                cached.image.handle,
+                source.image,
                 vk.image_layout_transfer_src_optimal,
                 destination.handle,
                 vk.image_layout_transfer_dst_optimal,
@@ -24303,12 +24497,11 @@ pub const Renderer = struct {
             .subresource_range = whole,
         };
         self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit, 0, 0, null, 0, null, 1, @ptrCast(&to_read));
-        for (sources) |index| {
-            const cached = self.storage_image_cache.items[index];
-            try self.transitionTrackedImage(command_buffer, cached.image.handle, .{
+        for (sources) |source| {
+            try self.transitionTrackedImage(command_buffer, source.image, .{
                 .aspect_mask = vk.image_aspect_color_bit,
                 .layer_count = 1,
-            }, image_state.storage_usage);
+            }, source.restore);
         }
         try self.submitOneShot(command_buffer);
         // No host wait here. The copies go to the same queue as the draw that
@@ -24331,7 +24524,7 @@ pub const Renderer = struct {
         if (self.reported_mip_assemblies < 8) {
             self.reported_mip_assemblies += 1;
             std.debug.print(
-                "[vulkan dcb] assembled mip chain @0x{x} {d}x{d} levels={d} from resident storage\n",
+                "[vulkan dcb] assembled mip chain @0x{x} {d}x{d} levels={d} from resident images\n",
                 .{ descriptor.address, descriptor.width, descriptor.height, levels },
             );
         }
@@ -24612,13 +24805,14 @@ pub const Renderer = struct {
         // cached an empty guest upload of the same address before the cube was
         // rasterized.
         const aliases_active_render_target = if (render_target_write) |target|
-            target.descriptor.address != 0 and target.descriptor.address == descriptor.address
+            sampledViewAliasesColorTarget(descriptor, target)
         else
             false;
         if (aliases_active_render_target) {
             if (try self.stageFeedbackSnapshot(descriptor, sampler_descriptor, image_format, dimension, render_target_write.?)) |snapshot| return snapshot;
         }
         if ((dimension == .two_d or dimension == .two_d_array) and !aliases_active_render_target) {
+            if (try self.stageResidentColorMipChain(descriptor, sampler_descriptor, image_format, dimension)) |resident| return resident;
             if (try self.stageResidentRenderTarget(
                 descriptor,
                 sampler_descriptor,
@@ -37543,6 +37737,113 @@ test "R8 UNORM color targets use the matching single-channel attachment" {
 
     descriptor.number_type = 7;
     try std.testing.expect(colorTargetFormat(descriptor) == null);
+}
+
+test "resident colour views keep mip and array identity" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.address = 0x8000;
+    descriptor.width = 32;
+    descriptor.height = 32;
+    descriptor.depth = 1;
+    descriptor.format = 11;
+    descriptor.number_type = 7;
+    descriptor.resource_type = 1;
+    descriptor.maximum_mip = 5;
+    var sampled = try gpu.resources.decodeImageDescriptor(&.{ 0x80, 64 << 20, 31 | (31 << 14), 0x90000fac, 0, 5 << 4, 0, 0 });
+    sampled.address = descriptor.address;
+    sampled.width = 32;
+    sampled.height = 32;
+    sampled.depth_or_layers = 1;
+    sampled.image_type = .color_2d;
+    sampled.extended = true;
+    sampled.max_mip = 5;
+    for (0..6) |level| {
+        descriptor.mip_level = @intCast(level);
+        const target = try guestColorTarget(descriptor);
+        for (0..6) |sample_level| {
+            sampled.base_level = @intCast(sample_level);
+            sampled.last_level = @intCast(sample_level);
+            try std.testing.expectEqual(level == sample_level, renderTargetMatchesSampledSubresource(target, sampled));
+            try std.testing.expectEqual(level == sample_level, sampledViewAliasesColorTarget(sampled, target));
+        }
+        sampled.base_level = 0;
+        sampled.last_level = 5;
+        try std.testing.expect(!renderTargetMatchesSampledSubresource(target, sampled));
+        try std.testing.expect(sampledViewAliasesColorTarget(sampled, target));
+        sampled.image_type = .color_2d_array;
+        sampled.base_array = 1;
+        try std.testing.expect(!sampledViewAliasesColorTarget(sampled, target));
+        sampled.base_array = 0;
+        sampled.image_type = .color_2d;
+    }
+}
+
+test "colour mip backing spans preserve neighbouring levels and CPU replacements" {
+    const Fixture = struct {
+        bytes: []u8,
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+        fn fingerprint(raw: ?*anyopaque, address: u64, size: usize) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return gpu.parallel_copy.fingerprint(self.bytes[@intCast(address - 0x1000)..][0..size]);
+        }
+    };
+    for ([_]gpu.resources.TileMode{ .linear, .render_target }) |mode| {
+        var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+        descriptor.address = 0x1000;
+        descriptor.width = 512;
+        descriptor.height = 512;
+        descriptor.depth = 1;
+        descriptor.resource_type = 1;
+        descriptor.format = 11;
+        descriptor.number_type = 7;
+        descriptor.maximum_mip = 9;
+        descriptor.tile_mode = mode;
+        var targets: [10]GuestColorTarget = undefined;
+        var snapshots: [10]ColorBackingSnapshot = undefined;
+        for (&targets, 0..) |*target, level| {
+            descriptor.mip_level = @intCast(level);
+            target.* = try guestColorTarget(descriptor);
+        }
+        const bytes = try std.testing.allocator.alloc(u8, @intCast(targets[0].layout.required_source_bytes));
+        defer std.testing.allocator.free(bytes);
+        @memset(bytes, 0);
+        var fixture = Fixture{ .bytes = bytes };
+        const memory = GuestMemory{ .context = &fixture, .read = Fixture.read, .write = Fixture.write, .fingerprint = Fixture.fingerprint };
+        for (targets, &snapshots) |target, *snapshot| snapshot.* = ColorBackingSnapshot.capture(memory, target);
+        for (targets, 0..) |target, level| {
+            const range = colorTargetBackingRange(target);
+            const pixel: usize = @intCast(try target.layout.sourceByteOffset(0, 0, 0));
+            try std.testing.expect(pixel >= range.offset and pixel < range.offset + range.size);
+            bytes[pixel] = 0xa5;
+            for (targets, snapshots, 0..) |view, snapshot, index| {
+                const watched = colorTargetBackingRange(view);
+                try std.testing.expectEqual(pixel >= watched.offset and pixel < watched.offset + watched.size, snapshot.changed(memory, view));
+                // A CPU write must never be accepted as our own publication.
+                if (level != index and snapshot.changed(memory, view))
+                    try std.testing.expect(ColorPublicationBaseline.prepare(&snapshots[index], view, target, bytes) == null);
+            }
+            bytes[pixel] = 0;
+            var baselines: [10]?ColorPublicationBaseline = undefined;
+            for (targets, &snapshots, &baselines) |view, *snapshot, *baseline|
+                baseline.* = ColorPublicationBaseline.prepare(snapshot, view, target, bytes);
+            var unrelated = target;
+            unrelated.descriptor.width += 1;
+            for (targets, &snapshots) |view, *snapshot|
+                try std.testing.expect(ColorPublicationBaseline.prepare(snapshot, view, unrelated, bytes) == null);
+            bytes[pixel] = 0x55;
+            for (baselines) |baseline| if (baseline) |known| known.commit(bytes);
+            for (targets, snapshots, 0..) |view, snapshot, index| {
+                if (level != index) try std.testing.expect(!snapshot.changed(memory, view));
+            }
+            bytes[pixel] = 0;
+            for (targets, &snapshots) |view, *snapshot| snapshot.* = ColorBackingSnapshot.capture(memory, view);
+        }
+    }
 }
 
 test "captured RG32F color target retains its layout and two-channel exports" {

@@ -828,7 +828,7 @@ fn run(init: std.process.Init) !bool {
     } else |_| 4096;
     const storage_buffer_cache_entries = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_BUFFER_CACHE_ENTRIES")) |text| parse: {
         defer allocator.free(text);
-        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 4096, 64, 4096);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 4096, 64, 8192);
     } else |_| 4096;
 
     // What the rendering preset actually selects. Both of these trade a

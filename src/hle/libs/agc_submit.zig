@@ -1180,6 +1180,11 @@ pub fn publishDirectMemory(context: ?*anyopaque, address: u64, size: usize) bool
     return true;
 }
 
+/// Bounded diagnostics for native objects overwritten by a deferred GPU copy.
+/// Zero keeps the hot path silent; no guest bytes are changed by the observer.
+pub export var trace_guest_write_min_bytes: u64 = 0;
+pub export var trace_guest_write_reports: u32 = 0;
+
 pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
     if (video_out.writeLabelMemory(address, bytes)) return true;
     // Fence/write-data packets only publish one or two words. Reject those
@@ -1205,6 +1210,15 @@ pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) b
         return false;
     }
     const resolved = resolveGuestMemoryAddress(address, bytes.len) orelse return false;
+    const trace_min = @atomicLoad(u64, &trace_guest_write_min_bytes, .monotonic);
+    if (trace_min != 0 and bytes.len >= trace_min and
+        @atomicRmw(u32, &trace_guest_write_reports, .Add, 1, .monotonic) < 2048)
+    {
+        const before = @as([*]const u8, @ptrFromInt(resolved))[0..@min(bytes.len, 32)];
+        std.debug.print("[gpu guest write] address=0x{x} resolved=0x{x} bytes={d} caller=0x{x} before={x} after={x}\n", .{
+            address, resolved, bytes.len, @returnAddress(), before, bytes[0..@min(bytes.len, 32)],
+        });
+    }
     if (addressSpaceFromContext(context)) |space| space.notifyGuestWrite(resolved, bytes.len);
     const destination: [*]u8 = @ptrFromInt(resolved);
     gpu.parallel_copy.guest_copy_pool.copy(destination[0..bytes.len], bytes);
