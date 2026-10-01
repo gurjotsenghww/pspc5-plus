@@ -226,7 +226,7 @@ comptime {
 /// downloaded/generated title data are writable and outlive the installation,
 /// but the console exposes them through separate mount points. A path therefore
 /// has to say which host directory it belongs to before it can be resolved.
-pub const Mount = enum { title, savedata, download };
+pub const Mount = enum { title, savedata, download, temporary };
 
 const MountPoint = struct { prefix: []const u8, mount: Mount };
 
@@ -237,6 +237,7 @@ const mount_points = [_]MountPoint{
     .{ .prefix = "/host/", .mount = .title },
     .{ .prefix = "/savedata0/", .mount = .savedata },
     .{ .prefix = "/download0/", .mount = .download },
+    .{ .prefix = "/temp0/", .mount = .temporary },
 };
 
 /// Whether a path names a mount itself rather than one of its children.
@@ -420,6 +421,9 @@ var savedata_root: ?std.Io.Dir = null;
 /// Where `/download0` resolves. Unlike `/app0`, titles may create generated
 /// configuration, caches, and downloaded content here.
 var download_root: ?std.Io.Dir = null;
+/// Scratch storage exposed by AppContentTemporaryDataMount2. Keep it separate
+/// from both installed content and saves: Unity stages new saves here first.
+var temporary_root: ?std.Io.Dir = null;
 var open_files: [maximum_open_files]?OpenFile = @splat(null);
 // Unity's PS5 read-ahead cache keys buffered bytes by the guest descriptor,
 // including across opens on different threads. Recycling a table slot must
@@ -487,12 +491,26 @@ pub fn detachDownloadData() void {
     download_root = null;
 }
 
+/// The caller owns this per-title scratch directory until detachment.
+pub fn attachTemporaryData(directory: std.Io.Dir) void {
+    table_lock.lock();
+    defer table_lock.unlock();
+    temporary_root = directory;
+}
+
+pub fn detachTemporaryData() void {
+    table_lock.lock();
+    defer table_lock.unlock();
+    temporary_root = null;
+}
+
 /// The host directory a mount resolves against, if one is attached.
 fn rootFor(mount: Mount) ?std.Io.Dir {
     return switch (mount) {
         .title => root,
         .savedata => savedata_root,
         .download => download_root,
+        .temporary => temporary_root,
     };
 }
 
@@ -789,6 +807,7 @@ pub fn detach() void {
     root = null;
     boot_override_length = 0;
     download_root = null;
+    temporary_root = null;
     virtual_socket_signal.store(0, .release);
     audio_fs.reset();
 }
@@ -2056,6 +2075,38 @@ test "download data is writable without making title content writable" {
     try testing.expectEqualStrings("config", &contents);
 
     try testing.expectError(Error.ReadOnly, makeDirectory("/app0/generated"));
+}
+
+test "temporary mount supports save staging and remains isolated from content" {
+    var fixture = try Fixture.init("title data");
+    defer fixture.deinit();
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    attachTemporaryData(scratch.dir);
+    defer detachTemporaryData();
+
+    var metadata: Stat = undefined;
+    try stat("/temp0", &metadata);
+    try testing.expectEqual(mode_ifdir, metadata.mode & 0o170000);
+    try stat("/temp0/", &metadata);
+    try makeDirectory("/temp0/TempSave");
+    const fd = try open("/temp0/TempSave/slot.bin", O.rdwr | O.creat | O.trunc);
+    try testing.expectEqual(@as(usize, 4), try write(fd, "save"));
+    try close(fd);
+    const reopened = try open("/temp0/TempSave/slot.bin", O.rdonly);
+    defer close(reopened) catch {};
+    var bytes: [4]u8 = undefined;
+    try testing.expectEqual(bytes.len, try read(reopened, &bytes));
+    try testing.expectEqualStrings("save", &bytes);
+    try testing.expectError(Error.NotFound, stat("/app0/TempSave/slot.bin", &metadata));
+    try testing.expectError(Error.ReadOnly, makeDirectory("/app0/TempSave"));
+
+    // Parent components cannot walk out of the attached scratch directory.
+    var path: [maximum_path]u8 = undefined;
+    try testing.expectEqualStrings("slot.bin", mountRelative("/temp0/../../slot.bin", &path).?);
+    try testing.expect(mountRelative("/temp00/slot.bin", &path) == null);
+    detachTemporaryData();
+    try testing.expectError(Error.NotAttached, stat("/temp0", &metadata));
 }
 
 test "missing files and bad descriptors are reported precisely" {

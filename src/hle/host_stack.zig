@@ -38,6 +38,23 @@ threadlocal var stack: ?[]align(16) u8 = null;
 /// inner call must stay on the stack the outer one already established.
 threadlocal var active: bool = false;
 
+/// Registers spilled on the interrupted stack before firmware switches stacks.
+/// A conservative guest GC must scan from here, not from a host-stack local.
+pub const SuspendedStack = extern struct {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
+    return_address: u64,
+};
+threadlocal var suspended_stack: ?*const SuspendedStack = null;
+
+pub fn suspendedStack() ?*const SuspendedStack {
+    return suspended_stack;
+}
+
 /// The top of this thread's firmware stack, or zero if it has none.
 ///
 /// Allocation happens on first use and is deliberately small-framed, so it can
@@ -61,12 +78,14 @@ pub fn release() void {
     if (stack) |value| std.heap.page_allocator.free(value);
     stack = null;
     active = false;
+    suspended_stack = null;
 }
 
 extern fn ps5HleCallOnStack(
     context: *anyopaque,
     target: *const fn (*anyopaque) callconv(.c) void,
     stack_top: u64,
+    saved_stack: *?*const SuspendedStack,
 ) callconv(.c) void;
 
 comptime {
@@ -74,15 +93,21 @@ comptime {
     // Switches to `stack_top`, calls `target(context)`, and restores.
     //
     // The Microsoft x64 convention places context in rcx, target in rdx and the
-    // new top in r8. Only r10 is used as scratch, and it is volatile, so
-    // nothing the caller relies on is disturbed. Argument and return registers
-    // are untouched by design: everything the call needs travels through the
-    // context, so this works for any signature and any return type.
+    // new top in r8 and saved_stack in r9. Spill all SysV nonvolatile GPRs on
+    // the original stack so roots held only in registers remain visible when
+    // a guest signal suspends this call for garbage collection.
         \\.text
         \\.p2align 4
         \\.globl ps5HleCallOnStack
         \\ps5HleCallOnStack:
+        \\  pushq %rbx
+        \\  pushq %rbp
+        \\  pushq %r12
+        \\  pushq %r13
+        \\  pushq %r14
+        \\  pushq %r15
         \\  movq %rsp, %r10
+        \\  movq %r10, (%r9)
         \\  movq %r8, %rsp
         \\  pushq %r10
         // The pushed word leaves rsp 8 past alignment. Thirty-two bytes of
@@ -93,6 +118,12 @@ comptime {
         \\  addq $40, %rsp
         \\  popq %r10
         \\  movq %r10, %rsp
+        \\  popq %r15
+        \\  popq %r14
+        \\  popq %r13
+        \\  popq %r12
+        \\  popq %rbp
+        \\  popq %rbx
         \\  retq
     );
 }
@@ -134,7 +165,8 @@ pub fn call(comptime Result: type, comptime func: anytype, args: anytype) Result
 
     active = true;
     defer active = false;
-    ps5HleCallOnStack(&frame, &Invoker.invoke, stack_top);
+    defer suspended_stack = null;
+    ps5HleCallOnStack(&frame, &Invoker.invoke, stack_top, &suspended_stack);
 
     if (Result == void) return;
     return frame.result;
@@ -143,6 +175,50 @@ pub fn call(comptime Result: type, comptime func: anytype, args: anytype) Result
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+comptime {
+    std.debug.assert(@sizeOf(SuspendedStack) == 7 * @sizeOf(u64));
+    if (supported and builtin.is_test) asm (
+        \\.text
+        \\.p2align 4
+        \\.globl ps5HleTestRegisterRoot
+        \\ps5HleTestRegisterRoot:
+        \\  pushq %r12
+        \\  subq $32, %rsp
+        \\  movabsq $0x1234567887654321, %r12
+        \\  callq ps5HleCallOnStack
+        \\  movq %r12, %rax
+        \\  addq $32, %rsp
+        \\  popq %r12
+        \\  retq
+    );
+}
+
+extern fn ps5HleTestRegisterRoot(
+    context: *anyopaque,
+    target: *const fn (*anyopaque) callconv(.c) void,
+    stack_top: u64,
+    saved_stack: *?*const SuspendedStack,
+) callconv(.c) u64;
+
+test "register-only roots are spilled before switching firmware stacks" {
+    if (!supported) return error.SkipZigTest;
+    defer release();
+    const Probe = struct {
+        fn invoke(raw: *anyopaque) callconv(.c) void {
+            const observed: *u64 = @ptrCast(@alignCast(raw));
+            observed.* = suspendedStack().?.r12;
+        }
+    };
+    var observed: u64 = 0;
+    const marker: u64 = 0x1234567887654321;
+    const stack_top = top();
+    try testing.expect(stack_top != 0);
+    const preserved = ps5HleTestRegisterRoot(&observed, &Probe.invoke, stack_top, &suspended_stack);
+    try testing.expectEqual(marker, observed);
+    try testing.expectEqual(marker, preserved);
+    suspended_stack = null;
+}
 
 fn addThree(a: u64, b: u64, c: u64) u64 {
     return a + b + c;

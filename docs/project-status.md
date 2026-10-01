@@ -17,7 +17,7 @@ supplied locally and is not included in this repository.
 
 | Title | Status | Notes |
 |---|---|---|
-| **Subnautica: Below Zero**<br><img src="images/subnautica-below-zero-menu-scratch.png" width="240" alt="Subnautica Below Zero main menu showing Play, Options and Credits in PS5PCEM"> | **Main menu renders · gameplay unverified** | Rechecked on September 28, 2026 with PPSA02457 v1.022.125. Enter opens Play, Options and Credits. The default 1920×1080 setting reaches Unity's startup configuration without editing installed game files. Scalar walks now initialize branch tables only when used and scan occupied spill records. The latest menu run measures 59 ms median (about 17 FPS), with a 55–73 ms range on the RTX 3070 Ti host. Previous-build controls measure 57 and 58 ms; this change does not demonstrate an FPS improvement. All three runs last 180 seconds and use 24 matching samples at native 1920×1080. Median GPU waits are 1.7–2.1 ms. CPU preparation and command handling remain the main costs, and the 30 FPS target remains unmet. Rendering artifacts and intermittent missing labels remain unresolved. The measured runs had no reported guest fault or device loss; an earlier startup fault has not been isolated. Gameplay, audio correctness and longer-run stability are unverified. [Latest native capture](images/subnautica-below-zero-menu-scratch.png) · [Scalar scratch results and rejected worker experiment](development/subnautica-scalar-scratch-2026-09-28.md) · [Earlier register borrowing results](development/subnautica-register-borrowing-2026-09-28.md) · [Earlier retirement probe results](development/subnautica-retirement-probes-2026-09-28.md) · [Earlier index staging and scalar input results](development/subnautica-index-staging-2026-09-28.md) · [Earlier shader and submission reuse results](development/subnautica-pipeline-submission-reuse-2026-09-28.md) · [Earlier completion and shader results](development/subnautica-async-completion-2026-09-27.md) · [Earlier CPU cost results](development/subnautica-cpu-costs-2026-09-27.md) · [Initial 1080p results](development/1080p-buffer-reuse-2026-09-27.md) · [Menu investigation](development/subnautica-menu-2026-09-26.md) |
+| **Subnautica: Below Zero**<br><img src="images/subnautica-below-zero-new-game-loading.png" width="240" alt="Subnautica Below Zero world-loading screen with a ship above the planet"> | **New Game reaches loading · gameplay blocked** | October 1, 2026 development build, PPSA02457 v1.022.125. The runner now mounts writable per-title temporary storage: choosing Survival proceeds beyond the mode panel and creates the temporary save workspace. Shared signal delivery preserves the interrupted guest stack and register roots during garbage collection. Deferred frame writeback also checks for loss of previously accessible backing. Earlier runs reached main-scene objects and a larger render workload but presented a black screen. The final retest still faults in a worker during world loading; the runtime correction does not fully resolve that failure. Playable gameplay is not established. Shader/resource failures, rendering artifacts and low FPS remain under investigation. Save persistence and audio correctness are unverified. Earlier September 28 menu measurements remain about 17 FPS; these startup fixes are not an FPS benchmark. The 30 FPS target remains unmet. [Loading capture](images/subnautica-below-zero-new-game-loading.png) · [New-game investigation and validation](development/subnautica-new-game-2026-10-01.md) · [Earlier menu performance](development/subnautica-scalar-scratch-2026-09-28.md) |
 | **Terminator 2D: No Fate**<br><img src="images/live-gameplay.png" width="240" alt="Terminator 2D gameplay with the player character, HUD and desert scene"> | **Playable · Completable** | Completed without reported problems. Correct backgrounds, characters, HUD, textures and colors; warmed-up startup frames measure 22–65 ms on the current test host. [Gameplay capture](images/live-gameplay.png) |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
@@ -36,13 +36,14 @@ supplied locally and is not included in this repository.
 
 ## Screenshots
 
-![Subnautica Below Zero main menu showing Play, Options and Credits in PS5PCEM](images/subnautica-below-zero-menu-scratch.png)
+![Subnautica Below Zero world-loading screen with a ship above the planet](images/subnautica-below-zero-new-game-loading.png)
 
-*Subnautica: Below Zero, PPSA02457 v1.022.125, September 28, 2026. Frame 512
-from the final measured development run, captured at native 1920×1080 after
-the scalar scratch change. Median menu performance is
-about 17 FPS; this change shows no FPS improvement, and 30 FPS has not been reached. Rendering artifacts and intermittent
-missing labels remain unresolved; gameplay is unverified.*
+*Subnautica: Below Zero, PPSA02457 v1.022.125, October 1, 2026. An unedited
+1765×993 client-window capture during the new-game investigation with 1080p
+guest output. Writable temporary storage allows Survival to leave the mode
+selection panel and start loading. This final run later faults in a worker; earlier runs also presented a black screen. This
+image does not establish playable gameplay. See the linked investigation for
+the runtime and deferred-writeback fixes, validation, and remaining limits.*
 
 ![Big Helmet Heroes opening movie playing in PS5PCEM](images/big-helmet-heroes-intro.png)
 

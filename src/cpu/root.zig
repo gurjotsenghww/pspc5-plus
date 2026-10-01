@@ -3911,6 +3911,30 @@ const ActiveExecution = struct {
 
 threadlocal var active_execution: ?ActiveExecution = null;
 
+/// PS5 exception callbacks receive mcontext directly: RSP is at +0xf8,
+/// including the reserved words between RFLAGS and RSP. Firmware executes on
+/// a different stack, so its locals cannot stand in for the interrupted RSP.
+fn writeGuestSignalContext(
+    context: *[0x4c0]u8,
+    suspended: ?*const hle.host_stack.SuspendedStack,
+    fs_base: u64,
+) void {
+    @memset(context, 0);
+    if (suspended) |saved| {
+        inline for (.{
+            .{ 0x40, "rbx" },            .{ 0x48, "rbp" }, .{ 0x60, "r12" },
+            .{ 0x68, "r13" },            .{ 0x70, "r14" }, .{ 0x78, "r15" },
+            .{ 0xa0, "return_address" },
+        }) |field| std.mem.writeInt(u64, context[field[0]..][0..8], @field(saved, field[1]), .little);
+    }
+    // Without a switched firmware stack, delivery already runs below the
+    // guest frames. With one, include both the saved GPRs and every guest frame.
+    const stack_pointer = if (suspended) |saved| @intFromPtr(saved) else @intFromPtr(context);
+    std.mem.writeInt(u64, context[0xf8..][0..8], stack_pointer, .little);
+    std.mem.writeInt(u64, context[0x108..][0..8], context.len, .little);
+    std.mem.writeInt(u64, context[0x480..][0..8], fs_base, .little);
+}
+
 pub const Dispatcher = struct {
     allocator: std.mem.Allocator = undefined,
     io: std.Io = undefined,
@@ -4463,16 +4487,8 @@ pub const Dispatcher = struct {
         if (active.dispatcher != self) return false;
         const pending = self.takePendingGuestException(active.thread_handle) orelse return false;
 
-        // Orbis ucontext_t places its amd64 mcontext at +0x40. A conservative
-        // stack pointer keeps all live roots visible even though delivery
-        // happens at an HLE safe point rather than at an arbitrary instruction.
-        var context: [0x500]u8 align(16) = [_]u8{0} ** 0x500;
-        const mcontext: usize = 0x40;
-        const stack_pointer = @intFromPtr(&context);
-        std.mem.writeInt(u64, context[mcontext + 0x48 ..][0..8], stack_pointer, .little); // RBP
-        std.mem.writeInt(u64, context[mcontext + 0xb8 ..][0..8], stack_pointer, .little); // RSP
-        std.mem.writeInt(u64, context[mcontext + 0xc8 ..][0..8], 0x480, .little); // mcontext size
-        std.mem.writeInt(u64, context[mcontext + 0x440 ..][0..8], active.context.fs_base, .little);
+        var context: [0x4c0]u8 align(16) = undefined;
+        writeGuestSignalContext(&context, hle.host_stack.suspendedStack(), active.context.fs_base);
 
         delivering_guest_exception = true;
         defer delivering_guest_exception = false;
@@ -4962,6 +4978,36 @@ test "broadcast wake tokens are limited to current waiters" {
         .key = key,
         .observed_sequence = 1,
     }));
+}
+
+test "guest signal context scans the interrupted stack across firmware calls" {
+    if (!hle.host_stack.supported) return error.SkipZigTest;
+    defer hle.host_stack.release();
+    const Probe = struct {
+        fn capture(root: *u64) !void {
+            var context: [0x4c0]u8 align(16) = undefined;
+            const saved = hle.host_stack.suspendedStack().?;
+            writeGuestSignalContext(&context, saved, 0x12345000);
+            const rsp = std.mem.readInt(u64, context[0xf8..][0..8], .little);
+            // The live caller root must be in the scan interval. A pointer to
+            // `context` would instead start in the unrelated firmware stack.
+            try testing.expect(rsp < @intFromPtr(root));
+            try testing.expect(@intFromPtr(root) - rsp < 64 * 1024);
+            try testing.expect(@intFromPtr(&context) < rsp or @intFromPtr(&context) > @intFromPtr(root));
+            try testing.expectEqual(saved.r12, std.mem.readInt(u64, context[0x60..][0..8], .little));
+            try testing.expectEqual(@as(u64, 0x4c0), std.mem.readInt(u64, context[0x108..][0..8], .little));
+            try testing.expectEqual(@as(u64, 0x12345000), std.mem.readInt(u64, context[0x480..][0..8], .little));
+        }
+        fn nested(root: *u64) !void {
+            const saved = hle.host_stack.suspendedStack();
+            try hle.host_stack.call(anyerror!void, capture, .{root});
+            try testing.expectEqual(saved, hle.host_stack.suspendedStack());
+        }
+    };
+    var root: u64 = 0x1122334455667788;
+    try hle.host_stack.call(anyerror!void, Probe.nested, .{&root});
+    try testing.expect(hle.host_stack.suspendedStack() == null);
+    try testing.expectEqual(@as(u64, 0x1122334455667788), root);
 }
 
 test "native bridge installs FS, SysV arguments, and the guest stack" {

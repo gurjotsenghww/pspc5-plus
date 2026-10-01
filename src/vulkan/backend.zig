@@ -471,6 +471,9 @@ pub const GuestMemory = struct {
     context: ?*anyopaque,
     read: *const fn (?*anyopaque, u64, []u8) bool,
     write: *const fn (?*anyopaque, u64, []const u8) bool,
+    /// Full-range residency check, independent of content and write tracking.
+    /// Used to retire deferred image output after its guest backing is unmapped.
+    range_accessible: ?*const fn (?*anyopaque, u64, usize) bool = null,
     /// Proves that bulk read/write callbacks preserve individual word-copy
     /// effects for this ordinary range (no control labels or backing alias).
     can_batch_copy: ?*const fn (?*anyopaque, u64, u64, usize) bool = null,
@@ -2348,6 +2351,9 @@ const CachedRenderTarget = struct {
     depth_pass: ?DepthPass = null,
     readback: OwnedBuffer,
     initialized: bool = false,
+    /// Capture residency when the attachment is created, before a later
+    /// eviction/readback can outlive the title's allocation.
+    backing_was_accessible: bool = false,
     shader_read_layout: bool = false,
     gpu_generation: u64 = 0,
     host_generation: u64 = 0,
@@ -2882,7 +2888,60 @@ const CachedFrame = struct {
     /// The guest allocation at `guest_address` is stale: the rendered frame
     /// has not been tiled back into guest memory yet.
     needs_writeback: bool = false,
+    backing_was_accessible: bool = false,
 };
+
+fn discardUnmappedCompletedFrame(cached: *CachedFrame, memory: GuestMemory) bool {
+    if (!cached.needs_writeback or !cached.backing_was_accessible) return false;
+    const target = cached.target orelse return false;
+    const accessible = memory.range_accessible orelse return false;
+    if (accessible(memory.context, target.descriptor.address, target.layout.required_source_bytes)) return false;
+    // A previously valid allocation no longer exists in full. Its pending
+    // pixels must neither block unrelated draws nor overwrite recycled pages.
+    cached.needs_writeback = false;
+    cached.backing_was_accessible = false;
+    cached.guest_address = 0;
+    cached.sequence = 0;
+    cached.target = null;
+    return true;
+}
+
+test "deferred frames retire only after proven loss of guest backing" {
+    const Fixture = struct {
+        mapped_bytes: usize = 4096,
+        fn accessible(raw: ?*anyopaque, address: u64, size: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return address == 0x1000 and size <= self.mapped_bytes;
+        }
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    var fixture = Fixture{};
+    var memory = GuestMemory{ .context = &fixture, .read = Fixture.read, .write = Fixture.write, .range_accessible = Fixture.accessible };
+    const descriptor = displayColorTarget(.{ .address = 0x1000, .width = 32, .height = 32, .pitch_in_pixels = 32, .tiling_mode = 1 }).?;
+    const target = try guestColorTarget(descriptor);
+    var cached = CachedFrame{ .guest_address = 0x1000, .sequence = 7, .target = target, .needs_writeback = true, .backing_was_accessible = true };
+    // A failed read in an otherwise resident allocation remains an error.
+    try std.testing.expect(!discardUnmappedCompletedFrame(&cached, memory));
+    try std.testing.expect(cached.needs_writeback);
+    // Even a partially unmapped old image cannot safely receive a writeback.
+    fixture.mapped_bytes = 2048;
+    var unknown = cached;
+    unknown.backing_was_accessible = false;
+    try std.testing.expect(!discardUnmappedCompletedFrame(&unknown, memory));
+    memory.range_accessible = null;
+    try std.testing.expect(!discardUnmappedCompletedFrame(&cached, memory));
+    memory.range_accessible = Fixture.accessible;
+    try std.testing.expect(discardUnmappedCompletedFrame(&cached, memory));
+    try std.testing.expect(!cached.needs_writeback and cached.target == null);
+    try std.testing.expectEqual(@as(u64, 0), cached.guest_address);
+    try std.testing.expectEqual(@as(u64, 0), cached.sequence);
+    try std.testing.expect(!discardUnmappedCompletedFrame(&cached, memory));
+}
 
 const WindowPresentation = struct {
     native_window: NativeWindow,
@@ -6811,9 +6870,7 @@ pub const Renderer = struct {
         if (materialized) {
             for (self.completed_frames.items) |*frame| {
                 if (frame.guest_address != guest_address or !frame.needs_writeback) continue;
-                const target = frame.target orelse continue;
-                try self.commitGuestColorTarget(target, frame.pixels.items);
-                frame.needs_writeback = false;
+                try self.commitCompletedFrame(frame);
             }
         }
         self.guest_buffer_sequence +%= 1;
@@ -13813,6 +13870,7 @@ pub const Renderer = struct {
             .render_pass = render_pass,
             .framebuffer = framebuffer,
             .readback = readback,
+            .backing_was_accessible = self.colorTargetBackingAccessible(target),
         };
     }
 
@@ -15170,7 +15228,7 @@ pub const Renderer = struct {
         if (snapshot.target.descriptor.force_destination_alpha_one) {
             forceColorTargetAlphaOne(frame, snapshot.target.format);
         }
-        try self.recordGuestColorTarget(snapshot.target, frame);
+        try self.recordGuestColorTarget(snapshot.target, frame, snapshot.backing_was_accessible);
         self.render_targets.items[index].host_generation = snapshot.gpu_generation;
         self.render_targets.items[index].shader_read_layout = false;
 
@@ -15392,7 +15450,7 @@ pub const Renderer = struct {
         const frame_index = resolved_index orelse return Error.MissingPresentedFrame;
         const pixels = try self.allocator.dupe(u8, self.completed_frames.items[frame_index].pixels.items);
         defer self.allocator.free(pixels);
-        try self.recordGuestColorTarget(destination, pixels);
+        try self.recordGuestColorTarget(destination, pixels, false);
 
         for (self.render_targets.items) |*cached| {
             if (cached.target.descriptor.address != destination.descriptor.address) continue;
@@ -16323,7 +16381,7 @@ pub const Renderer = struct {
         try self.readMapped(readback, frame);
         if (guest_target) |target| {
             if (target.descriptor.force_destination_alpha_one) forceDestinationAlphaOne(frame);
-            try self.recordGuestColorTarget(target, frame);
+            try self.recordGuestColorTarget(target, frame, false);
         }
         if (frame.len == self.graphics_probe_frame.len) @memcpy(&self.graphics_probe_frame, frame);
 
@@ -16438,6 +16496,22 @@ pub const Renderer = struct {
         self.guest_color_target_writes += 1;
     }
 
+    fn commitCompletedFrame(self: *Renderer, cached: *CachedFrame) anyerror!void {
+        const target = cached.target orelse return;
+        self.commitGuestColorTarget(target, cached.pixels.items) catch |err| {
+            // A read failure alone is not evidence of deallocation. Keep
+            // reporting errors unless the embedding proves the old mapping
+            // was readable when recorded and is now missing at least a page.
+            if (err == Error.GuestMemoryReadFailed) {
+                if (self.guest_memory) |memory| {
+                    if (discardUnmappedCompletedFrame(cached, memory)) return;
+                }
+            }
+            return err;
+        };
+        cached.needs_writeback = false;
+    }
+
     /// Host rendering publishes ordinary base-surface texels. Mark every
     /// active CMASK block expanded so a later cache miss never re-applies an
     /// obsolete fast clear over those newly written pixels.
@@ -16475,7 +16549,13 @@ pub const Renderer = struct {
     /// is produced by `flushPendingGuestWrites` only when it is actually
     /// needed, so a frame with many draws costs one tile+writeback instead of
     /// one per draw.
-    fn recordGuestColorTarget(self: *Renderer, target: GuestColorTarget, frame: []const u8) anyerror!void {
+    fn colorTargetBackingAccessible(self: *Renderer, target: GuestColorTarget) bool {
+        const memory = self.guest_memory orelse return false;
+        const accessible = memory.range_accessible orelse return false;
+        return accessible(memory.context, target.descriptor.address, target.layout.required_source_bytes);
+    }
+
+    fn recordGuestColorTarget(self: *Renderer, target: GuestColorTarget, frame: []const u8, backing_was_accessible: bool) anyerror!void {
         var frame_index: ?usize = null;
         for (self.completed_frames.items, 0..) |cached, index| {
             if (cached.guest_address != target.descriptor.address) continue;
@@ -16502,10 +16582,7 @@ pub const Renderer = struct {
                 }
                 const evicted = &self.completed_frames.items[oldest_index];
                 if (evicted.needs_writeback) {
-                    if (evicted.target) |evicted_target| {
-                        try self.commitGuestColorTarget(evicted_target, evicted.pixels.items);
-                    }
-                    evicted.needs_writeback = false;
+                    try self.commitCompletedFrame(evicted);
                 }
                 frame_index = oldest_index;
             }
@@ -16523,6 +16600,7 @@ pub const Renderer = struct {
         cached.sequence = self.frame_sequence;
         cached.target = target;
         cached.needs_writeback = true;
+        cached.backing_was_accessible = backing_was_accessible or self.colorTargetBackingAccessible(target);
         self.latest_frame_index = frame_index;
     }
 
@@ -16551,9 +16629,7 @@ pub const Renderer = struct {
         }
         for (self.completed_frames.items) |*cached| {
             if (!cached.needs_writeback) continue;
-            const target = cached.target orelse continue;
-            try self.commitGuestColorTarget(target, cached.pixels.items);
-            cached.needs_writeback = false;
+            try self.commitCompletedFrame(cached);
         }
     }
 
@@ -16629,9 +16705,7 @@ pub const Renderer = struct {
         self.frame_profile.flush_htile_ns +|= elapsedHostNanoseconds(step);
         for (self.completed_frames.items) |*cached| {
             if (!cached.needs_writeback or cached.guest_address != address) continue;
-            const target = cached.target orelse continue;
-            try self.commitGuestColorTarget(target, cached.pixels.items);
-            cached.needs_writeback = false;
+            try self.commitCompletedFrame(cached);
             return;
         }
     }

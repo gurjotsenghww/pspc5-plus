@@ -1068,6 +1068,10 @@ pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     return true;
 }
 
+pub fn guestRangeAccessible(_: ?*anyopaque, address: u64, size: usize) bool {
+    return resolveGuestMemoryAddress(address, size) != null;
+}
+
 /// Only ordinary, disjoint guest backing can combine word-copy
 /// callbacks. Command arenas and their labels retain the narrow-write guards
 /// and snapshot mirroring, and host-owned video labels never pass this proof.

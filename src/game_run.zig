@@ -64,6 +64,7 @@ fn openSaveDataHome(io: std.Io, content: std.Io.Dir) !std.Io.Dir {
 
 const save_data_home = "savedata";
 const download_data_home = "out/download0";
+const temporary_data_home = "out/temp0";
 const terminator_2d_title_id = "PPSA25872";
 const tetris_effect_connected_title_id = "PPSA07923";
 const yotei_title_id = "PPSA26344";
@@ -101,15 +102,14 @@ fn readTitleIdentifier(io: std.Io, content: std.Io.Dir, storage: []u8) ?[]const 
 }
 
 /// Prepares writable, per-title generated/downloaded data. Unreal titles use
-/// this mount for staged configuration and caches even when no network content
-/// is involved, so treating a missing `/download0` as read-only can leave them
-/// indefinitely probing fallback platform configurations.
-fn openDownloadData(io: std.Io, title_identifier: []const u8) !std.Io.Dir {
+/// these mounts for staged configuration, caches and temporary saves. Keep
+/// generated data writable without changing the installed title directory.
+fn openWritableTitleData(io: std.Io, home: []const u8, title_identifier: []const u8) !std.Io.Dir {
     const savedata = runtime.firmware.savedata;
     var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
     const safe_identifier = savedata.sanitizeName(title_identifier, &identifier_storage);
     var path_storage: [savedata.maximum_path]u8 = undefined;
-    const path = savedata.joinPath(&path_storage, &.{ download_data_home, safe_identifier }) orelse
+    const path = savedata.joinPath(&path_storage, &.{ home, safe_identifier }) orelse
         return error.NameTooLong;
 
     const cwd = std.Io.Dir.cwd();
@@ -464,7 +464,7 @@ fn run(init: std.process.Init) !bool {
     var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
     const title_identifier = readTitleIdentifier(io, content, &title_identifier_storage) orelse "";
 
-    var download_data: ?std.Io.Dir = openDownloadData(io, title_identifier) catch |err| blk: {
+    var download_data: ?std.Io.Dir = openWritableTitleData(io, download_data_home, title_identifier) catch |err| blk: {
         try stderr.print("cannot prepare /download0: {s}\n", .{@errorName(err)});
         try stderr.flush();
         break :blk null;
@@ -472,6 +472,18 @@ fn run(init: std.process.Init) !bool {
     defer if (download_data) |*directory| directory.close(io);
     if (download_data) |directory| runtime.firmware.filesystem.attachDownloadData(directory);
     defer runtime.firmware.filesystem.detachDownloadData();
+
+    // Unity validates the mount returned by AppContent before publishing its
+    // temporaryCachePath. A successful mount backed by no filesystem produced
+    // an empty path and stopped new-save creation before loading a level.
+    var temporary_data: ?std.Io.Dir = openWritableTitleData(io, temporary_data_home, title_identifier) catch |err| blk: {
+        try stderr.print("cannot prepare /temp0: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        break :blk null;
+    };
+    defer if (temporary_data) |*directory| directory.close(io);
+    if (temporary_data) |directory| runtime.firmware.filesystem.attachTemporaryData(directory);
+    defer runtime.firmware.filesystem.detachTemporaryData();
 
     // A contained fault prints the retained calls afterwards, but a process
     // that dies outright takes the buffer with it. This is the escape hatch for
@@ -958,6 +970,7 @@ fn run(init: std.process.Init) !bool {
             .context = if (enable_gpu_page_tracker) address_space else null,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
+            .range_accessible = runtime.firmware.libs.agc_submit.guestRangeAccessible,
             .can_batch_copy = runtime.firmware.libs.agc_submit.canBatchGuestCopy,
             // Images must detect native CPU writes even without page tracking.
             // Repeated full-buffer hashing is controlled separately by

@@ -98,6 +98,16 @@ bootstrap. The live path can translate guest vertex/pixel shaders, fetch AGC
 vertex attributes, sample title textures, and present multi-draw frames, though
 render-state and surface-format coverage remains incomplete.
 
+Guest suspension signals are delivered cooperatively at HLE wait and sleep
+boundaries. Firmware uses a separate host stack, so the signal context must
+refer to the interrupted stack. The stack-switch assembly spills the six SysV
+nonvolatile GPRs there and retains its address for nested firmware calls. The
+PS5 exception context exposes those registers and RSP at offset `0xf8`, keeping
+live guest roots visible to conservative garbage collection. Passing a local
+on the firmware stack instead could allow Unity to collect objects still held
+by a sleeping worker. Regression tests cover a register-only root and the
+caller-stack scan interval.
+
 ## Roadmap
 
 1. Introduce import transition stubs with Windows unwind metadata, host-stack
