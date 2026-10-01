@@ -11388,6 +11388,8 @@ pub const Renderer = struct {
                 result.storage_image_mapping_count,
                 inst.imageResourceWords(),
             )) orelse {
+                if (!writable and bindings.stage == .compute and
+                    try resolveUniformNullImage(bindings, reader, analysis, instruction_scalar, inst)) continue;
                 if (!writable and bindings.stage == .compute and self.sampled_image_nonuniform_indexing) {
                     if (try resolveBufferImageCandidates(bindings, reader, analysis, instruction_scalar, inst)) |candidates| {
                         var compressed = true;
@@ -11587,7 +11589,9 @@ pub const Renderer = struct {
                 descriptor_slot,
                 inst.imageResourceWords(),
             );
-            const candidates = if (direct_image == null and self.sampled_image_nonuniform_indexing)
+            const candidates = if (direct_image == null and try resolveUniformNullImage(bindings, reader, analysis, instruction_scalar, inst))
+                BufferImageCandidates{}
+            else if (direct_image == null and self.sampled_image_nonuniform_indexing)
                 try resolveBufferImageCandidates(bindings, reader, analysis, instruction_scalar, inst)
             else
                 null;
@@ -21664,8 +21668,9 @@ pub const Renderer = struct {
         target: GuestColorTarget,
         extra_colors: []const GuestColorTarget,
     ) anyerror!bool {
-        if (!self.sampled_image_nonuniform_indexing) return false;
-        const candidates = (try resolveBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
+        const uniform_null = try resolveUniformNullImage(bindings, reader, analysis, scalar, inst);
+        if (!uniform_null and !self.sampled_image_nonuniform_indexing) return false;
+        const candidates = if (uniform_null) BufferImageCandidates{} else (try resolveBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
         // Graphics has no dispatch fault readback; keep its previous strict
         // behavior until an equivalent draw-completion check is available.
         if (candidates.requires_null_check) return false;
@@ -34431,6 +34436,29 @@ fn scalarRegistersAtCheckpoint(
     }
     std.debug.assert(low < pcs.len and pcs[low] == pc);
     return &snapshots[low];
+}
+
+fn resolveUniformNullImage(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
+    inst: gpu.ShaderInstruction,
+) anyerror!bool {
+    // RDNA2 defines an all-zero resource as unbound (reads return 0,0,0,0).
+    // Prove the whole tuple through reaching definitions. An unknown load,
+    // arbitrary zero-filled snapshot or malformed nonzero T# is not proof.
+    var resolver = gpu.scalar_resources.Resolver{
+        .bindings = bindings,
+        .reader = reader,
+        .instructions = analysis.program.instructions.items,
+        .graph = &analysis.graph,
+        .snapshot = scalar,
+        .definition_cache = analysis.scalar_definitions,
+    };
+    var words: [8]u32 = undefined;
+    const tuple = words[0..inst.imageResourceWords()];
+    return try resolver.words(inst.src1.reg, inst.pc, tuple) and std.mem.allEqual(u32, tuple, 0);
 }
 
 /// Recovers one T# from any lane of a scalar pointer load.  Compilers commonly

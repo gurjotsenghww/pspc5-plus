@@ -10046,6 +10046,68 @@ fn runIndexedImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("indexed images passed: material-to-global tables, SGPR/VCC_LO/VCC_HI indices, large record scan, wrapping multiply/shift, mixed views, exact aliases and both bounds\n", .{});
 }
 
+fn runUniformNullImageProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |compact| for ([_]bool{ false, true }) |pointer| for ([_]bool{ false, true }) |fetch| for ([_]bool{ false, true }) |nonuniform| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        renderer.sampled_image_nonuniform_indexing = nonuniform;
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        var code: std.ArrayList(u32) = .empty;
+        defer code.deinit(allocator);
+        if (pointer) {
+            // Coalesced load after five pointer links, with the final pointer
+            // sharing SGPRs that were used by an earlier link.
+            for (0..5) |i| {
+                const destination: u32 = @intCast(20 + i * 2);
+                const source: u32 = @intCast(if (i == 0) 0 else 18 + i * 2);
+                try code.appendSlice(allocator, &.{ 0xf404_0000 | (destination << 6) | (source >> 1), 125 << 25 });
+                guest.word(0x1000 + i * 128, @intCast(0x1000 + (i + 1) * 128));
+            }
+            try code.appendSlice(allocator, &.{ 0xf410_0000 | (20 << 6) | 14, 125 << 25 }); // s_load_dwordx16 s20,s28
+        }
+        try code.appendSlice(allocator, &.{ vop1(1, 0, 128), vop1(1, 1, 128) });
+        const r128: u32 = if (compact) 1 << 15 else 0;
+        if (fetch) try code.appendSlice(allocator, &.{ 0xf000_0f08 | r128, 0x0005_0400 }) else try code.appendSlice(allocator, &.{ 0xf09c_0f0a | r128, 0x0045_0400, 1 });
+        try code.appendSlice(allocator, &mubuf(0x1e, 0, 4, 0, 12));
+        try code.append(allocator, 0xbf81_0000);
+        for (code.items, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 28 << 1);
+        var userdata: [28]u32 = @splat(0);
+        userdata[0] = 0x1000;
+        @memcpy(userdata[12..16], &[_]u32{ 0x13000, 16 << 16, 1, 0 });
+        guest.word(0x8000, 0xff0000ff);
+        // Null -> valid -> null must refresh the same program and SGPRs.
+        // Nonzero malformed data must still fail, not become another null.
+        for (0..4) |pass| {
+            var descriptor: [8]u32 = @splat(0);
+            if (pass == 1) descriptor = sampledImageDescriptorWords(0x8000, 1, 1);
+            if (pass == 3) descriptor[0] = 0xdeadbeef;
+            if (pointer) {
+                for (descriptor, 0..) |word, i| guest.word(0x1280 + i * 4, word);
+            } else @memcpy(userdata[20..28], &descriptor);
+            for (userdata, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+            @memset(guest.bytes[0x13000..][0..32], 0xa5);
+            if (pass == 3) {
+                _ = renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }) catch |err| {
+                    try std.testing.expect(err == error.UnsupportedSampledImage or err == error.UnsupportedStorageImage);
+                    continue;
+                };
+                return error.MalformedImageAccepted;
+            }
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var output: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x13000, &output);
+            for (0..4) |i| try std.testing.expectEqual(@as(u32, if (pass == 1 and (i == 0 or i == 3)) 0x3f800000 else 0), std.mem.readInt(u32, output[i * 4 ..][0..4], .little));
+            try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x13010..][0..16], 0xa5));
+        }
+        std.debug.print("uniform null image passed compact={} pointer={} fetch={} nonuniform={}\n", .{ compact, pointer, fetch, nonuniform });
+    };
+}
+
 fn runInactiveImageTableProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -11330,11 +11392,14 @@ fn runMaskedPointerImageProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runGraphicsDescriptorReuseProbe(allocator: std.mem.Allocator) !void {
-    for (0..4) |case_index| {
+    for (0..7) |case_index| {
         const array_first = case_index == 1;
-        const query_lod = case_index >= 2;
+        const query_lod = case_index == 2 or case_index == 3;
+        const null_first = case_index == 4 or case_index == 6;
+        const null_second = case_index >= 5;
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
+        if (case_index >= 4) renderer.sampled_image_nonuniform_indexing = false;
         var guest = GuestMemory{};
         const vertex = [_]u32{
             vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
@@ -11370,9 +11435,9 @@ fn runGraphicsDescriptorReuseProbe(allocator: std.mem.Allocator) !void {
         for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
         for (fragment, 0..) |word, index| guest.word(0x900 + index * 4, word);
         const extent: u32 = if (query_lod) 4 else 1;
-        var first = sampledImageDescriptorWords(0x10000, extent, extent);
+        var first: [8]u32 = if (null_first) @splat(0) else sampledImageDescriptorWords(0x10000, extent, extent);
         if (array_first) first[3] = (first[3] & 0x0fff_ffff) | (13 << 28);
-        const second = sampledImageDescriptorWords(0x11000, 1, 1);
+        const second: [8]u32 = if (null_second) @splat(0) else sampledImageDescriptorWords(0x11000, 1, 1);
         for (first, 0..) |word, index| guest.word(0x18000 + index * 4, word);
         for (second, 0..) |word, index| guest.word(0x18020 + index * 4, word);
         guest.word(0x10000, 0xff00_00ff);
@@ -11400,10 +11465,12 @@ fn runGraphicsDescriptorReuseProbe(allocator: std.mem.Allocator) !void {
         if (renderer.last_draw_error) |err| return err;
         try renderer.flushPendingGuestWrites();
         const center = 0x2000 + (32 * 64 + 32) * 4;
-        try std.testing.expectEqual(@as(u32, if (query_lod) 0xff00_00ff else 0xffff_00ff), std.mem.readInt(u32, guest.bytes[center..][0..4], .little));
-        try std.testing.expectEqual(@as(u64, if (query_lod) 1 else 2), renderer.texture_cache_misses);
+        const expected_color: u32 = 0xff00_0000 | (if (null_first) @as(u32, 0) else 0xff) | (if (query_lod or null_second) @as(u32, 0) else 0xff0000);
+        try std.testing.expectEqual(expected_color, std.mem.readInt(u32, guest.bytes[center..][0..4], .little));
+        const expected_images: u64 = @intFromBool(!null_first) + @as(u64, @intFromBool(!query_lod and !null_second));
+        try std.testing.expectEqual(expected_images, renderer.texture_cache_misses);
     }
-    std.debug.print("graphics descriptor reuse passed: 2D/array sample followed by 2D gather, distinct images, repeated physical binding and query-only LOD masks\n", .{});
+    std.debug.print("graphics descriptor reuse passed: 2D/array sample followed by 2D gather, distinct images, repeated physical binding, query-only LOD masks and uniform null sample/gather without nonuniform indexing\n", .{});
 }
 
 fn runUnsupportedTextureContinuationProbe(allocator: std.mem.Allocator) !void {
@@ -11733,6 +11800,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--shifted-images")) {
         try runShiftedImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--uniform-null-images")) {
+        try runUniformNullImageProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--inactive-image-tables")) {

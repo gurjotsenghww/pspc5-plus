@@ -93,11 +93,17 @@ pub const Resolver = struct {
     snapshot: *const scalar.ScalarRegisters,
     remaining: usize = 512,
     memoize_definitions: bool = true,
+    memoize_values: bool = true,
     definition_cache: ?*definitions.ScalarDefinitionCache = null,
     definition_batch: definitions.ScalarDefinitionBatch = undefined,
     batch_enabled: bool = false,
+    // Values belong to one descriptor recovery. A later invocation must read
+    // fresh guest memory, even when its reaching definitions are unchanged.
+    values: [64]struct { before: usize, register: u32, value: u32 } = undefined,
+    valid_values: u64 = 0,
 
     pub fn words(self: *Resolver, register: u32, before_pc: u32, output: []u32) !bool {
+        self.valid_values = 0;
         self.batch_enabled = self.memoize_definitions and definition_cache_enabled.load(.monotonic);
         self.definition_batch = .{ .instructions = self.instructions, .graph = self.graph };
         if (self.batch_enabled and persistent_definition_cache_enabled.load(.monotonic)) {
@@ -134,9 +140,24 @@ pub const Resolver = struct {
     }
 
     fn word(self: *Resolver, requested_register: u32, before: usize, depth: u8) anyerror!?u32 {
-        var register = requested_register;
-        if (register >= scalar.maximum_scalar_registers or depth >= 24 or self.remaining == 0) return null;
+        if (requested_register >= scalar.maximum_scalar_registers or depth >= 24 or self.remaining == 0) return null;
+        const slot: u6 = @truncate((before *% 37) ^ (@as(usize, requested_register) *% 17));
+        const mask = @as(u64, 1) << slot;
+        if (self.memoize_values and self.valid_values & mask != 0) {
+            const known = self.values[slot];
+            if (known.before == before and known.register == requested_register) return known.value;
+        }
         self.remaining -= 1;
+        const result = try self.recoverWord(requested_register, before, depth);
+        if (self.memoize_values) if (result) |value| {
+            self.values[slot] = .{ .before = before, .register = requested_register, .value = value };
+            self.valid_values |= mask;
+        };
+        return result;
+    }
+
+    fn recoverWord(self: *Resolver, requested_register: u32, before: usize, depth: u8) anyerror!?u32 {
+        var register = requested_register;
         const direct_definition = if (self.batch_enabled)
             self.definition_batch.lookup(before, register)
         else
@@ -599,6 +620,84 @@ test "scalar resource offsets recover wrapping multiplication before register re
     try std.testing.expect(!try resolver.words(4, 8, &value));
 }
 
+test "nested descriptor recovery shares pointer work and refreshes between calls" {
+    const M = struct {
+        data: [2048]u8 = @splat(0),
+        reads: usize = 0,
+        fn read(context: ?*anyopaque, address: u64, out: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < 0x1000 or address + out.len > 0x1000 + self.data.len) return false;
+            self.reads += 1;
+            @memcpy(out, self.data[@intCast(address - 0x1000)..][0..out.len]);
+            return true;
+        }
+    };
+    var memory = M{};
+    var instructions: [7]rdna2.Instruction = undefined;
+    // Six uniform pointer levels require exponentially many reads if each
+    // descriptor word independently follows both halves of every pointer.
+    for (0..5) |i| {
+        std.mem.writeInt(u64, memory.data[i * 128 ..][0..8], 0x1000 + (i + 1) * 128, .little);
+        instructions[i] = .{ .pc = @intCast(i * 8), .opcode = .s_load_dwordx2, .dst = .{ .kind = .sgpr, .reg = @intCast(4 + i * 2) }, .src0 = .{ .kind = .sgpr, .reg = @intCast(if (i == 0) 0 else 2 + i * 2) }, .src1 = .{ .kind = .null }, .data_words = 2 };
+    }
+    const expected = [_]u32{ 0x321, 0x400, 0x222, 0x94000000, 0x123, 0, 0, 0 };
+    for (expected, 0..) |word, i| std.mem.writeInt(u32, memory.data[640 + i * 4 ..][0..4], word, .little);
+    instructions[5] = .{ .pc = 40, .opcode = .s_load_dwordx8, .dst = .{ .kind = .sgpr, .reg = 36 }, .src0 = .{ .kind = .sgpr, .reg = 12 }, .src1 = .{ .kind = .null }, .data_words = 8 };
+    instructions[6] = .{ .pc = 48, .opcode = .s_endpgm };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x1000;
+    const snapshot = scalar.Evaluation{};
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
+    var actual: [8]u32 = undefined;
+    try std.testing.expect(try resolver.words(36, 48, &actual));
+    try std.testing.expectEqualSlices(u32, &expected, &actual);
+    try std.testing.expect(memory.reads <= 32);
+    const cached_reads = memory.reads;
+    resolver.memoize_values = false;
+    resolver.remaining = 4096;
+    memory.reads = 0;
+    try std.testing.expect(try resolver.words(36, 48, &actual));
+    try std.testing.expectEqualSlices(u32, &expected, &actual);
+    try std.testing.expect(memory.reads > cached_reads * 4);
+    std.debug.print("nested descriptor reads: uncached={d} cached={d}\n", .{ memory.reads, cached_reads });
+    resolver.memoize_values = true;
+    // Change an intermediate pointer and the payload, reusing the Resolver.
+    std.mem.writeInt(u64, memory.data[512..520], 0x1400, .little);
+    for (expected, 0..) |word, i| std.mem.writeInt(u32, memory.data[1024 + i * 4 ..][0..4], word + 7, .little);
+    resolver.remaining = 512;
+    try std.testing.expect(try resolver.words(36, 48, &actual));
+    for (expected, actual) |word, value| try std.testing.expectEqual(word + 7, value);
+    std.mem.writeInt(u64, memory.data[512..520], 0x9000, .little);
+    resolver.remaining = 512;
+    try std.testing.expectError(error.MemoryReadFailed, resolver.words(36, 48, &actual));
+}
+
+test "scalar resource value reuse keeps the reaching instruction in its key" {
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    };
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .integer_inline_constant, .value = 13 } },
+        .{ .pc = 4, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 16 }, .src0 = .{ .kind = .sgpr, .reg = 4 } },
+        .{ .pc = 8, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .integer_inline_constant, .value = 29 } },
+        .{ .pc = 12, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 17 }, .src0 = .{ .kind = .sgpr, .reg = 4 } },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    const bindings = std.mem.zeroes(shaders.StageBindings);
+    const snapshot = scalar.Evaluation{};
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
+    var words: [2]u32 = undefined;
+    try std.testing.expect(try resolver.words(16, 16, &words));
+    try std.testing.expectEqualSlices(u32, &.{ 13, 29 }, &words);
+}
+
 test "scalar resource recovery follows nested loads after USER_DATA reuse" {
     const Memory = struct {
         data: [256]u8 = @splat(0),
@@ -644,6 +743,8 @@ test "scalar resource recovery follows nested loads after USER_DATA reuse" {
     var cache = definitions.ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
     defer cache.deinit();
     var words: [4]u32 = undefined;
+    // This comparison isolates definition lookup caching, not value reuse.
+    resolver.memoize_values = false;
     var reference_reads: usize = 0;
     var reference_remaining: usize = 0;
     for (0..4) |mode| {
