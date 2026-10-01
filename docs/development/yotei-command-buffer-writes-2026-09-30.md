@@ -220,3 +220,7 @@ The indexed implementation is validated in `out/yotei-command-index-20260930/`;
 its runtime log, state samples and shader inventory are in
 `out/yotei-command-index-run-20260930/`. Raw guest shader code stays local.
 See the preceding [buffer-layout report](yotei-buffer-layout-2026-09-30.md).
+
+The [October 1 follow-up](yotei-null-images-2026-10-01.md) identifies a proven
+uniform-null texture failure, reduces repeated scalar pointer recovery, and
+records the installed runner's remaining GPU wait and invalid indirect data.
