@@ -325,6 +325,60 @@ test "mapping identities survive splits and reject remapped allocation backing" 
     try std.testing.expectEqual(@as(u64, 0), space.mappingIdentity(std.math.maxInt(u64), 2));
 }
 
+test "read lease holds backing across a concurrent unmap and rejects released ranges" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const base = user.start;
+    var space = try AddressSpace.init(std.testing.allocator);
+    defer space.deinit();
+    try space.mapFixed(base, 2 * page_size, .read_write, .private, null);
+    try space.writeInt(u32, base, 0x12345678);
+    try space.protect(base + page_size, page_size, .read_only);
+    var lease = space.borrowReadable(base, 2 * page_size).?;
+    var held = true;
+    const Shared = struct {
+        space: *AddressSpace,
+        started: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        failure: ?Error = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.space.unmap(user.start, 2 * page_size) catch |err| {
+                self.failure = err;
+            };
+            self.finished.store(true, .release);
+        }
+    };
+    var shared = Shared{ .space = &space };
+    const worker = std.Thread.spawn(.{}, Shared.run, .{&shared}) catch |err| {
+        lease.release();
+        return err;
+    };
+    defer {
+        if (held) lease.release();
+        worker.join();
+    }
+    while (!shared.started.load(.acquire)) std.atomic.spinLoopHint();
+    const expected = std.hash.Wyhash.hash(0, lease.bytes);
+    for (0..128) |_| {
+        try std.testing.expectEqual(expected, std.hash.Wyhash.hash(0, lease.bytes));
+        try std.testing.expect(!shared.finished.load(.acquire));
+    }
+    try std.testing.expectEqual(@as(u32, 0x12345678), std.mem.readInt(u32, lease.bytes[0..4], .little));
+    lease.release();
+    held = false;
+    while (!shared.finished.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expect(shared.failure == null);
+    try std.testing.expect(space.borrowReadable(base, 4) == null);
+    try std.testing.expect(space.borrowReadable(0, 1) == null);
+    try std.testing.expect(space.borrowReadable(std.math.maxInt(u64), 2) == null);
+    // CRT and host-stack sources keep the native allocation fallback.
+    const host_bytes = "host source";
+    var host_lease = space.borrowReadable(@intFromPtr(host_bytes.ptr), host_bytes.len).?;
+    defer host_lease.release();
+    try std.testing.expectEqualStrings(host_bytes, host_lease.bytes);
+}
+
 pub const Error = error{
     UnsupportedHost,
     AddressSpaceUnavailable,
@@ -766,6 +820,36 @@ pub const AddressSpace = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.coversWithProtectionLocked(address, size, .read);
+    }
+
+    pub const ReadLease = struct {
+        bytes: []const u8,
+        space: *AddressSpace,
+
+        pub fn release(self: *ReadLease) void {
+            self.space.mutex.unlock();
+            self.* = undefined;
+        }
+    };
+
+    /// Keep guest unmap/protect operations out of a native read or hash. The
+    /// caller must release the lease before calling another AddressSpace API.
+    /// Host-owned CRT memory retains its accessibility fallback; this lock
+    /// only serializes mappings owned by this address space, not CRT frees.
+    pub fn borrowReadable(self: *AddressSpace, address: u64, size: usize) ?ReadLease {
+        if (size != 0 and address == 0) return null;
+        _ = std.math.add(u64, address, size) catch return null;
+        self.mutex.lock();
+        if (size != 0 and !self.coversWithProtectionLocked(address, size, .read) and
+            !isHostRangeReadable(address, size))
+        {
+            self.mutex.unlock();
+            return null;
+        }
+        return .{
+            .bytes = if (size == 0) &.{} else @as([*]const u8, @ptrFromInt(address))[0..size],
+            .space = self,
+        };
     }
 
     /// Whether every byte is backed by committed, CPU-writable guest pages.

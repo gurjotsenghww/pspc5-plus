@@ -422,6 +422,10 @@ pub fn reportDirectMemoryAliases(label: []const u8, address: u64) void {
     }
 }
 
+pub fn attachedAddressSpace() ?*memory.AddressSpace {
+    return @atomicLoad(?*memory.AddressSpace, &guest_address_space, .acquire);
+}
+
 pub fn isGuestRangeAccessible(address: u64, length: u64) bool {
     if (length == 0) return true;
     if (address == 0) return false;

@@ -1064,8 +1064,22 @@ fn findSubmissionHeaderCollision(address: u64, byte_length: usize) ?SubmissionHe
     return null;
 }
 
-pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+fn borrowGuestRead(space: *guest_address_space.AddressSpace, address: u64, size: usize) ?guest_address_space.AddressSpace.ReadLease {
+    if (space.borrowReadable(address, size)) |lease| return lease;
+    // Alias lookup never holds its lock while acquiring the mapping lock.
+    // Only the newest matching arena can supply backing for compact labels.
+    const alias = findSubmissionAlias(address, size) orelse return null;
+    return space.borrowReadable(alias, size);
+}
+
+pub fn readGuestMemory(context: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (video_out.readLabelMemory(address, bytes)) return true;
+    if (addressSpaceFromContext(context) orelse memory.attachedAddressSpace()) |space| {
+        var lease = borrowGuestRead(space, address, bytes.len) orelse return false;
+        defer lease.release();
+        gpu.parallel_copy.guest_copy_pool.copy(bytes, lease.bytes);
+        return true;
+    }
     // Prefer a known AGC arena alias. Compact GPU VAs live in the broad guest
     // reservation too, but do not necessarily have committed CPU pages there.
     const resolved = resolveGuestMemoryAddress(address, bytes.len) orelse return false;
@@ -1162,7 +1176,12 @@ test "batched guest copies require disjoint physical backing and ordinary buffer
     try testing.expect(canBatchGuestCopy(&space, base, base + page + 128, 64));
 }
 
-pub fn fingerprintGuestMemory(_: ?*anyopaque, address: u64, size: usize) ?u64 {
+pub fn fingerprintGuestMemory(context: ?*anyopaque, address: u64, size: usize) ?u64 {
+    if (addressSpaceFromContext(context) orelse memory.attachedAddressSpace()) |space| {
+        var lease = borrowGuestRead(space, address, size) orelse return null;
+        defer lease.release();
+        return gpu.parallel_copy.fingerprint(lease.bytes);
+    }
     const resolved = resolveGuestMemoryAddress(address, size) orelse return null;
     const source: [*]const u8 = @ptrFromInt(resolved);
     return gpu.parallel_copy.fingerprint(source[0..size]);
@@ -4617,6 +4636,9 @@ test "compact command aliases reject released backing without reviving older are
     var word: u32 = 0;
     try testing.expect(readGuestMemory(null, compact_address, std.mem.asBytes(&word)));
     try testing.expectEqual(@as(u32, 0x5678), word);
+    const expected_hash = gpu.parallel_copy.fingerprint(std.mem.asBytes(&word));
+    try testing.expectEqual(@as(?u64, expected_hash), fingerprintGuestMemory(null, compact_address, 4));
+    try testing.expectEqual(@as(?u64, expected_hash), fingerprintGuestMemory(&address_space, newer_address + 28, 4));
 
     try address_space.unmap(newer_address, page);
     try testing.expectEqual(@as(?u64, null), resolveSubmissionAlias(compact_address, 4));
