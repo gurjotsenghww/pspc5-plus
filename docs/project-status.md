@@ -34,6 +34,17 @@ supplied locally and is not included in this repository.
 | **Mighty Morphin Power Rangers: Rita's Rewind**<br><img src="images/ritas-rewind-gameplay.png" width="240" alt="Rita's Rewind gameplay with the Red Ranger in the Command Center"> | **Playable · Completable** | Playthrough confirmed by the maintainer on September 24, 2026. The publisher sequence, title menu, and gameplay render and respond to controller input; the capture shows the Red Ranger in the Command Center training stage with the HUD, health bar, objectives, and button prompts. Native cooperative fibers retain suspended guest stacks, and exact `V_SAD_U32`, `V_MUL_HI_I32`, and `V_CVT_FLR_I32_F32` lowering removes the diagnostic shader fallback. The exact guest CRT composite still produces static on the current host, so a strict shader-signature fallback performs the observed 4× RGBA8 scene scale before post-processing. [Gameplay capture](images/ritas-rewind-gameplay.png) |
 | **Ghost of Yōtei**<br><img src="images/yotei-null-images-bonus.png" width="240" alt="Ghost of Yotei Digital Deluxe Bonus notice before the October 1 GPU wait"> | **Intro playback · bonus notices · brightness calibration · reaches in-game scenes · not playable** | **October 1 follow-up:** proven all-zero textures now use unbound-image semantics instead of rejecting the shader. Scalar descriptor recovery reuses intermediate values within one call; a nested fixture drops from 504 reads to 18 and is about 4.6× faster in isolation. This is not a game FPS result. Fourteen scalar tests, 16 compute null-image configurations, seven graphics cases and seven neighboring GPU probes pass. Two checks of the installed runner stop before the tree, awaiting GPU completion at flips 740 and 748, and are deliberately terminated after diagnostics. Both record the same last compute program and wait path. Snapshots of 636 and 619 programs have no unknown decoded opcode, and eight retained SPIR-V modules pass validation; runtime correctness remains unverified. A transition frame takes 167.2 seconds, including 164.8 seconds creating 206 compute pipelines. Invalid indirect draws and the control run's corrupt-count failure remain unresolved. Prior runs reached the tree with streaks and excessive brightness; those defects are not established as fixed. Gameplay and 30 FPS remain unverified. Public release archives are unchanged. [Null-image correction, benchmark and live checks](development/yotei-null-images-2026-10-01.md) · [New bonus-notice capture](images/yotei-null-images-bonus.png) · [Earlier tree and command-write evidence](development/yotei-command-buffer-writes-2026-09-30.md) |
 
+## Package extraction checks
+
+**October 2, 2026 — Grand Theft Auto III: The Definitive Edition,
+PPSA03527 v1.007:** corrected NAPS block-table alignment removes the
+`InvalidPfs` failure after CNT metadata extraction. The debug package now
+extracts all 48 files, including `eboot.bin`, six modules and both PAK archives;
+both PAK index checksums match. All 21 package tests pass. The local extractor
+is updated; public release archives are unchanged. This is an extraction
+check only, with game execution and compatibility untested.
+[Failure, fix and validation](development/gta3-pkg-extraction-2026-10-02.md).
+
 ## Screenshots
 
 ![Subnautica Below Zero snowy opening area after the sRGB lighting fix](images/subnautica-below-zero-srgb.png)

@@ -166,7 +166,8 @@ pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
     if (blob.len < map_end) return error.TruncatedNaps;
 
     // Outer digests and shuffle entries are 8-byte records packed after the
-    // header; only the file-offset and u2c tables are padded to 16 bytes.
+    // header. The file-offset table is padded to 16 bytes; the u2c table
+    // ends on an 8-byte boundary, which need not also be 16-byte aligned.
     var pos: usize = header_size;
     pos += @as(usize, counts.num_outer_blocks) * outer_stride;
     pos += @as(usize, counts.num_shuffle) * shuffle_stride;
@@ -184,7 +185,7 @@ pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
     pos += fidx_n * file_offset_stride;
     pos = std.mem.alignForward(usize, pos, 16);
     pos += @as(usize, counts.numU2c()) * u2c_stride;
-    pos = std.mem.alignForward(usize, pos, 16);
+    pos = std.mem.alignForward(usize, pos, 8);
 
     const cblocks = allocator.alloc(CblockInfo, counts.num_cblock_info) catch return error.TruncatedNaps;
     errdefer allocator.free(cblocks);
@@ -202,7 +203,7 @@ fn sectionEnd(counts: Counts, fidx_n: usize) usize {
     var pos = header_size + @as(usize, counts.num_outer_blocks) * outer_stride;
     pos += @as(usize, counts.num_shuffle) * shuffle_stride;
     pos = std.mem.alignForward(usize, pos + fidx_n * file_offset_stride, 16);
-    pos = std.mem.alignForward(usize, pos + @as(usize, counts.numU2c()) * u2c_stride, 16);
+    pos = std.mem.alignForward(usize, pos + @as(usize, counts.numU2c()) * u2c_stride, 8);
     return pos + @as(usize, counts.num_cblock_info) * cblock_stride;
 }
 
@@ -266,4 +267,27 @@ test "NAPS preserves the high bit of the first Kraken chunk length" {
     try std.testing.expectEqual(@as(u32, 0x22), rec.krakenFlags());
     const stored = try decodeCblock(&.{ 0x0a, 0x00, 0xa2, 0x24, 0xc3, 0xff, 0xff, 0x04, 0x00 });
     try std.testing.expectEqual(@as(u32, 0x20000), stored.evenComp());
+}
+
+test "CblockInfo starts after 8-byte u2c padding even when not 16-byte aligned" {
+    var blob: [96]u8 = @splat(0);
+    // Two file offsets, one outer digest, nine ublocks: two u2c entries.
+    std.mem.writeInt(u64, blob[0..8], 1 | (@as(u64, 9) << 32), .little);
+    std.mem.writeInt(u64, blob[8..16], 1, .little);
+    blob[32] = 0x24; // terminal mount size 0x240000
+    blob[35] = 0x40;
+    // fidx ends at 36, u2c occupies 48..68. CblockInfo starts at 72,
+    // not 80; optional padding after its two records is not another record.
+    blob[74] = 4; // run-base marker
+    blob[81] = 10; // first data record's compressed offset
+    for ([_]usize{ 90, blob.len }) |len| {
+        var layout = try parse(std.testing.allocator, blob[0..len]);
+        defer layout.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 0x240000), layout.mountSize());
+        try std.testing.expectEqual(@as(usize, 2), layout.cblocks.len);
+        try std.testing.expect(layout.cblocks[0].is_run_base);
+        try std.testing.expect(!layout.cblocks[1].is_run_base);
+        try std.testing.expectEqual(@as(u64, 10), layout.cblocks[0].runOnDisk(layout.cblocks[1]));
+    }
+    try std.testing.expectError(error.TruncatedNaps, parse(std.testing.allocator, blob[0..89]));
 }
