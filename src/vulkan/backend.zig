@@ -31734,6 +31734,7 @@ fn scalarPrefixEnd(analysis: *const gpu.ShaderAnalysis) u32 {
 const NggLdsWord = struct {
     present: bool = false,
     source: gpu.ShaderOperand = .{},
+    instruction_index: usize = 0,
 };
 
 fn sameShaderOperand(a: gpu.ShaderOperand, b: gpu.ShaderOperand) bool {
@@ -31756,11 +31757,12 @@ fn recordNggLdsWord(
     words: *[64]NggLdsWord,
     offset: i32,
     source: gpu.ShaderOperand,
+    instruction_index: usize,
 ) void {
     if (offset < 0 or offset & 3 != 0) return;
     const word: usize = @intCast(@divTrunc(offset, 4));
     if (word >= words.len or words[word].present) return;
-    words[word] = .{ .present = true, .source = source };
+    words[word] = .{ .present = true, .source = source, .instruction_index = instruction_index };
 }
 
 fn shaderOperandConstantBefore(
@@ -31823,8 +31825,8 @@ fn inferNggLdsExports(
         if (!sameShaderOperand(base.?, inst.src0)) continue;
         switch (inst.opcode) {
             .ds_write2_b32 => {
-                recordNggLdsWord(&words, inst.memory_offset, inst.src1);
-                recordNggLdsWord(&words, inst.secondary_memory_offset, inst.src2);
+                recordNggLdsWord(&words, inst.memory_offset, inst.src1, index);
+                recordNggLdsWord(&words, inst.secondary_memory_offset, inst.src2, index);
             },
             .ds_write_b32, .ds_write_b64, .ds_write_b96, .ds_write_b128 => {
                 const count: u8 = switch (inst.opcode) {
@@ -31841,6 +31843,7 @@ fn inferNggLdsExports(
                         &words,
                         inst.memory_offset + @as(i32, component) * 4,
                         source,
+                        index,
                     );
                 }
             },
@@ -31853,8 +31856,8 @@ fn inferNggLdsExports(
     var word_index: usize = 2;
     while (word_index + 1 < words.len) : (word_index += 1) {
         if (!words[word_index].present or !words[word_index + 1].present) continue;
-        const z = shaderOperandConstantBefore(instructions, terminal, words[word_index].source) orelse continue;
-        const w = shaderOperandConstantBefore(instructions, terminal, words[word_index + 1].source) orelse continue;
+        const z = shaderOperandConstantBefore(instructions, words[word_index].instruction_index, words[word_index].source) orelse continue;
+        const w = shaderOperandConstantBefore(instructions, words[word_index + 1].instruction_index, words[word_index + 1].source) orelse continue;
         if (z == @as(u32, @bitCast(@as(f32, 0))) and w == @as(u32, @bitCast(@as(f32, 1)))) {
             position_zw = word_index;
             break;
@@ -31877,6 +31880,7 @@ fn inferNggLdsExports(
         }
         break :blk expected_zw;
     };
+    if (layered and zw < 2) return 0;
 
     output[0] = .{
         .target = 0x0c,
@@ -31887,6 +31891,12 @@ fn inferNggLdsExports(
             words[zw].source,
             words[zw + 1].source,
         },
+        .source_pcs = .{
+            instructions[words[if (layered) zw - 2 else 0].instruction_index].pc,
+            instructions[words[if (layered) zw - 1 else 1].instruction_index].pc,
+            instructions[words[zw].instruction_index].pc,
+            instructions[words[zw + 1].instruction_index].pc,
+        },
     };
     var output_count: usize = 1;
     var parameter_word: usize = if (layered) 0 else 2;
@@ -31894,12 +31904,14 @@ fn inferNggLdsExports(
     for (parameter_components, 0..) |component_mask, parameter| {
         if (component_mask == 0) continue;
         var sources: [4]gpu.ShaderOperand = @splat(.{});
+        var source_pcs: [4]?u32 = @splat(null);
         var enable: u4 = 0;
         for (0..4) |component| {
             const bit: u4 = @as(u4, 1) << @intCast(component);
             if (component_mask & bit == 0) continue;
             if (parameter_word >= parameter_end or !words[parameter_word].present) return 0;
             sources[component] = words[parameter_word].source;
+            source_pcs[component] = instructions[words[parameter_word].instruction_index].pc;
             enable |= bit;
             parameter_word += 1;
         }
@@ -31907,13 +31919,14 @@ fn inferNggLdsExports(
             .target = @intCast(0x20 + parameter),
             .enable = enable,
             .sources = sources,
+            .source_pcs = source_pcs,
         };
         output_count += 1;
     }
     if (parameter_word != parameter_end) return 0;
     if (layered) {
         if (zw + 2 >= words.len or !words[zw + 2].present) return 0;
-        output[output_count] = .{ .target = 0x0d, .enable = 4, .sources = .{ .{}, .{}, words[zw + 2].source, .{} } };
+        output[output_count] = .{ .target = 0x0d, .enable = 4, .sources = .{ .{}, .{}, words[zw + 2].source, .{} }, .source_pcs = .{ null, null, instructions[words[zw + 2].instruction_index].pc, null } };
         output_count += 1;
     }
     return output_count;
@@ -37085,8 +37098,9 @@ test "NGG LDS export inference accepts dynamic clip depth" {
 
 test "layered NGG LDS exports retain contiguous position and RT layer" {
     const instructions = [_]gpu.ShaderInstruction{
-        .{ .opcode = .ds_write_b128, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 10 }, .memory_offset = 0 },
-        .{ .opcode = .ds_write_b96, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 14 }, .memory_offset = 16 },
+        .{ .pc = 8, .opcode = .ds_write_b128, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 10 }, .memory_offset = 0 },
+        .{ .pc = 16, .opcode = .ds_write_b96, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 14 }, .memory_offset = 16 },
+        .{ .pc = 24, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 16 }, .src0 = .{ .kind = .integer_inline_constant, .value = 99 } },
         .{ .opcode = .s_setpc_b64, .src0 = .{ .kind = .sgpr, .reg = 6 } },
     };
     var components: [32]u4 = @splat(0);
@@ -37099,6 +37113,9 @@ test "layered NGG LDS exports retain contiguous position and RT layer" {
     try std.testing.expectEqual(@as(u6, 0x0d), exports[2].target);
     try std.testing.expectEqual(@as(u4, 4), exports[2].enable);
     try std.testing.expectEqual(@as(u32, 16), exports[2].sources[2].reg);
+    try std.testing.expectEqualSlices(?u32, &.{ 8, 8, 16, 16 }, &exports[0].source_pcs);
+    try std.testing.expectEqualSlices(?u32, &.{ 8, 8, null, null }, &exports[1].source_pcs);
+    try std.testing.expectEqual(@as(?u32, 16), exports[2].source_pcs[2]);
 }
 
 test "RGBA8 integer scaling preserves every source pixel" {
@@ -38934,6 +38951,9 @@ test "prepared resource pools reset bindings and keep active loans distinct" {
     renderer.index_scratch = .{};
     renderer.checkpoint_scratch = .{};
     renderer.resource_preparation = .{};
+    renderer.draw_scalar_scratch = null;
+    renderer.sampled_descriptor_scratch = null;
+    renderer.buffer_image_candidate_scratch = null;
     renderer.free_compute_resource_count = 0;
     renderer.free_graphics_resource_count = 0;
     defer renderer.destroyResourcePools();

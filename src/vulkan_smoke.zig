@@ -5098,92 +5098,106 @@ fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
 
 fn runLayeredVolumeProbe(allocator: std.mem.Allocator) !void {
     for ([_]u5{ 0, 27 }) |tile_mode| {
-        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
-        defer renderer.deinit();
-        const guest = try allocator.create(SizedGuestMemory(4 * 1024 * 1024));
-        defer allocator.destroy(guest);
-        guest.* = .{};
-        // A fullscreen triangle, with the instance ID exported as POS1.z.
-        const vertex = [_]u32{
-            0x34020a81,      0x36040a82, 0x36020282, 0x7e040d02, 0x7e060d01,
-            0xd5410001,      0x03ce04f4, 0xd5410002, 0x03ce06f4, vop1(1, 0, 128),
-            vop1(1, 3, 242),
-            0xf80000d4, 0x00080000, // EXP POS1.z = instance v8
-            0xf80008cf, 0x03000102,
-            0xbf810000,
-        };
-        const fragment = [_]u32{
-            vop2Source(0x16, 2, 144, 2), // ancillary >> 16
-            vop1(6, 2, 258),  vop1(1, 3, 255),  0x3d000000, // 1/32
-            vop2(8, 0, 0, 3), vop2(8, 1, 1, 3), vop2(8, 2, 2, 3),
-            vop1(1, 3, 242),  0xf800080f,       0x03020100,
-            0xbf810000,
-        };
-        for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
-        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
-        var state = gpu.State{};
-        for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, program| {
-            try state.writeRegister(.shader, stage.programRegisterBase(), program);
-            try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        for ([_]bool{ false, true }) |ngg| {
+            var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+            defer renderer.deinit();
+            const guest = try allocator.create(SizedGuestMemory(4 * 1024 * 1024));
+            defer allocator.destroy(guest);
+            guest.* = .{};
+            // A fullscreen triangle, with the instance ID exported as POS1.z.
+            const vertex: []const u32 = if (ngg) &.{
+                0x34020a81,      0x36040a82,      0x36020282, 0x7e040d02, 0x7e060d01,
+                0xd5410001,      0x03ce04f4,      0xd5410002, 0x03ce06f4, vop1(1, 0, 128),
+                vop1(1, 3, 242), vop1(1, 4, 128),
+                // Save Z/W and layer before those VGPRs are reused. POS.xy is
+                // written last, as in a merged shader's LDS export record.
+                0xd8380302, 0x00030004, // LDS[8,12] = v0,v3
+                0xd8340010,      0x00000804, // LDS[16] = instance v8
+                vop1(1, 0, 242), vop1(1, 3, 128),
+                vop1(1, 8, 128),
+                0xd8380100, 0x00010204, // LDS[0,4] = v2,v1
+                0xbe802006, // hardware NGG exporter
+            } else &.{
+                0x34020a81,      0x36040a82, 0x36020282, 0x7e040d02, 0x7e060d01,
+                0xd5410001,      0x03ce04f4, 0xd5410002, 0x03ce06f4, vop1(1, 0, 128),
+                vop1(1, 3, 242),
+                0xf80000d4, 0x00080000, // EXP POS1.z = instance v8
+                0xf80008cf, 0x03000102,
+                0xbf810000,
+            };
+            const fragment = [_]u32{
+                vop2Source(0x16, 2, 144, 2), // ancillary >> 16
+                vop1(6, 2, 258),  vop1(1, 3, 255),  0x3d000000, // 1/32
+                vop2(8, 0, 0, 3), vop2(8, 1, 1, 3), vop2(8, 2, 2, 3),
+                vop1(1, 3, 242),  0xf800080f,       0x03020100,
+                0xbf810000,
+            };
+            for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+            for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+            var state = gpu.State{};
+            for ([_]gpu.resources.ShaderStage{ if (ngg) .export_shader else .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, program| {
+                try state.writeRegister(.shader, stage.programRegisterBase(), program);
+                try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+            }
+            const inputs = (1 << 8) | (1 << 9) | (1 << 13);
+            const context = [_][2]u32{
+                .{ 0x08e, 0xf },             .{ 0x200, 0 },                                            .{ 0x204, 1 << 19 },               .{ 0x205, 0 },               .{ 0x202, 0xcc0010 },
+                .{ 0x318, 0x100 },           .{ 0x390, 0 },                                            .{ 0x31c, (10 << 2) | (1 << 28) }, .{ 0x325, 0x3f00 },          .{ 0x3a8, 0 },
+                .{ 0x3b0, (31 << 14) | 31 }, .{ 0x3b8, (2 << 24) | (@as(u32, tile_mode) << 14) | 31 }, .{ 0x1b4, inputs },                .{ 0x1b3, inputs },          .{ 0x1e0, 0 },
+                .{ 0x00c, 0 },               .{ 0x00d, 32 | (32 << 16) },                              .{ 0x094, 1 << 31 },               .{ 0x095, 32 | (32 << 16) },
+            };
+            for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+            for ([_]f32{ 16, 16, -16, 16, 1, 0 }, 0..) |value, i|
+                try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+            var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+            _ = try executor.execute(&.{ command(gpu.pm4.num_instances, 1), 32, command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+            if (renderer.last_draw_error) |err| return err;
+            try renderer.flushPendingGuestWrites();
+            try std.testing.expectEqual(@as(usize, 1), renderer.render_targets.items.len);
+            const target = renderer.render_targets.items[0].target;
+            try std.testing.expectEqual(@as(u32, 32), target.layout.layers);
+            const linear = try allocator.alloc(u8, @intCast(target.layout.staging_bytes));
+            defer allocator.free(linear);
+            try target.layout.detile(guest.bytes[0x10000..], linear);
+            for (0..32) |z| for (0..32) |y| for (0..32) |x| {
+                const pixel = linear[((z * 32 + y) * 32 + x) * 4 ..][0..4];
+                const expected = [4]u8{ @intFromFloat(@round((@as(f32, @floatFromInt(x)) + 0.5) * 255 / 32)), @intFromFloat(@round((@as(f32, @floatFromInt(y)) + 0.5) * 255 / 32)), @intFromFloat(@round(@as(f32, @floatFromInt(z)) * 255 / 32)), 255 };
+                for (expected, pixel) |want, got| try std.testing.expect(@abs(@as(i16, want) - got) <= 1);
+            };
+            // DCC clears recur every frame without writing the base surface.
+            // They must clear every resident layer before additive volume draws.
+            const metadata = try allocator.alloc(u8, @intCast((target.layout.required_source_bytes + 255) / 256));
+            defer allocator.free(metadata);
+            @memset(metadata, 0);
+            try std.testing.expect(executor.backend.vtable.write(executor.backend.context, 0x3f0000, metadata));
+            try renderer.flushPendingGuestWrites();
+            try target.layout.detile(guest.bytes[0x10000..], linear);
+            try std.testing.expect(std.mem.allEqual(u8, linear, 0));
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+            const native_clear = [_]u32{
+                0xd7460004, 8 | (134 << 9) | (256 << 18),
+                0x7e000204, 0x7e020205,
+                0x7e040206, 0x7e060207,
+                0xe01c2000, 0x80000004,
+                0xbf800000, 0xbf810000,
+            };
+            for (native_clear, 0..) |word, i| guest.word(0xb00 + i * 4, word);
+            var compute = gpu.State{};
+            try compute.writeRegister(.shader, 0x20c, 0xb);
+            try compute.writeRegister(.shader, 0x20d, 0);
+            try compute.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+            const clear_data = [_]u32{ 0x3f0000, 16 << 16, @intCast(metadata.len / 16), (75 << 12) | 0xfac, 0, 0, 0, 0 };
+            for (clear_data, 0..) |word, i| try compute.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+            renderer.defer_small_storage_writes_enabled = true;
+            const fills_before = renderer.emulated_buffer_clear_dispatches;
+            _ = try renderer.dispatchRdna2State(&compute, .{ 64, 1, 1 }, .{ @intCast((metadata.len + 1023) / 1024), 1, 1 });
+            try std.testing.expectEqual(fills_before, renderer.emulated_buffer_clear_dispatches);
+            try renderer.flushPendingGuestWrites();
+            try target.layout.detile(guest.bytes[0x10000..], linear);
+            try std.testing.expect(std.mem.allEqual(u8, linear, 0));
         }
-        const inputs = (1 << 8) | (1 << 9) | (1 << 13);
-        const context = [_][2]u32{
-            .{ 0x08e, 0xf },             .{ 0x200, 0 },                                            .{ 0x204, 1 << 19 },               .{ 0x205, 0 },               .{ 0x202, 0xcc0010 },
-            .{ 0x318, 0x100 },           .{ 0x390, 0 },                                            .{ 0x31c, (10 << 2) | (1 << 28) }, .{ 0x325, 0x3f00 },          .{ 0x3a8, 0 },
-            .{ 0x3b0, (31 << 14) | 31 }, .{ 0x3b8, (2 << 24) | (@as(u32, tile_mode) << 14) | 31 }, .{ 0x1b4, inputs },                .{ 0x1b3, inputs },          .{ 0x1e0, 0 },
-            .{ 0x00c, 0 },               .{ 0x00d, 32 | (32 << 16) },                              .{ 0x094, 1 << 31 },               .{ 0x095, 32 | (32 << 16) },
-        };
-        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
-        for ([_]f32{ 16, 16, -16, 16, 1, 0 }, 0..) |value, i|
-            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
-        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
-        _ = try executor.execute(&.{ command(gpu.pm4.num_instances, 1), 32, command(gpu.pm4.draw_index_auto, 2), 3, 0 });
-        if (renderer.last_draw_error) |err| return err;
-        try renderer.flushPendingGuestWrites();
-        try std.testing.expectEqual(@as(usize, 1), renderer.render_targets.items.len);
-        const target = renderer.render_targets.items[0].target;
-        try std.testing.expectEqual(@as(u32, 32), target.layout.layers);
-        const linear = try allocator.alloc(u8, @intCast(target.layout.staging_bytes));
-        defer allocator.free(linear);
-        try target.layout.detile(guest.bytes[0x10000..], linear);
-        for (0..32) |z| for (0..32) |y| for (0..32) |x| {
-            const pixel = linear[((z * 32 + y) * 32 + x) * 4 ..][0..4];
-            const expected = [4]u8{ @intFromFloat(@round((@as(f32, @floatFromInt(x)) + 0.5) * 255 / 32)), @intFromFloat(@round((@as(f32, @floatFromInt(y)) + 0.5) * 255 / 32)), @intFromFloat(@round(@as(f32, @floatFromInt(z)) * 255 / 32)), 255 };
-            for (expected, pixel) |want, got| try std.testing.expect(@abs(@as(i16, want) - got) <= 1);
-        };
-        // DCC clears recur every frame without writing the base surface.
-        // They must clear every resident layer before additive volume draws.
-        const metadata = try allocator.alloc(u8, @intCast((target.layout.required_source_bytes + 255) / 256));
-        defer allocator.free(metadata);
-        @memset(metadata, 0);
-        try std.testing.expect(executor.backend.vtable.write(executor.backend.context, 0x3f0000, metadata));
-        try renderer.flushPendingGuestWrites();
-        try target.layout.detile(guest.bytes[0x10000..], linear);
-        try std.testing.expect(std.mem.allEqual(u8, linear, 0));
-        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
-        const native_clear = [_]u32{
-            0xd7460004, 8 | (134 << 9) | (256 << 18),
-            0x7e000204, 0x7e020205,
-            0x7e040206, 0x7e060207,
-            0xe01c2000, 0x80000004,
-            0xbf800000, 0xbf810000,
-        };
-        for (native_clear, 0..) |word, i| guest.word(0xb00 + i * 4, word);
-        var compute = gpu.State{};
-        try compute.writeRegister(.shader, 0x20c, 0xb);
-        try compute.writeRegister(.shader, 0x20d, 0);
-        try compute.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
-        const clear_data = [_]u32{ 0x3f0000, 16 << 16, @intCast(metadata.len / 16), (75 << 12) | 0xfac, 0, 0, 0, 0 };
-        for (clear_data, 0..) |word, i| try compute.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
-        renderer.defer_small_storage_writes_enabled = true;
-        const fills_before = renderer.emulated_buffer_clear_dispatches;
-        _ = try renderer.dispatchRdna2State(&compute, .{ 64, 1, 1 }, .{ @intCast((metadata.len + 1023) / 1024), 1, 1 });
-        try std.testing.expectEqual(fills_before, renderer.emulated_buffer_clear_dispatches);
-        try renderer.flushPendingGuestWrites();
-        try target.layout.detile(guest.bytes[0x10000..], linear);
-        try std.testing.expect(std.mem.allEqual(u8, linear, 0));
     }
-    std.debug.print("layered volume passed: 32 distinct layers, ancillary input, full raster coverage and 3D guest swizzle\n", .{});
+    std.debug.print("layered volume passed: 32 distinct layers, ancillary input, full raster coverage, 3D guest swizzle and NGG register reuse\n", .{});
 }
 
 fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {

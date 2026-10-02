@@ -274,6 +274,9 @@ pub const NggLdsExport = struct {
     target: u6,
     enable: u4,
     sources: [4]operand.Operand,
+    /// Capture each component at its LDS write, before VGPR reuse. Null keeps
+    /// the explicit terminal-source convention used by standalone callers.
+    source_pcs: [4]?u32 = @splat(null),
 };
 
 pub const ColorExportType = enum { float32, uint32, sint32 };
@@ -944,6 +947,7 @@ const Builder = struct {
     sampled_bindings: []const SampledImageBinding,
     storage_image_bindings: []const StorageImageBinding,
     ngg_lds_exports: []const NggLdsExport,
+    ngg_lds_snapshots: [34][4]u32 = @splat(@splat(0)),
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
     storage_block_pointer_type: u32 = 0,
@@ -5519,6 +5523,18 @@ const Builder = struct {
     }
 
     fn exportValue(self: *Builder, inst: instruction.Instruction) Error!void {
+        return self.exportValueWithBits(inst, null);
+    }
+
+    fn exportSource(self: *Builder, source_op: operand.Operand, expected: ValueType, captured: ?u32) Error!u32 {
+        const bits = captured orelse return self.source(source_op, expected);
+        if (expected == .bits32) return bits;
+        const result = self.id();
+        try self.emit(&self.body, 124, &.{ self.typeId(expected), result, bits }); // OpBitcast
+        return result;
+    }
+
+    fn exportValueWithBits(self: *Builder, inst: instruction.Instruction, captured: ?[4]u32) Error!void {
         if (self.fragment_valid_mask != 0 and inst.export_valid_mask) {
             const enabled = (try self.laneEnabled()) orelse try self.constantBool(true);
             try self.emit(&self.body, 62, &.{ self.fragment_valid_mask, enabled });
@@ -5540,7 +5556,7 @@ const Builder = struct {
             return;
         }
         if (self.stage == .vertex and self.layer_variable != 0 and inst.export_target == 0x0d and inst.export_enable & 4 != 0) {
-            var layer = try self.source(inst.src2, .sint32);
+            var layer = try self.exportSource(inst.src2, .sint32, if (captured) |bits| bits[2] else null);
             if (try self.laneEnabled()) |enabled| {
                 const previous = self.id();
                 const selected = self.id();
@@ -5623,11 +5639,11 @@ const Builder = struct {
             };
         } else .{
             // Uncompressed: one f32 per channel from src0..src3.
-            if (inst.export_enable & 1 != 0) try self.source(inst.src0, .float32) else zero,
-            if (inst.export_enable & 2 != 0) try self.source(inst.src1, .float32) else zero,
-            if (inst.export_enable & 4 != 0) try self.source(inst.src2, .float32) else zero,
+            if (inst.export_enable & 1 != 0) try self.exportSource(inst.src0, .float32, if (captured) |bits| bits[0] else null) else zero,
+            if (inst.export_enable & 2 != 0) try self.exportSource(inst.src1, .float32, if (captured) |bits| bits[1] else null) else zero,
+            if (inst.export_enable & 4 != 0) try self.exportSource(inst.src2, .float32, if (captured) |bits| bits[2] else null) else zero,
             if (inst.export_enable & 8 != 0)
-                try self.source(inst.src3, .float32)
+                try self.exportSource(inst.src3, .float32, if (captured) |bits| bits[3] else null)
             else if (is_position)
                 one
             else
@@ -5742,10 +5758,49 @@ const Builder = struct {
         const targets = self.vertex_parameter_targets[export_index];
         return if (targets == 0) 0 else self.parameter_variables[@ctz(targets)];
     }
+    fn snapshotNggLdsWrites(self: *Builder, pc: u32) Error!void {
+        if (self.stage != .vertex) return;
+        if (self.ngg_lds_exports.len > self.ngg_lds_snapshots.len) return Error.InvalidStageInterface;
+        for (self.ngg_lds_exports, 0..) |record, record_index| {
+            for (record.source_pcs, 0..) |source_pc, component| {
+                if (source_pc == null or source_pc.? != pc or record.enable & (@as(u4, 1) << @intCast(component)) == 0) continue;
+                const saved_word = &self.ngg_lds_snapshots[record_index][component];
+                if (saved_word.* == 0) {
+                    const pointer = self.id();
+                    saved_word.* = self.id();
+                    try self.emit(&self.declarations, 32, &.{ pointer, 6, self.bits_type }); // ptr Private
+                    const zero = try self.constant(.bits32, 0);
+                    try self.emit(&self.declarations, 59, &.{ pointer, saved_word.*, 6, zero });
+                }
+                var value = try self.source(record.sources[component], .bits32);
+                if (try self.laneEnabled()) |enabled| {
+                    const previous = self.id();
+                    try self.emit(&self.body, 61, &.{ self.bits_type, previous, saved_word.* });
+                    const selected = self.id();
+                    try self.emit(&self.body, 169, &.{ self.bits_type, selected, enabled, value, previous });
+                    value = selected;
+                }
+                try self.emit(&self.body, 62, &.{ saved_word.*, value });
+            }
+        }
+    }
+
     fn exportNggLdsRecord(self: *Builder) Error!void {
         if (self.stage != .vertex or self.ngg_lds_exports.len == 0) return;
-        for (self.ngg_lds_exports) |record| {
-            try self.exportValue(.{
+        if (self.ngg_lds_exports.len > self.ngg_lds_snapshots.len) return Error.InvalidStageInterface;
+        for (self.ngg_lds_exports, 0..) |record, record_index| {
+            var captured: [4]u32 = undefined;
+            for (record.sources, 0..) |source_op, component| {
+                captured[component] = try self.constant(.bits32, 0);
+                if (record.enable & (@as(u4, 1) << @intCast(component)) == 0) continue;
+                if (record.source_pcs[component] != null) {
+                    const saved_word = self.ngg_lds_snapshots[record_index][component];
+                    if (saved_word == 0) return Error.InvalidStageInterface;
+                    captured[component] = self.id();
+                    try self.emit(&self.body, 61, &.{ self.bits_type, captured[component], saved_word });
+                } else captured[component] = try self.source(source_op, .bits32);
+            }
+            try self.exportValueWithBits(.{
                 .opcode = .exp,
                 .export_target = record.target,
                 .export_enable = record.enable,
@@ -5754,7 +5809,7 @@ const Builder = struct {
                 .src2 = record.sources[2],
                 .src3 = record.sources[3],
                 .src_count = 4,
-            });
+            }, captured);
         }
     }
 
@@ -10075,6 +10130,7 @@ const Builder = struct {
     }
 
     fn lower(self: *Builder, source_inst: instruction.Instruction) Error!void {
+        if (source_inst.family == .ds) try self.snapshotNggLdsWrites(source_inst.pc);
         for (self.fragment_min_pcs) |reduction| {
             if (reduction.start_pc != source_inst.pc) continue;
             // Reduce the original inputs: a shuffle from an inactive fragment
