@@ -587,6 +587,32 @@ fn amprCommandBufferWriteCounter(
     return amprAppendNop(address, ampr_fixed_record_size);
 }
 
+// The completion-only ABI omits the legacy flags argument. Keep explicit
+// adapters so an unused guest register cannot become an event payload.
+fn amprCommandBufferWriteAddressOnCompletion(address: u64, destination: ?*volatile u64, value: u64) callconv(abi.guest) i32 {
+    return amprCommandBufferWriteAddress(address, destination, value, 0);
+}
+
+fn amprCommandBufferWriteCounterOnCompletion(address: u64, counter: u8, mode: u8, value: u64, operation: u8) callconv(abi.guest) i32 {
+    return amprCommandBufferWriteCounter(address, counter, mode, value, operation, 0);
+}
+
+fn amprCommandBufferWriteAddressFromTimeCounterOnCompletion(address: u64, destination: ?*volatile u64) callconv(abi.guest) i32 {
+    return amprCommandBufferWriteAddressFromTimeCounter(address, destination, 0);
+}
+
+fn amprCommandBufferWriteAddressFromCounterOnCompletion(address: u64, destination: ?*volatile u64, counter: u8) callconv(abi.guest) i32 {
+    return amprCommandBufferWriteAddressFromCounter(address, destination, counter, 0);
+}
+
+fn amprCommandBufferWriteAddressFromCounterPairOnCompletion(address: u64, destination: ?*volatile u64, counter: u8) callconv(abi.guest) i32 {
+    return amprCommandBufferWriteAddressFromCounterPair(address, destination, counter, 0);
+}
+
+fn amprCommandBufferWriteKernelEventQueueOnCompletion(address: u64, queue_handle: i64, ident: u64, data: u64) callconv(abi.guest) i32 {
+    return amprCommandBufferWriteKernelEventQueue(address, queue_handle, ident, data, data);
+}
+
 fn amprAprCommandBufferMapBegin(
     address: u64,
     va: u64,
@@ -4879,6 +4905,19 @@ const agc_driver_exports = [_]symbols.Export{
 };
 
 const ampr_exports = [_]symbols.Export{
+    .{ .name = "sceAmprCommandBufferWaitOnAddress", .function = trace.wrap("sceAmprCommandBufferWaitOnAddress", &amprCommandBufferWaitOnAddress), .expect_id = "V7GQTEeUfhw" },
+    .{ .name = "sceAmprCommandBufferWaitOnCounter", .function = trace.wrap("sceAmprCommandBufferWaitOnCounter", &amprCommandBufferWaitOnCounter), .expect_id = "FrCNL9TQ8ms" },
+    .{ .name = "sceAmprCommandBufferWriteAddressOnCompletion", .function = trace.wrap("sceAmprCommandBufferWriteAddressOnCompletion", &amprCommandBufferWriteAddressOnCompletion), .expect_id = "sJXyWHjP-F8" },
+    .{ .name = "sceAmprCommandBufferWriteCounterOnCompletion", .function = trace.wrap("sceAmprCommandBufferWriteCounterOnCompletion", &amprCommandBufferWriteCounterOnCompletion), .expect_id = "3wn42MWTzTs" },
+    .{ .name = "sceAmprCommandBufferWriteKernelEventQueueOnCompletion", .function = trace.wrap("sceAmprCommandBufferWriteKernelEventQueueOnCompletion", &amprCommandBufferWriteKernelEventQueueOnCompletion), .expect_id = "o67gODLFpls" },
+    .{ .name = "sceAmprCommandBufferWriteAddressFromTimeCounterOnCompletion", .function = trace.wrap("sceAmprCommandBufferWriteAddressFromTimeCounterOnCompletion", &amprCommandBufferWriteAddressFromTimeCounterOnCompletion), .expect_id = "FI2JD0jAHCs" },
+    .{ .name = "sceAmprCommandBufferWriteAddressFromCounterOnCompletion", .function = trace.wrap("sceAmprCommandBufferWriteAddressFromCounterOnCompletion", &amprCommandBufferWriteAddressFromCounterOnCompletion), .expect_id = "gSF5OsXdfIg" },
+    .{ .name = "sceAmprCommandBufferWriteAddressFromCounterPairOnCompletion", .function = trace.wrap("sceAmprCommandBufferWriteAddressFromCounterPairOnCompletion", &amprCommandBufferWriteAddressFromCounterPairOnCompletion), .expect_id = "ZLWtNUP6R5E" },
+    .{ .name = "sceAmprMeasureCommandSizeWaitOnAddress", .function = trace.wrap("sceAmprMeasureCommandSizeWaitOnAddress", &amprMeasureCommandSizeFixed32), .expect_id = "jIlc4p5dSD0" },
+    .{ .name = "sceAmprMeasureCommandSizeWaitOnCounter", .function = trace.wrap("sceAmprMeasureCommandSizeWaitOnCounter", &amprMeasureCommandSizeFixed32), .expect_id = "6jLL5BIZ88U" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteAddressOnCompletion", .function = trace.wrap("sceAmprMeasureCommandSizeWriteAddressOnCompletion", &amprMeasureCommandSizeFixed32), .expect_id = "C+IEj+BsAFM" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteCounterOnCompletion", .function = trace.wrap("sceAmprMeasureCommandSizeWriteCounterOnCompletion", &amprMeasureCommandSizeFixed32), .expect_id = "4muPEJ-x5N8" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion", .function = trace.wrap("sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion", &amprMeasureCommandSizeWriteKernelEventQueue), .expect_id = "Zi3dBUjgyXI" },
     .{ .name = "sceAmprCommandBufferConstructor", .function = trace.wrap("sceAmprCommandBufferConstructor", &amprCommandBufferConstructor), .expect_id = "8aI7R7WaOlc" },
     .{ .name = "sceAmprAprCommandBufferConstructor", .function = trace.wrap("sceAmprAprCommandBufferConstructor", &amprAprCommandBufferConstructor), .expect_id = "a8uLzYY--tM" },
     .{ .name = "sceAmprCommandBufferDestructor", .function = trace.wrap("sceAmprCommandBufferDestructor", &amprCommandBufferDestructor), .expect_id = "GuchCTefuZw" },
@@ -6028,6 +6067,65 @@ test "AMPR kernel event records retain completion user data" {
     try std.testing.expectEqual(@as(u64, 0x9999_aaaa_bbbb_cccc), std.mem.readInt(u64, storage[0x18..0x20], .little));
     try std.testing.expectEqual(@as(u64, 0x5555_6666_7777_8888), std.mem.readInt(u64, storage[0x20..0x28], .little));
     try std.testing.expectEqual(@as(u64, 0x30), amprCommandBufferGetCurrentOffset(address));
+}
+
+test "AMPR completion ABI links and publishes writes before its event" {
+    var db = symbols.Database{};
+    defer db.deinit(std.testing.allocator);
+    try register(&db, std.testing.allocator);
+    // Import identifiers from the GTA III executable, independent of names
+    // in our export table. Registration also verifies each name's NID hash.
+    for ([_][]const u8{
+        "V7GQTEeUfhw", "FrCNL9TQ8ms", "sJXyWHjP-F8", "3wn42MWTzTs",
+        "o67gODLFpls", "FI2JD0jAHCs", "gSF5OsXdfIg", "ZLWtNUP6R5E",
+        "jIlc4p5dSD0", "6jLL5BIZ88U", "C+IEj+BsAFM", "4muPEJ-x5N8",
+        "Zi3dBUjgyXI",
+    }) |id| {
+        const symbol = db.findById(id, .function) orelse return error.TestExpectedSymbol;
+        try std.testing.expectEqualStrings("libSceAmpr", symbol.key.library.name);
+    }
+
+    const Sink = struct {
+        var label: u64 = 0;
+        var event: ?apr.CompletionCommand = null;
+        var label_at_event: u64 = 0;
+        fn publish(command: apr.CompletionCommand) bool {
+            event = command;
+            label_at_event = label;
+            return true;
+        }
+    };
+    Sink.label = 0;
+    Sink.event = null;
+    Sink.label_at_event = 0;
+    apr.reset();
+    defer apr.reset();
+    apr.attachCompletionSink(Sink.publish);
+    defer apr.attachCompletionSink(null);
+    var header: [ampr_command_buffer_header_size]u8 align(8) = @splat(0);
+    var storage: [0x50]u8 align(8) = @splat(0);
+    const address = @intFromPtr(&header);
+    try std.testing.expectEqual(errno.ok, amprCommandBufferConstructor(address));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferSetBuffer(address, @intFromPtr(&storage), storage.len));
+    const write: *const fn (u64, ?*volatile u64, u64) callconv(abi.guest) i32 =
+        @ptrFromInt(db.findById("sJXyWHjP-F8", .function).?.address);
+    const event: *const fn (u64, i64, u64, u64) callconv(abi.guest) i32 =
+        @ptrFromInt(db.findById("o67gODLFpls", .function).?.address);
+    const value: u64 = 0x1234_5678_9abc_def0;
+    const data: u64 = 0xfedc_ba98_7654_3210;
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), write(address, null, value));
+    try std.testing.expectEqual(errno.ok, write(address, &Sink.label, value));
+    try std.testing.expectEqual(errno.ok, event(address, 7, 11, data));
+    try std.testing.expectEqual(@as(u64, 0), Sink.label);
+    try std.testing.expect(Sink.event == null);
+    try std.testing.expectEqual(@as(u64, storage.len), amprCommandBufferGetCurrentOffset(address));
+    const submission = try apr.submitCommandBuffer(address);
+    try apr.waitCommandBuffer(submission);
+    try std.testing.expectEqual(value, Sink.label_at_event);
+    try std.testing.expectEqual(@as(i64, 7), Sink.event.?.queue_handle);
+    try std.testing.expectEqual(@as(u64, 11), Sink.event.?.ident);
+    try std.testing.expectEqual(data, Sink.event.?.completion_token);
+    try std.testing.expectEqual(data, Sink.event.?.user_data);
 }
 
 test "AMPR gather and scatter continue a recorded file read" {

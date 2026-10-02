@@ -1,5 +1,9 @@
 # GTA III: Definitive Edition package extraction — October 2, 2026
 
+For the subsequent AMPR fix and the first rendered policy screen, see the
+[separate startup report](gta3-ampr-startup-2026-10-02.md). The checks below
+record the earlier extraction milestone.
+
 The debug package for **PPSA03527 v1.007**, content ID
 `UP1004-PPSA03527_00-GTATHREE00000001`, now extracts completely. The installed
 extractor previously wrote the 27 CNT metadata files and then returned
