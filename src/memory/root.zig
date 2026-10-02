@@ -93,15 +93,18 @@ fn windowsAllocationRange(address: u64) Error!Range {
     var info: WindowsMemoryInfo = undefined;
     if (windowsVirtualQuery(address, &info) == 0) return Error.HostDecommitFailed;
     const allocation_start: u64 = @intFromPtr(info.allocation_base);
-    var cursor = allocation_start;
+    // The first query already describes this allocation when it starts at
+    // the requested address. Unmap preflight and execution both walk every
+    // native view; do not query each first region twice.
+    var cursor = address;
     while (true) {
-        if (windowsVirtualQuery(cursor, &info) == 0) return Error.HostDecommitFailed;
-        if (@intFromPtr(info.allocation_base) != allocation_start) break;
         const region_start: u64 = @intFromPtr(info.base_address);
         const region_end = std.math.add(u64, region_start, info.region_size) catch
             return Error.HostDecommitFailed;
         if (region_end <= cursor) return Error.HostDecommitFailed;
         cursor = region_end;
+        if (windowsVirtualQuery(cursor, &info) == 0) return Error.HostDecommitFailed;
+        if (@intFromPtr(info.allocation_base) != allocation_start) break;
     }
     return .{ .start = allocation_start, .end = cursor };
 }
@@ -507,6 +510,10 @@ pub const AddressSpace = struct {
     /// is intentionally a list of free extents rather than three booleans.
     reservations: std.ArrayList(Range) = .empty,
     direct_backing: ?SharedBacking = null,
+    // SEC_RESERVE section pages remain committed until the backing section
+    // dies, even after its last guest view is removed. Protected by mutex;
+    // tracks physical offsets, never guest addresses or mapping identities.
+    direct_committed: std.DynamicBitSetUnmanaged = .{},
     mutex: Lock = .{},
     gpu_tracker: GpuPageTracker = .{},
     mapping_identity: u64 = 0,
@@ -539,6 +546,12 @@ pub const AddressSpace = struct {
         errdefer self.deinit();
         self.direct_backing = SharedBacking.init(backing_size) catch
             return Error.BackingStoreUnavailable;
+        if (builtin.os.tag == .windows) {
+            self.direct_committed = try std.DynamicBitSetUnmanaged.initEmpty(
+                allocator,
+                @intCast(std.math.divCeil(u64, backing_size, page_size) catch return Error.InvalidSize),
+            );
+        }
         return self;
     }
 
@@ -551,6 +564,7 @@ pub const AddressSpace = struct {
         self.releaseReservations();
         if (self.direct_backing) |*backing| backing.deinit();
         self.direct_backing = null;
+        self.direct_committed.deinit(self.allocator);
         self.reservations.deinit(self.allocator);
         self.reservations = .empty;
         self.mappings.deinit(self.allocator);
@@ -1322,7 +1336,7 @@ pub const AddressSpace = struct {
             if (!isAligned(offset, page_size) or backing_end > backing.size) {
                 return Error.BackingOffsetInvalid;
             }
-            try hostMapBacking(backing, address, size, offset, protection);
+            try hostMapBacking(backing, address, size, offset, protection, &self.direct_committed);
             errdefer hostUnmapBacking(address, size) catch {};
         } else {
             if (backing_offset != null) return Error.BackingOffsetInvalid;
@@ -1402,7 +1416,7 @@ pub const AddressSpace = struct {
             if (!isAligned(offset, page_size) or backing_end > backing.size) {
                 return Error.BackingOffsetInvalid;
             }
-            try hostMapBacking(backing, address, size, offset, protection);
+            try hostMapBacking(backing, address, size, offset, protection, &self.direct_committed);
             errdefer hostUnmapBacking(address, size) catch {};
         } else {
             if (backing_offset != null) return Error.BackingOffsetInvalid;
@@ -2500,6 +2514,7 @@ fn hostMapBacking(
     size: u64,
     offset: u64,
     protection: Protection,
+    committed: *std.DynamicBitSetUnmanaged,
 ) Error!void {
     const host_started = timing.timestampNs();
     defer _ = @atomicRmw(u64, &host_map_ns, .Add, timing.elapsedNs(host_started), .monotonic);
@@ -2536,6 +2551,16 @@ fn hostMapBacking(
                     return Error.HostCommitFailed;
                 }
 
+                const first_page: usize = @intCast(page_offset / page_size);
+                const end_page: usize = @intCast((page_offset + view_size_bytes) / page_size);
+                const already_committed = for (first_page..end_page) |physical_page| {
+                    if (!committed.isSet(physical_page)) break false;
+                } else true;
+                // Mapping supplies the new view's protection. Recommitting
+                // existing section pages adds a syscall per view but changes
+                // neither their contents nor the physical allocation.
+                if (already_committed) continue;
+
                 var commit_base = base;
                 var commit_size: windows.SIZE_T = @intCast(view_size_bytes);
                 const commit_status = WindowsApi.NtAllocateVirtualMemoryEx(
@@ -2556,6 +2581,7 @@ fn hostMapBacking(
                     if (cursor > address) hostUnmapBacking(address, cursor - address) catch {};
                     return Error.HostCommitFailed;
                 }
+                committed.setRangeValue(.{ .start = first_page, .end = end_page }, true);
             }
         },
         .linux, .macos => {
@@ -2977,6 +3003,56 @@ test "aligned Windows direct memory shares one allocation-granularity view" {
     try space.protect(address + page_size, page_size, .read_only);
     try space.unmap(address, view_size);
     try testing.expect(!space.isMapped(address, view_size));
+}
+
+test "recycled direct views retain committed contents and apply fresh protections" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const granule = windows_allocation_granularity;
+    const base = user.start;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 3 * granule);
+    defer space.deinit();
+
+    // Seed just one 16 KiB physical page, then drop every alias. A later
+    // 64 KiB view mixes previously committed pages with untouched ones.
+    try space.mapFixed(base, page_size, .read_write, .direct_memory, page_size);
+    try space.writeInt(u32, base, 0xa1b2c3d4);
+    try space.unmap(base, page_size);
+    try space.mapFixed(base, granule, .read_write, .direct_memory, 0);
+    var word: [4]u8 = undefined;
+    try space.read(base + page_size, &word);
+    try testing.expectEqual(@as(u32, 0xa1b2c3d4), std.mem.readInt(u32, &word, .little));
+    try space.writeInt(u32, base + 3 * page_size, 0x55667788);
+    const original_identity = space.mappingIdentity(base, granule);
+    try space.protect(base + page_size, page_size, .read_only);
+    try space.unmap(base, granule);
+    try testing.expect(!isHostRangeReadable(base, granule));
+
+    // Reuse fully committed storage through a new read-only view. This skips
+    // commitment but must not inherit the old view's read-write permissions.
+    try space.reserveFixed(base, granule);
+    try space.mapInReservation(base, granule, .read_only, .direct_memory, 0);
+    try testing.expect(space.mappingIdentity(base, granule) != original_identity);
+    try testing.expect(isHostRangeReadable(base, granule));
+    try testing.expect(!isHostRangeWritable(base, granule));
+    try space.read(base + 3 * page_size, &word);
+    try testing.expectEqual(@as(u32, 0x55667788), std.mem.readInt(u32, &word, .little));
+    try space.unmap(base, granule);
+
+    // An unaligned offset still gets independent 16 KiB views. Partial
+    // removal and a writable alias preserve both data and native boundaries.
+    try space.mapFixed(base, 2 * page_size, .read_write, .direct_memory, page_size);
+    try space.mapFixed(base + granule, page_size, .read_write, .direct_memory, page_size);
+    try space.writeInt(u32, base + granule, 0x99887766);
+    try space.unmap(base + page_size, page_size);
+    try space.read(base, &word);
+    try testing.expectEqual(@as(u32, 0x99887766), std.mem.readInt(u32, &word, .little));
+    try testing.expect(isHostRangeWritable(base, page_size));
+    try testing.expect(!isHostRangeReadable(base + page_size, page_size));
+    try space.unmap(base, page_size);
+    try space.unmap(base + granule, page_size);
+    try space.mapFixed(base, page_size, .none, .direct_memory, page_size);
+    try testing.expect(!isHostRangeReadable(base, page_size));
+    try space.unmap(base, page_size);
 }
 
 test "virtual reservations and mapping queries retain guest metadata" {
