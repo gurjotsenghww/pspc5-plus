@@ -967,10 +967,11 @@ fn run(init: std.process.Init) !bool {
                 .acquire = acquireHostMemory,
                 .publish = runtime.firmware.libs.agc_submit.publishDirectMemory,
             } else null,
-            .context = if (enable_gpu_page_tracker) address_space else null,
+            .context = address_space,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
             .range_accessible = runtime.firmware.libs.agc_submit.guestRangeAccessible,
+            .mapping_identity = runtime.firmware.libs.agc_submit.guestMappingIdentity,
             .can_batch_copy = runtime.firmware.libs.agc_submit.canBatchGuestCopy,
             // Images must detect native CPU writes even without page tracking.
             // Repeated full-buffer hashing is controlled separately by

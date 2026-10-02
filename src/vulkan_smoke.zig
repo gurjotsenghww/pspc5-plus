@@ -18,6 +18,7 @@ fn SizedGuestMemory(comptime size: usize) type {
         const Self = @This();
         bytes: [size]u8 = @splat(0),
         watch_generation: u64 = 0,
+        mapping_identity: u64 = 1,
         watch_armed: bool = false,
         write_after_fingerprint: ?usize = null,
         write_on_generation: ?usize = null,
@@ -27,6 +28,12 @@ fn SizedGuestMemory(comptime size: usize) type {
             if (self.watch_generation == 0) return;
             self.watch_generation += 1;
             self.watch_armed = false;
+        }
+
+        fn mappingIdentity(context: ?*anyopaque, address: u64, length: usize) u64 {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            if (address > self.bytes.len or length > self.bytes.len - address) return 0;
+            return self.mapping_identity;
         }
 
         fn track(context: ?*anyopaque, _: u64, _: usize) u64 {
@@ -2346,6 +2353,47 @@ fn runBufferRangePublicationProbe(allocator: std.mem.Allocator, incoming_evictio
     } else {
         std.debug.print("buffer range publication passed: both backings, tracked/untracked pages, both read orders, clean newer eviction, dirty/clean nested writer rebinds and disjoint writes\n", .{});
     }
+}
+
+fn runBufferMappingLifetimeProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |local| for (0..3) |scenario| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = true, .retain_clean_storage_buffers = true });
+        defer renderer.deinit();
+        renderer.device_storage_budget_bytes = if (local) 1024 * 1024 else 0;
+        renderer.device_storage_min_bytes = 4;
+        var guest = GuestMemory{};
+        var memory = guest.interface();
+        memory.mapping_identity = GuestMemory.mappingIdentity;
+        _ = renderer.dcbBackend(memory);
+        @memset(guest.bytes[0x10000..0x10080], 0xa5);
+        const store = mubuf(0x1c, 0, 0, 0, 0);
+        const code = [_]u32{ vop1(1, 0, 4), store[0], store[1], 0xbf810000 };
+        for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 5 << 1);
+        for ([_]u32{ 0x10000, 0, 128, 0, 0x11223344 }, 0..) |word, i|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        if (scenario != 0) {
+            guest.mapping_identity += 1;
+            @memset(guest.bytes[0x10000..0x10080], 0x6d);
+        }
+        if (scenario == 2) _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 128);
+        try renderer.flushPendingGuestWrites();
+        if (scenario == 0) {
+            try std.testing.expectEqual(@as(u32, 0x11223344), std.mem.readInt(u32, guest.bytes[0x10000..][0..4], .little));
+            try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x10004..0x10080], 0xa5));
+        } else {
+            try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x10000..0x10080], 0x6d));
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 128);
+            var observed: [128]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x10000, &observed);
+            try std.testing.expect(std.mem.allEqual(u8, &observed, 0x6d));
+        }
+    };
+    std.debug.print("buffer mapping lifetimes passed: original publication, remapped readback rejection and rebind across both backings\n", .{});
 }
 
 fn runBufferCommandWriteProbe(allocator: std.mem.Allocator) !void {
@@ -12344,6 +12392,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-command-writes")) {
         try runBufferCommandWriteProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-mapping-lifetime")) {
+        try runBufferMappingLifetimeProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-layout-rebind")) {

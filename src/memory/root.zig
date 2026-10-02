@@ -279,6 +279,9 @@ pub const Mapping = struct {
     size: u64,
     protection: Protection,
     kind: MappingKind,
+    /// Ownership of one mapping operation, retained by protection/metadata splits.
+    /// A later mapping at the same VA receives a different nonzero identity.
+    identity: u64 = 0,
     /// Physical direct-memory offset, when `kind == .direct_memory`.
     backing_offset: ?u64 = null,
     /// Original guest ABI protection mask, including GPU access bits.
@@ -297,6 +300,30 @@ pub const MappingMetadata = struct {
     memory_type: ?i32 = null,
     name: ?[]const u8 = null,
 };
+
+test "mapping identities survive splits and reject remapped allocation backing" {
+    const base = user.start;
+    var space = try AddressSpace.initWithDirectMemory(std.testing.allocator, 4 * page_size);
+    defer space.deinit();
+    try space.mapFixed(base, 3 * page_size, .read_write, .direct_memory, 0);
+    const original = space.mappingIdentity(base + 32, 3 * page_size - 32);
+    try std.testing.expect(original != 0);
+    try space.protect(base + page_size, page_size, .read_only);
+    try space.setMetadata(base + 2 * page_size, page_size, .{ .name = "split" });
+    try std.testing.expectEqual(original, space.mappingIdentity(base + 32, 3 * page_size - 32));
+    try space.unmap(base + page_size, page_size);
+    try std.testing.expectEqual(@as(u64, 0), space.mappingIdentity(base + 32, 3 * page_size - 32));
+    try space.mapFixed(base + page_size, page_size, .read_write, .direct_memory, page_size);
+    try std.testing.expect(space.mappingIdentity(base + page_size, page_size) != original);
+    try std.testing.expectEqual(@as(u64, 0), space.mappingIdentity(base + 32, 3 * page_size - 32));
+    try std.testing.expectEqual(original, space.mappingIdentity(base + 32, page_size - 32));
+    try space.reserveFixed(base + 3 * page_size, page_size);
+    try std.testing.expectEqual(@as(u64, 0), space.mappingIdentity(base + 3 * page_size, page_size));
+    try space.mapInReservation(base + 3 * page_size, page_size, .read_write, .private, null);
+    const committed = space.mappingIdentity(base + 3 * page_size, page_size);
+    try std.testing.expect(committed != 0 and committed != original);
+    try std.testing.expectEqual(@as(u64, 0), space.mappingIdentity(std.math.maxInt(u64), 2));
+}
 
 pub const Error = error{
     UnsupportedHost,
@@ -378,6 +405,7 @@ pub const AddressSpace = struct {
     direct_backing: ?SharedBacking = null,
     mutex: Lock = .{},
     gpu_tracker: GpuPageTracker = .{},
+    mapping_identity: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Error!AddressSpace {
         if (@sizeOf(usize) != @sizeOf(u64)) return Error.UnsupportedHost;
@@ -652,6 +680,32 @@ pub const AddressSpace = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.coversLocked(address, size, null);
+    }
+
+    /// Identifies one allocation even after protection or metadata splits.
+    /// Zero declines a proof for holes, reservations and multiple allocations.
+    pub fn mappingIdentity(self: *AddressSpace, address: u64, size: usize) u64 {
+        if (size == 0) return 0;
+        const end = std.math.add(u64, address, size) catch return 0;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var cursor = address;
+        var identity: u64 = 0;
+        const first = firstOverlappingMapping(self.mappings.items, address);
+        for (self.mappings.items[first..]) |mapping| {
+            if (mapping.address > cursor or mapping.kind == .reserved or mapping.identity == 0) return 0;
+            if (identity != 0 and identity != mapping.identity) return 0;
+            identity = mapping.identity;
+            cursor = @min(end, mapping.end());
+            if (cursor == end) return identity;
+        }
+        return 0;
+    }
+
+    fn nextMappingIdentity(self: *AddressSpace) u64 {
+        self.mapping_identity +%= 1;
+        if (self.mapping_identity == 0) self.mapping_identity = 1;
+        return self.mapping_identity;
     }
 
     /// A fixed direct-memory request can retain an identical complete mapping.
@@ -1129,6 +1183,7 @@ pub const AddressSpace = struct {
             .size = size,
             .protection = protection,
             .kind = kind,
+            .identity = self.nextMappingIdentity(),
             .backing_offset = backing_offset,
             .protection_bits = protection.guestBits(),
         });
@@ -1207,6 +1262,7 @@ pub const AddressSpace = struct {
             .size = size,
             .protection = protection,
             .kind = kind,
+            .identity = self.nextMappingIdentity(),
             // Carried through, not dropped. This mapping is a window onto
             // physical memory, and the offset is the only record of which
             // physical memory: without it a title asking what backs the address

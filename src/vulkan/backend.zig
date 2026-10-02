@@ -474,6 +474,9 @@ pub const GuestMemory = struct {
     /// Full-range residency check, independent of content and write tracking.
     /// Used to retire deferred image output after its guest backing is unmapped.
     range_accessible: ?*const fn (?*anyopaque, u64, usize) bool = null,
+    /// Nonzero ownership token for one mapped allocation, stable across writes
+    /// and protection splits. Remapping the same VA must change the token.
+    mapping_identity: ?*const fn (?*anyopaque, u64, usize) u64 = null,
     /// Proves that bulk read/write callbacks preserve individual word-copy
     /// effects for this ordinary range (no control labels or backing alias).
     can_batch_copy: ?*const fn (?*anyopaque, u64, u64, usize) bool = null,
@@ -1417,6 +1420,7 @@ const GuestBufferEntry = struct {
     gpu_dirty: bool = false,
     /// A deferred result belongs to the allocation that existed when written.
     backing_was_accessible: bool = false,
+    backing_identity: u64 = 0,
     pending_writes: buffer_write_ranges.Ranges = .{ .whole = true },
     /// Exact later command-processor writes that an older readback must spare.
     /// Overflow is drained before accepting another write, never widened.
@@ -1484,6 +1488,53 @@ test "deferred storage retires released backing before submitting a readback" {
     try renderer.flushGuestStoragePrefixOrdered(0, 4096);
     try std.testing.expect(!entries[0].gpu_dirty);
     try renderer.flushGuestStoragePrefix(0, 4096);
+}
+
+test "deferred storage rejects a new allocation at the same still-readable VA" {
+    const Fixture = struct {
+        identity: u64 = 10,
+        fn accessible(_: ?*anyopaque, _: u64, _: usize) bool {
+            return true;
+        }
+        fn mapping(raw: ?*anyopaque, _: u64, _: usize) u64 {
+            return @as(*@This(), @ptrCast(@alignCast(raw.?))).identity;
+        }
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    var fixture = Fixture{};
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.* = undefined;
+    renderer.guest_memory = .{ .context = &fixture, .read = Fixture.read, .write = Fixture.write, .range_accessible = Fixture.accessible, .mapping_identity = Fixture.mapping };
+    var entries = [_]GuestBufferEntry{.{
+        .descriptor_index = 0,
+        .guest_address = 0x1000,
+        .size = 4096,
+        .device_local = .{ .handle = 1, .memory = 0, .size = 4096 },
+        .last_used_sequence = 1,
+        .gpu_dirty = true,
+        .backing_was_accessible = true,
+        .backing_identity = 10,
+        .page_generation = 5,
+    }};
+    renderer.guest_buffers = .{ .items = &entries, .capacity = 1 };
+    renderer.deferred_shader_metadata_slots = .initEmpty();
+    try std.testing.expect(!renderer.discardUnmappedGuestBuffer(0));
+    fixture.identity = 11;
+    try std.testing.expect(renderer.discardUnmappedGuestBuffer(0));
+    try std.testing.expect(!entries[0].gpu_dirty);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].page_generation);
+    entries[0].gpu_dirty = true;
+    entries[0].backing_was_accessible = true;
+    entries[0].backing_identity = 11;
+    fixture.identity = 0; // Replacement can split the range across allocations.
+    try renderer.flushGuestStoragePrefixOrdered(0, 4096);
+    try std.testing.expect(!entries[0].gpu_dirty);
 }
 
 test "buffer victims follow recency while preserving dirty and active bindings" {
@@ -7299,6 +7350,7 @@ pub const Renderer = struct {
         }
 
         if (cache_hit and !recycled_entry) {
+            _ = self.discardUnmappedGuestBuffer(entry_index.?);
             // Merge explicit CP bytes before another shader uses the old
             // backing. Deferred publication preserves them in guest memory.
             if (self.guest_buffers.items[entry_index.?].pending_host_writes.count != 0)
@@ -7306,6 +7358,10 @@ pub const Renderer = struct {
             try self.synchronizeGuestBufferAliases(entry_index.?);
         }
         const entry = &self.guest_buffers.items[entry_index.?];
+        entry.backing_identity = if (memory.mapping_identity) |identity|
+            identity(memory.context, guest_address, size)
+        else
+            0;
         entry.last_alias_sync_sequence = self.guest_buffer_sequence;
         entry.last_used_sequence = self.guest_buffer_sequence;
         self.guest_buffer_recency.touch(entry_index.?);
@@ -7562,12 +7618,20 @@ pub const Renderer = struct {
 
     fn discardUnmappedGuestBuffer(self: *Renderer, index: usize) bool {
         const entry = &self.guest_buffers.items[index];
-        if (!entry.gpu_dirty or !entry.backing_was_accessible) return false;
+        if (!entry.gpu_dirty) return false;
         const memory = self.guest_memory orelse return false;
-        const accessible = memory.range_accessible orelse return false;
         const size = std.math.cast(usize, entry.size) orelse return false;
-        if (accessible(memory.context, entry.guest_address, size)) return false;
-        // A partially released allocation cannot receive its old GPU result.
+        const replaced = entry.backing_identity != 0 and if (memory.mapping_identity) |identity|
+            identity(memory.context, entry.guest_address, size) != entry.backing_identity
+        else
+            false;
+        const unmapped = entry.backing_was_accessible and if (memory.range_accessible) |accessible|
+            !accessible(memory.context, entry.guest_address, size)
+        else
+            false;
+        if (!replaced and !unmapped) return false;
+        // An address may already be readable again but belong to another
+        // allocation. Neither it nor a hole can receive this old GPU result.
         // Retire before queuing a readback: otherwise every eviction retries
         // the same failed write and blocks unrelated resource bindings.
         entry.gpu_dirty = false;
@@ -7649,6 +7713,8 @@ pub const Renderer = struct {
         }
         const mapping = try self.mapStorageReadbackRanges(entry, size, spans);
         defer mapping.release(self);
+        // Waiting for Vulkan completion can let the guest replace this VA.
+        if (self.discardUnmappedGuestBuffer(index)) return;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const clipped = try self.publishGuestStorageBytes(index, mapping.bytes, spans);
         var published_size: usize = 0;

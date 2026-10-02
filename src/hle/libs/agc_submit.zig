@@ -993,6 +993,14 @@ fn rememberSubmissionRange(stream: []const u32, protect_header: bool) void {
 }
 
 fn resolveSubmissionAlias(address: u64, byte_length: usize) ?u64 {
+    const resolved = findSubmissionAlias(address, byte_length) orelse return null;
+    // Submission history can outlive the CPU allocation. Recheck after releasing
+    // the alias lock; mapping queries take a separate lock. A released newest
+    // match must not revive an older arena with the same compact address.
+    return if (memory.isGuestRangeAccessible(resolved, byte_length)) resolved else null;
+}
+
+fn findSubmissionAlias(address: u64, byte_length: usize) ?u64 {
     const low = address & 0xffff_ffff;
     const length: u64 = byte_length;
     submission_alias_lock.lock();
@@ -1008,8 +1016,6 @@ fn resolveSubmissionAlias(address: u64, byte_length: usize) ?u64 {
         if (low < alias_low) continue;
         const offset = low - alias_low;
         if (offset > alias.byte_length or length > alias.byte_length - offset) continue;
-        // The arena itself was validated when the submission was accepted.
-        // Callers use this fallback only after ruling out a readable full VA.
         return alias.cpu_address + offset;
     }
     return null;
@@ -1070,6 +1076,16 @@ pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
 
 pub fn guestRangeAccessible(_: ?*anyopaque, address: u64, size: usize) bool {
     return resolveGuestMemoryAddress(address, size) != null;
+}
+
+pub fn guestMappingIdentity(context: ?*anyopaque, address: u64, size: usize) u64 {
+    const space = addressSpaceFromContext(context) orelse return 0;
+    // Normal resource VAs need no compact-address lookup on this path.
+    const identity = space.mappingIdentity(address, size);
+    if (identity != 0) return identity;
+    if (memory.isGuestRangeAccessible(address, size)) return 0;
+    const alias = resolveSubmissionAlias(address, size) orelse return 0;
+    return space.mappingIdentity(alias, size);
 }
 
 /// Only ordinary, disjoint guest backing can combine word-copy
@@ -4577,6 +4593,37 @@ test "compact GPU label address resolves into submitted CPU arena" {
     var observed: u32 = 0;
     try testing.expect(readGuestMemory(null, gpu_address, std.mem.asBytes(&observed)));
     try testing.expectEqual(value, observed);
+}
+
+test "compact command aliases reject released backing without reviving older arenas" {
+    reset();
+    defer reset();
+    var address_space = try guest_address_space.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    memory.attachAddressSpace(&address_space);
+    defer memory.attachAddressSpace(null);
+    const older_address = 0x2012340000;
+    const newer_address = 0x3012340000;
+    const compact_address = 0x11234001c;
+    const page = guest_address_space.page_size;
+    try address_space.mapFixed(older_address, page, .read_write, .private, null);
+    try address_space.mapFixed(newer_address, page, .read_write, .private, null);
+    const older: [*]u32 = @ptrFromInt(older_address);
+    const newer: [*]u32 = @ptrFromInt(newer_address);
+    older[7] = 0x1234;
+    newer[7] = 0x5678;
+    rememberSubmissionAlias(older[0..16]);
+    rememberSubmissionAlias(newer[0..16]);
+    var word: u32 = 0;
+    try testing.expect(readGuestMemory(null, compact_address, std.mem.asBytes(&word)));
+    try testing.expectEqual(@as(u32, 0x5678), word);
+
+    try address_space.unmap(newer_address, page);
+    try testing.expectEqual(@as(?u64, null), resolveSubmissionAlias(compact_address, 4));
+    try testing.expect(!readGuestMemory(null, compact_address, std.mem.asBytes(&word)));
+    try testing.expectEqual(@as(?u64, null), fingerprintGuestMemory(null, compact_address, 4));
+    try testing.expect(!writeGuestMemory(null, compact_address, std.mem.asBytes(&word)));
+    try testing.expectEqual(@as(u32, 0x1234), older[7]);
 }
 
 test "full guest addresses win over matching command arena low bits" {
