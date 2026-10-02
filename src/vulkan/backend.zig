@@ -5063,6 +5063,8 @@ pub const Renderer = struct {
     guest_buffer_device_bytes: u64 = 0,
     guest_buffer_address_index: @import("sampled_image_index.zig").Index(maximum_retained_buffer_entries) = .{},
     guest_buffer_overlap_index: @import("buffer_overlap_index.zig").Index(maximum_retained_buffer_entries) = .{},
+    /// Diagnostic control for comparing exact alias queries with linear scans.
+    indexed_buffer_alias_queries: bool = true,
     guest_buffer_write_history: @import("buffer_write_history.zig").History(128) = .{},
     guest_buffer_recency: @import("buffer_recency.zig").Index(maximum_retained_buffer_entries) = .{},
     active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
@@ -7589,7 +7591,9 @@ pub const Renderer = struct {
         if (!self.guest_buffer_write_history.mayOverlapSince(entry.guest_address, entry.size, since)) return;
         self.frame_profile.buffer_alias_scans +|= 1;
         var changed = false;
-        for (self.guest_buffers.items, 0..) |other, candidate| {
+        var candidates = self.bufferAliasCandidates(entry.guest_address, @intCast(entry.size));
+        while (candidates.next()) |candidate| {
+            const other = &self.guest_buffers.items[candidate];
             if (candidate == index or other.last_gpu_write_sequence <= since or
                 other.guest_address >= entry.guest_address + entry.size or
                 other.guest_address + other.size <= entry.guest_address) continue;
@@ -7646,6 +7650,13 @@ pub const Renderer = struct {
         return true;
     }
 
+    fn bufferAliasCandidates(self: *Renderer, address: u64, size: usize) @import("buffer_overlap_index.zig").Index(maximum_retained_buffer_entries).Iterator {
+        return if (self.indexed_buffer_alias_queries)
+            self.guest_buffer_overlap_index.candidates(self.guest_buffers.items, address, size)
+        else
+            .{ .linear_end = self.guest_buffers.items.len };
+    }
+
     fn flushGuestStoragePrefix(self: *Renderer, index: usize, requested_size: usize) (Error || std.mem.Allocator.Error)!void {
         if (index >= self.guest_buffers.items.len) return Error.GuestBufferNotStaged;
         if (!self.guest_buffers.items[index].gpu_dirty or requested_size == 0) return;
@@ -7666,7 +7677,9 @@ pub const Renderer = struct {
             const current = pending.items[cursor];
             const owner = &self.guest_buffers.items[current];
             const end = owner.guest_address + @min(owner.size, if (current == index) requested_size else std.math.maxInt(usize));
-            for (self.guest_buffers.items, 0..) |*other, candidate| {
+            var candidates = self.bufferAliasCandidates(owner.guest_address, @intCast(end - owner.guest_address));
+            while (candidates.next()) |candidate| {
+                const other = &self.guest_buffers.items[candidate];
                 if (!other.gpu_dirty or selected.isSet(candidate) or
                     other.last_gpu_write_sequence <= owner.last_gpu_write_sequence or
                     other.guest_address >= end or other.guest_address + other.size <= owner.guest_address) continue;
@@ -7775,7 +7788,9 @@ pub const Renderer = struct {
         for (entry.pending_host_writes.spans[0..entry.pending_host_writes.count]) |span| {
             if (span.first < bytes.len) try protected.append(allocator, .{ .first = span.first, .end = @min(span.end, bytes.len) });
         }
-        for (self.guest_buffers.items) |other| {
+        var candidates = self.bufferAliasCandidates(entry.guest_address, bytes.len);
+        while (candidates.next()) |candidate| {
+            const other = &self.guest_buffers.items[candidate];
             if (other.last_gpu_write_sequence <= entry.last_gpu_write_sequence or
                 other.guest_address >= end or other.guest_address + other.size <= entry.guest_address) continue;
             try protected.append(allocator, .{
@@ -7846,7 +7861,9 @@ pub const Renderer = struct {
     fn flushGuestStorageBeforeRemoval(self: *Renderer, index: usize) (Error || std.mem.Allocator.Error)!void {
         const removed = self.guest_buffers.items[index];
         if (removed.last_gpu_write_sequence != 0) {
-            for (self.guest_buffers.items, 0..) |other, older_index| {
+            var candidates = self.bufferAliasCandidates(removed.guest_address, @intCast(removed.size));
+            while (candidates.next()) |older_index| {
+                const other = &self.guest_buffers.items[older_index];
                 if (!other.gpu_dirty or other.last_gpu_write_sequence >= removed.last_gpu_write_sequence or
                     other.guest_address >= removed.guest_address + removed.size or
                     other.guest_address + other.size <= removed.guest_address) continue;

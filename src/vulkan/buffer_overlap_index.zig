@@ -80,14 +80,24 @@ pub fn Index(comptime capacity: usize) type {
 
         pub fn candidates(self: *Self, items: anytype, address: u64, size: usize) Iterator {
             if (size == 0) return .{};
-            // Large DMA spans may cover many tiny regions. Retain bounded query
-            // work and every possible overlap through the original linear scan.
-            if (items.len > capacity or size > 64) return .{ .linear_end = items.len };
+            if (items.len > capacity) return .{ .linear_end = items.len };
             if (!self.valid) {
                 @memset(&self.heads, empty);
                 self.levels = 0;
                 self.valid = true;
                 for (items, 0..) |item, slot| self.insert(slot, item.guest_address, item.size);
+            }
+            // Bound actual bucket work, not byte length: a 4 KiB resource can
+            // cover few occupied regions while a short write spans many tiny
+            // ones. Wide/dense queries retain the complete linear fallback.
+            var budget: u64 = @min(256, @max(16, items.len / 8));
+            var occupied = self.levels;
+            while (occupied != 0) {
+                const height: u7 = @intCast(@ctz(occupied));
+                occupied &= occupied - 1;
+                const count = (region(address +| (size - 1), height) - region(address, height)) +| 1;
+                if (count > budget) return .{ .linear_end = items.len };
+                budget -= count;
             }
             var result = Iterator{};
             var levels = self.levels;
@@ -187,4 +197,25 @@ test "short writes avoid scanning a full resident cache" {
     }
     try std.testing.expect(narrow and wide);
     try std.testing.expect(checked < 64);
+}
+
+test "buffer-sized overlap queries avoid scanning unrelated allocations" {
+    const Entry = struct { guest_address: u64, size: u64 };
+    var entries: [4096]Entry = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = .{ .guest_address = 0x100000 + i * 4096, .size = 128 };
+    entries[4000] = .{ .guest_address = 0x100000, .size = 8 * 1024 * 1024 };
+    var index = Index(4096){};
+    for ([_]usize{ 128, 512, 4096 }) |size| {
+        var candidates = index.candidates(&entries, entries[1200].guest_address, size);
+        var checked: usize = 0;
+        var narrow = false;
+        var wide = false;
+        while (candidates.next()) |slot| {
+            checked += 1;
+            narrow = narrow or slot == 1200;
+            wide = wide or slot == 4000;
+        }
+        try std.testing.expect(narrow and wide);
+        try std.testing.expect(checked < 64);
+    }
 }
