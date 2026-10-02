@@ -873,6 +873,8 @@ const WindowsX64Machine = struct {
         entry_point: u64,
         stack_pointer: u64,
     ) u64 {
+        const firmware_state = hle.host_stack.CallState.capture();
+        defer firmware_state.restore();
         return ps5NativeCallWindowsX64(
             frame,
             entry_point,
@@ -5140,6 +5142,29 @@ test "Windows context compatibility advances AMD wait instructions" {
     } else {
         return error.SkipZigTest;
     }
+}
+
+test "native bridge restores firmware state after escapes and nested callbacks" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+    defer hle.host_stack.release();
+    const Probe = struct {
+        fn escape(frame: *NativeCallFrame) void {
+            NativeMachine.escape(frame);
+        }
+        fn entry(frame: *NativeCallFrame) callconv(.{ .x86_64_sysv = .{} }) u64 {
+            hle.host_stack.call(void, escape, .{frame});
+            unreachable;
+        }
+        fn check() !void {
+            const before = hle.host_stack.CallState.capture();
+            var frame: NativeCallFrame align(16) = .{};
+            frame.guest_arguments[0] = @intFromPtr(&frame);
+            try testing.expectEqual(@as(u64, 0), NativeMachine.call(&frame, @intFromPtr(&entry), 0));
+            try testing.expectEqualDeep(before, hle.host_stack.CallState.capture());
+        }
+    };
+    try Probe.check();
+    try hle.host_stack.call(anyerror!void, Probe.check, .{});
 }
 
 test "native bridge contains guest access and illegal instruction faults" {

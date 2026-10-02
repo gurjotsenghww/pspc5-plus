@@ -55,6 +55,41 @@ pub fn suspendedStack() ?*const SuspendedStack {
     return suspended_stack;
 }
 
+/// A native guest escape can bypass call's normal return and defers. Capture
+/// at the native bridge boundary, including nested callbacks, so returning to
+/// its saved stack also restores the corresponding Windows exception bounds.
+pub const CallState = struct {
+    was_active: bool,
+    suspended: ?*const SuspendedStack,
+    stack_base: u64,
+    stack_limit: u64,
+
+    pub fn capture() CallState {
+        return .{
+            .was_active = active,
+            .suspended = suspended_stack,
+            .stack_base = if (supported) asm volatile ("movq %%gs:8, %[value]"
+                : [value] "=r" (-> u64),
+            ) else 0,
+            .stack_limit = if (supported) asm volatile ("movq %%gs:16, %[value]"
+                : [value] "=r" (-> u64),
+            ) else 0,
+        };
+    }
+
+    pub fn restore(self: CallState) void {
+        active = self.was_active;
+        suspended_stack = self.suspended;
+        if (supported) asm volatile (
+            \\movq %[base], %%gs:8
+            \\movq %[limit], %%gs:16
+            :
+            : [base] "r" (self.stack_base),
+              [limit] "r" (self.stack_limit),
+            : .{ .memory = true });
+    }
+};
+
 /// The top of this thread's firmware stack, or zero if it has none.
 ///
 /// Allocation happens on first use and is deliberately small-framed, so it can
@@ -108,14 +143,28 @@ comptime {
         \\  pushq %r15
         \\  movq %rsp, %r10
         \\  movq %r10, (%r9)
+        \\  movq %gs:8, %rax
+        \\  movq %gs:16, %r11
         \\  movq %r8, %rsp
         \\  pushq %r10
-        // The pushed word leaves rsp 8 past alignment. Thirty-two bytes of
+        \\  pushq %rax
+        \\  pushq %r11
+        // Windows validates frames against NT_TIB.StackBase/StackLimit during
+        // SEH dispatch. Leaving the original bounds here makes even a handled
+        // OutputDebugString exception terminate a non-debugged process.
+        \\  movq %r8, %gs:8
+        \\  leaq -4194304(%r8), %rax
+        \\  movq %rax, %gs:16
+        // Three pushed words leave rsp 8 past alignment. Thirty-two bytes of
         // shadow space are mandatory for the callee, and eight more restore the
         // sixteen-byte alignment the convention requires at the call.
         \\  subq $40, %rsp
         \\  callq *%rdx
         \\  addq $40, %rsp
+        \\  popq %r11
+        \\  movq %r11, %gs:16
+        \\  popq %rax
+        \\  movq %rax, %gs:8
         \\  popq %r10
         \\  movq %r10, %rsp
         \\  popq %r15
@@ -176,8 +225,40 @@ pub fn call(comptime Result: type, comptime func: anytype, args: anytype) Result
 
 const testing = std.testing;
 
+const DebugOutput = struct {
+    extern "kernel32" fn OutputDebugStringA([*:0]const u8) callconv(.winapi) void;
+    extern "kernel32" fn OutputDebugStringW([*:0]const u16) callconv(.winapi) void;
+};
+
+test "Windows debug output returns on firmware stacks and restores native bounds" {
+    if (!supported) return error.SkipZigTest;
+    defer release();
+    const original = CallState.capture();
+    const Probe = struct {
+        fn output() !void {
+            var local: u64 = 0;
+            const state = CallState.capture();
+            try testing.expect(state.was_active);
+            try testing.expect(@intFromPtr(&local) >= state.stack_limit);
+            try testing.expect(@intFromPtr(&local) < state.stack_base);
+            try testing.expectEqual(@as(u64, stack_size), state.stack_base - state.stack_limit);
+            DebugOutput.OutputDebugStringA("PS5PCEM firmware stack regression");
+            DebugOutput.OutputDebugStringW(std.unicode.utf8ToUtf16LeStringLiteral("PS5PCEM firmware stack regression"));
+        }
+        fn nested() !void {
+            const before = CallState.capture();
+            try call(anyerror!void, output, .{});
+            try testing.expectEqualDeep(before, CallState.capture());
+        }
+    };
+    try call(anyerror!void, Probe.nested, .{});
+    try testing.expectEqualDeep(original, CallState.capture());
+    DebugOutput.OutputDebugStringA("PS5PCEM restored native stack regression");
+}
+
 comptime {
     std.debug.assert(@sizeOf(SuspendedStack) == 7 * @sizeOf(u64));
+    std.debug.assert(stack_size == 4194304); // Shared with the switch assembly.
     if (supported and builtin.is_test) asm (
         \\.text
         \\.p2align 4
