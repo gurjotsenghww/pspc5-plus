@@ -4820,6 +4820,14 @@ const Lock = struct {
     }
 };
 
+const DrawScalarScratch = struct {
+    vertex: gpu.ScalarEvaluation,
+    vertex_seeded: gpu.ScalarEvaluation,
+    fragment: gpu.ScalarEvaluation,
+    vertex_registers: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister,
+    fragment_registers: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister,
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     loader: Loader,
@@ -5332,6 +5340,7 @@ pub const Renderer = struct {
     image_scratch: @import("scratch_pool.zig").Pool = .{},
     index_scratch: @import("scratch_pool.zig").Pool = .{ .minimum_cache_bytes = 1, .maximum_cache_bytes = 4 * 1024 * 1024 },
     checkpoint_scratch: gpu.resource_checkpoints.Pool = .{},
+    draw_scalar_scratch: ?*DrawScalarScratch = null,
     resource_preparation: gpu.resource_preparation.Pool = .{},
     resource_preparation_in_use: bool = false,
     resource_preparation_bindings: [2]?*const gpu.ShaderBindings = @splat(null),
@@ -5366,6 +5375,8 @@ pub const Renderer = struct {
         self.image_scratch.deinit(self.allocator);
         self.index_scratch.deinit(self.allocator);
         self.checkpoint_scratch.deinit(self.allocator);
+        if (self.draw_scalar_scratch) |scratch| self.allocator.destroy(scratch);
+        self.draw_scalar_scratch = null;
         for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| resource.destroy(self.allocator);
         self.free_compute_resource_count = 0;
         for (self.free_graphics_resources[0..self.free_graphics_resource_count]) |resource| resource.destroy(self.allocator);
@@ -20117,24 +20128,33 @@ pub const Renderer = struct {
         // programs interleave SMEM loads after a few VALU ops. Preserve each
         // recovered load at its producer PC; a final SGPR snapshot is invalid
         // for NGG shaders which reuse the same registers many times.
+        // Large per-draw arrays otherwise force hundreds of stack-page probes
+        // on every call. Borrow storage exclusively; nested draws own another
+        // allocation, and each evaluator/collector initializes its used range.
+        const scalar_scratch = self.draw_scalar_scratch orelse try self.allocator.create(DrawScalarScratch);
+        self.draw_scalar_scratch = null;
+        defer {
+            if (self.draw_scalar_scratch) |nested| self.allocator.destroy(nested);
+            self.draw_scalar_scratch = scalar_scratch;
+        }
         const vertex_provenance_started = hostTimestampNs();
-        var vertex_scalar: gpu.ScalarEvaluation = undefined;
-        const prepared_vertex = owns_preparation and (self.resource_preparation.takeScalar(1, &vertex_bindings, vertex_instructions, reader, &vertex_scalar) or
-            self.resource_preparation.startScalar(1, reader, &vertex_bindings, vertex_instructions, if (vertex_analysis.resource_checkpoints) |*plan| plan else null, &vertex_scalar));
+        const vertex_scalar = &scalar_scratch.vertex;
+        const prepared_vertex = owns_preparation and (self.resource_preparation.takeScalar(1, &vertex_bindings, vertex_instructions, reader, vertex_scalar) or
+            self.resource_preparation.startScalar(1, reader, &vertex_bindings, vertex_instructions, if (vertex_analysis.resource_checkpoints) |*plan| plan else null, vertex_scalar));
         if (!prepared_vertex) gpu.scalar_provenance.evaluateDecodedResourceStateInto(
-            &vertex_scalar,
+            vertex_scalar,
             reader,
             &vertex_bindings,
             vertex_instructions,
         );
         self.frame_profile.scalar_provenance_ns +|= elapsedHostNanoseconds(vertex_provenance_started);
         const vertex_scalar_end: u32 = 0x0010_0000;
-        var vertex_scalar_regs: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister = undefined;
-        var vertex_scalar_count = collectScalarLoadSpecializations(&vertex_scalar, &vertex_scalar_regs);
+        const vertex_scalar_regs = &scalar_scratch.vertex_registers;
+        var vertex_scalar_count = collectScalarLoadSpecializations(vertex_scalar, vertex_scalar_regs);
         vertex_scalar_count = mergeUserDataScalars(
             &vertex_bindings,
             vertex_bindings.scalar_user_data_base,
-            &vertex_scalar_regs,
+            vertex_scalar_regs,
             vertex_scalar_count,
         );
         if (vertex_stage == .export_shader and vertex_scalar_count < vertex_scalar_regs.len) {
@@ -20152,33 +20172,33 @@ pub const Renderer = struct {
         // Attribute metadata helps resource discovery, but its V# register
         // names describe a later fetch, not the shader's entry ABI. Keep
         // synthetic descriptors out of the actual initial scalar values.
-        var vertex_scalar_mut: gpu.ScalarEvaluation = undefined;
-        vertex_scalar_mut.copyFrom(&vertex_scalar);
+        const vertex_scalar_mut = &scalar_scratch.vertex_seeded;
+        vertex_scalar_mut.copyFrom(vertex_scalar);
         seedVertexBufferEvaluation(
             &vertex_bindings,
             reader,
             vertex_instructions,
-            &vertex_scalar_mut,
+            vertex_scalar_mut,
         );
 
         const fragment_provenance_started = hostTimestampNs();
-        var fragment_scalar: gpu.ScalarEvaluation = undefined;
-        const prepared_fragment = owns_preparation and (self.resource_preparation.takeScalar(0, &fragment_bindings, fragment_analysis.program.instructions.items, reader, &fragment_scalar) or
-            self.resource_preparation.startScalar(0, reader, &fragment_bindings, fragment_analysis.program.instructions.items, if (fragment_analysis.resource_checkpoints) |*plan| plan else null, &fragment_scalar));
+        const fragment_scalar = &scalar_scratch.fragment;
+        const prepared_fragment = owns_preparation and (self.resource_preparation.takeScalar(0, &fragment_bindings, fragment_analysis.program.instructions.items, reader, fragment_scalar) or
+            self.resource_preparation.startScalar(0, reader, &fragment_bindings, fragment_analysis.program.instructions.items, if (fragment_analysis.resource_checkpoints) |*plan| plan else null, fragment_scalar));
         if (!prepared_fragment) gpu.scalar_provenance.evaluateDecodedResourceStateInto(
-            &fragment_scalar,
+            fragment_scalar,
             reader,
             &fragment_bindings,
             fragment_analysis.program.instructions.items,
         );
         self.frame_profile.scalar_provenance_ns +|= elapsedHostNanoseconds(fragment_provenance_started);
         const fragment_scalar_end: u32 = 0x0010_0000;
-        var fragment_scalar_regs: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister = undefined;
-        var fragment_scalar_count = collectScalarLoadSpecializations(&fragment_scalar, &fragment_scalar_regs);
+        const fragment_scalar_regs = &scalar_scratch.fragment_registers;
+        var fragment_scalar_count = collectScalarLoadSpecializations(fragment_scalar, fragment_scalar_regs);
         fragment_scalar_count = mergeUserDataScalars(
             &fragment_bindings,
             fragment_bindings.scalar_user_data_base,
-            &fragment_scalar_regs,
+            fragment_scalar_regs,
             fragment_scalar_count,
         );
         // Keep each recovered load at its producer PC. Shaders reuse T#/S#
@@ -20206,7 +20226,7 @@ pub const Renderer = struct {
             reader,
             vertex_analysis,
             vertex_instructions,
-            &vertex_scalar_mut,
+            vertex_scalar_mut,
             vertex_scalar_end,
             null,
             graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
@@ -20619,7 +20639,7 @@ pub const Renderer = struct {
             reader,
             fragment_analysis,
             fragment_analysis.program.instructions.items,
-            &fragment_scalar,
+            fragment_scalar,
             fragment_scalar_end,
             vertex_storage,
             graphics_resources.mappings[0..fragment_mapping_count],
@@ -20653,7 +20673,7 @@ pub const Renderer = struct {
         // suppress the real loads and turn complex post-processing black.
         if (fragment_storage.mapping_count == 0) {
             fragment_scalar_count = ensureIdentityFragmentScale(
-                &fragment_scalar_regs,
+                fragment_scalar_regs,
                 fragment_scalar_count,
             );
         }
@@ -21172,8 +21192,8 @@ pub const Renderer = struct {
                     draw_key,
                     draw_input_key,
                     if (self.frame_profile.bounded_vertex_fetches != bounded_fetches_before) DrawFetchBounds.init(vertex_range, draw) else null,
-                    &vertex_scalar,
-                    &fragment_scalar,
+                    vertex_scalar,
+                    fragment_scalar,
                     tessellation == null and vertex_instruction_storage.items.len == 0 and fragment_specialization == null and
                         drawReuseShapeSafe(vertex_stage, render_state.primitive_type, draw) and
                         fragment_words.ptr == fragment_module.words.ptr and shaderResourcesAreReadOnly(vertex_analysis, vertex_instructions) and

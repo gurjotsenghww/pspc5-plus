@@ -38,7 +38,9 @@ pub fn appendMissingPointerLoads(
     for (output[0..count]) |entry| if (entry.producer_pc) |pc| {
         if (pc / 4 < seen.capacity()) seen.set(pc / 4);
     };
-    const empty = scalar.Evaluation{};
+    // The resolver borrows only registers. Keeping a complete Evaluation here
+    // reserves unused load-history storage in every draw's stack frame.
+    const empty: scalar.ScalarRegisters = @splat(.{});
     var end = count;
     var resource_instructions = checkpoints.Iterator.init(instructions, plan, .resource);
     while (resource_instructions.next()) |instruction_index| {
@@ -54,7 +56,7 @@ pub fn appendMissingPointerLoads(
         if (pointer_register >= 127 or inst.data_words == 0 or
             inst.data_words > 16 or destination + inst.data_words > 128 or inst.memory_offset < 0) continue;
         if (output.len - end < inst.data_words) break;
-        var resolver = Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = graph, .snapshot = &empty.registers, .definition_cache = cache };
+        var resolver = Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = graph, .snapshot = &empty, .definition_cache = cache };
         var base: [2]u32 = undefined;
         if (!(resolver.words(@intCast(pointer_register), inst.pc, &base) catch false) or base[1] > 0xffff) continue;
         const pointer = @as(u64, base[0]) | (@as(u64, base[1]) << 32);
