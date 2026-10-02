@@ -5348,6 +5348,7 @@ pub const Renderer = struct {
     checkpoint_scratch: gpu.resource_checkpoints.Pool = .{},
     draw_scalar_scratch: ?*DrawScalarScratch = null,
     sampled_descriptor_scratch: ?*SampledDescriptorScratch = null,
+    buffer_image_candidate_scratch: ?*BufferImageCandidates = null,
     resource_preparation: gpu.resource_preparation.Pool = .{},
     resource_preparation_in_use: bool = false,
     resource_preparation_bindings: [2]?*const gpu.ShaderBindings = @splat(null),
@@ -5386,6 +5387,8 @@ pub const Renderer = struct {
         self.draw_scalar_scratch = null;
         if (self.sampled_descriptor_scratch) |scratch| self.allocator.destroy(scratch);
         self.sampled_descriptor_scratch = null;
+        if (self.buffer_image_candidate_scratch) |scratch| self.allocator.destroy(scratch);
+        self.buffer_image_candidate_scratch = null;
         for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| resource.destroy(self.allocator);
         self.free_compute_resource_count = 0;
         for (self.free_graphics_resources[0..self.free_graphics_resource_count]) |resource| resource.destroy(self.allocator);
@@ -11845,7 +11848,8 @@ pub const Renderer = struct {
                 if (!writable and bindings.stage == .compute and
                     try resolveUniformNullImage(bindings, reader, analysis, instruction_scalar, inst)) continue;
                 if (!writable and bindings.stage == .compute and self.sampled_image_nonuniform_indexing) {
-                    if (try resolveBufferImageCandidates(bindings, reader, analysis, instruction_scalar, inst)) |candidates| {
+                    if (try self.borrowBufferImageCandidates(bindings, reader, analysis, instruction_scalar, inst)) |candidates| {
+                        defer self.releaseBufferImageCandidates(candidates);
                         var compressed = true;
                         for (candidates.words[0..candidates.count]) |words| {
                             const image = try gpu.resources.decodeImageDescriptor(&words);
@@ -12043,13 +12047,14 @@ pub const Renderer = struct {
                 descriptor_slot,
                 inst.imageResourceWords(),
             );
-            const candidates = if (direct_image == null and try resolveUniformNullImage(bindings, reader, analysis, instruction_scalar, inst))
-                BufferImageCandidates{}
-            else if (direct_image == null and self.sampled_image_nonuniform_indexing)
-                try resolveBufferImageCandidates(bindings, reader, analysis, instruction_scalar, inst)
+            const uniform_null = direct_image == null and try resolveUniformNullImage(bindings, reader, analysis, instruction_scalar, inst);
+            const candidate_scratch = if (direct_image == null and !uniform_null and self.sampled_image_nonuniform_indexing)
+                try self.borrowBufferImageCandidates(bindings, reader, analysis, instruction_scalar, inst)
             else
                 null;
-            if (direct_image == null and candidates == null) {
+            defer if (candidate_scratch) |scratch| self.releaseBufferImageCandidates(scratch);
+            const candidate_table: ?*const BufferImageCandidates = if (uniform_null) &empty_buffer_image_candidates else candidate_scratch;
+            if (direct_image == null and candidate_table == null) {
                 self.reportResourceFailure(bindings, inst, instruction_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: T# s{d}:s{d} unresolved\n",
@@ -12057,10 +12062,9 @@ pub const Renderer = struct {
                 );
                 return Error.UnsupportedSampledImage;
             }
-            // The candidate array is 256 KiB. Borrow its optional payload so
-            // accessing one descriptor or sampler does not copy the whole
-            // table on every iteration in ReleaseSafe builds.
-            const candidate_table: ?*const BufferImageCandidates = if (candidates) |*table| table else null;
+            // Direct descriptors never reserve the 256 KiB fallback table.
+            // An indirect instruction keeps exclusive scratch until staging
+            // finishes, including any nested resource preparation.
             const candidate_count: usize = if (candidate_table) |table| table.count else 1;
             if (candidate_count == 0) {
                 result.sampled_image_mappings[result.sampled_image_mapping_count] = .{
@@ -22330,7 +22334,7 @@ pub const Renderer = struct {
         }
     }
 
-    fn appendIndirectGraphicsImages(
+    noinline fn appendIndirectGraphicsImages(
         self: *Renderer,
         result: *GraphicsResources,
         bindings: *const gpu.ShaderBindings,
@@ -22344,7 +22348,9 @@ pub const Renderer = struct {
     ) anyerror!bool {
         const uniform_null = try resolveUniformNullImage(bindings, reader, analysis, scalar, inst);
         if (!uniform_null and !self.sampled_image_nonuniform_indexing) return false;
-        const candidates = if (uniform_null) BufferImageCandidates{} else (try resolveBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
+        const candidate_scratch = if (uniform_null) null else (try self.borrowBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
+        defer if (candidate_scratch) |scratch| self.releaseBufferImageCandidates(scratch);
+        const candidates: *const BufferImageCandidates = if (uniform_null) &empty_buffer_image_candidates else candidate_scratch.?;
         // Graphics has no dispatch fault readback; keep its previous strict
         // behavior until an equivalent draw-completion check is available.
         if (candidates.requires_null_check) return false;
@@ -22401,6 +22407,33 @@ pub const Renderer = struct {
             result.mapping_count += 1;
         }
         return true;
+    }
+
+    // Keep large by-value resolver results off the common draw/dispatch stack.
+    // These helpers run only when an image actually needs indirect recovery.
+    // Nested preparation owns a separate allocation; only a free table is cached.
+    noinline fn borrowBufferImageCandidates(
+        self: *Renderer,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+        scalar: *const gpu.scalar_provenance.ScalarRegisters,
+        inst: gpu.ShaderInstruction,
+    ) anyerror!?*BufferImageCandidates {
+        const scratch = self.buffer_image_candidate_scratch orelse try self.allocator.create(BufferImageCandidates);
+        self.buffer_image_candidate_scratch = null;
+        errdefer self.releaseBufferImageCandidates(scratch);
+        const candidates = (try resolveBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse {
+            self.releaseBufferImageCandidates(scratch);
+            return null;
+        };
+        scratch.* = candidates;
+        return scratch;
+    }
+
+    fn releaseBufferImageCandidates(self: *Renderer, scratch: *BufferImageCandidates) void {
+        if (self.buffer_image_candidate_scratch) |nested| self.allocator.destroy(nested);
+        self.buffer_image_candidate_scratch = scratch;
     }
 
     fn createBuffer(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags) Error!OwnedBuffer {
@@ -34322,6 +34355,8 @@ const BufferImageCandidates = struct {
     sampler: ?gpu.resources.SamplerDescriptor = null,
     requires_null_check: bool = false,
 };
+
+const empty_buffer_image_candidates = BufferImageCandidates{};
 
 /// Stores candidate indices rather than duplicating the descriptor payload.
 /// Half-full open addressing keeps large material tables linear to recover.
