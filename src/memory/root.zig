@@ -325,6 +325,56 @@ test "mapping identities survive splits and reject remapped allocation backing" 
     try std.testing.expectEqual(@as(u64, 0), space.mappingIdentity(std.math.maxInt(u64), 2));
 }
 
+test "rejected partial direct unmap leaves earlier Windows views intact" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const base = user.start;
+    const granule = windows_allocation_granularity;
+    for ([_]bool{ false, true }) |private_prefix| {
+        var space = try AddressSpace.initWithDirectMemory(testing.allocator, 2 * granule);
+        defer space.deinit();
+        if (private_prefix) {
+            try space.mapFixed(base, granule, .read_write, .private, null);
+            try space.mapFixed(base + granule, granule, .read_write, .direct_memory, granule);
+        } else {
+            try space.mapFixed(base, 2 * granule, .read_write, .direct_memory, 0);
+            try space.protect(base + page_size, page_size, .read_only);
+        }
+        try space.writeInt(u32, base, 0xa1b2c3d4);
+        // The last 16 KiB cuts a 64 KiB host view. Reject before unmapping
+        // earlier direct/private views, including protection-split intervals.
+        try testing.expectError(Error.HostDecommitFailed, space.unmap(base, granule + page_size));
+        try testing.expect(isHostRangeReadable(base, 2 * granule));
+        var bytes: [4]u8 = undefined;
+        try space.read(base, &bytes);
+        try testing.expectEqual(@as(u32, 0xa1b2c3d4), std.mem.readInt(u32, &bytes, .little));
+        try testing.expect(space.isReadable(base, 2 * granule));
+        try space.unmap(base, 2 * granule);
+    }
+}
+
+test "failed host protection does not lend pages left inaccessible" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const base = user.start;
+    var space = try AddressSpace.init(testing.allocator);
+    defer space.deinit();
+    try space.mapFixed(base, 2 * page_size, .read_write, .private, null);
+    // Emulate native state changing behind the interval table, then provoke
+    // an operation which protects its first page but fails on the second.
+    try hostDecommit(base + page_size, page_size);
+    defer {
+        hostCommit(base + page_size, page_size, .read_write) catch unreachable;
+        space.protect(base, 2 * page_size, .read_write) catch unreachable;
+    }
+    try testing.expectError(Error.ProtectionDenied, space.protect(base, 2 * page_size, .none));
+    try testing.expect(space.host_mapping_state_uncertain);
+    try testing.expect(!space.isReadable(base, 4));
+    try testing.expect(!space.isWritable(base, 4));
+    try testing.expect(space.borrowReadable(base, 4) == null);
+    try testing.expect(space.borrowReadable(base + page_size, 4) == null);
+    var bytes: [4]u8 = undefined;
+    try testing.expectError(Error.ProtectionDenied, space.read(base, &bytes));
+}
+
 test "read lease holds backing across a concurrent unmap and rejects released ranges" {
     if (builtin.single_threaded) return error.SkipZigTest;
     const base = user.start;
@@ -460,6 +510,10 @@ pub const AddressSpace = struct {
     mutex: Lock = .{},
     gpu_tracker: GpuPageTracker = .{},
     mapping_identity: u64 = 0,
+    // An unexpected host mutation failure can leave only part of a range
+    // changed. Until destruction, native access checks must then verify the
+    // actual host pages instead of relying solely on interval metadata.
+    host_mapping_state_uncertain: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Error!AddressSpace {
         if (@sizeOf(usize) != @sizeOf(u64)) return Error.UnsupportedHost;
@@ -691,7 +745,10 @@ pub const AddressSpace = struct {
             false,
         );
 
-        hostProtect(address, size, protection) catch return Error.ProtectionDenied;
+        hostProtect(address, size, protection) catch {
+            self.host_mapping_state_uncertain = true;
+            return Error.ProtectionDenied;
+        };
 
         self.mappings.deinit(self.allocator);
         self.mappings = replacement;
@@ -706,6 +763,10 @@ pub const AddressSpace = struct {
 
         if (!self.coversLocked(address, size, null)) return Error.RangeNotMapped;
 
+        // A later partial host view must be rejected before any earlier view
+        // is removed. Protection splits can divide a view into several guest
+        // intervals, so validate the same merged runs used for the mutation.
+        try self.hostUnmapLocked(address, size, true);
         self.invalidateGpuTrackingLocked(address, size);
 
         // Rebuilding the table here cost the whole of it per call, and a batch
@@ -724,10 +785,18 @@ pub const AddressSpace = struct {
         ) orelse return Error.HostDecommitFailed;
         try self.mappings.ensureUnusedCapacity(self.allocator, 1);
 
-        try self.hostUnmapLocked(address, size);
-        try hostCoalescePlaceholder(free_range);
-
+        self.hostUnmapLocked(address, size, false) catch |err| {
+            if (!self.host_mapping_state_uncertain) std.debug.print(
+                "[memory] host unmap failed address=0x{x} size=0x{x}; verifying native page access\n",
+                .{ address, size },
+            );
+            self.host_mapping_state_uncertain = true;
+            return err;
+        };
         removeMappingSpanAssumeCapacity(&self.mappings, span, address, end);
+        // Coalescing is only an optimization. The pages are already unmapped;
+        // its failure cannot roll back that fact or retain readable metadata.
+        hostCoalescePlaceholder(free_range) catch {};
     }
 
     pub fn isMapped(self: *AddressSpace, address: u64, size: u64) bool {
@@ -1392,7 +1461,7 @@ pub const AddressSpace = struct {
         return freeRangeInMappings(self.reservations.items, self.mappings.items, address, size);
     }
 
-    fn hostUnmapLocked(self: *AddressSpace, address: u64, size: u64) Error!void {
+    fn hostUnmapLocked(self: *AddressSpace, address: u64, size: u64, comptime validate_only: bool) Error!void {
         const end = address + size;
         var direct_start: ?u64 = null;
         var direct_end: u64 = 0;
@@ -1408,19 +1477,21 @@ pub const AddressSpace = struct {
                 } else if (part_start == direct_end) {
                     direct_end = part_end;
                 } else {
-                    try hostUnmapBacking(direct_start.?, direct_end - direct_start.?);
+                    try hostUnmapBackingOperation(direct_start.?, direct_end - direct_start.?, validate_only);
                     direct_start = part_start;
                     direct_end = part_end;
                 }
             } else if (mapping.kind != .reserved) {
                 if (direct_start) |start| {
-                    try hostUnmapBacking(start, direct_end - start);
+                    try hostUnmapBackingOperation(start, direct_end - start, validate_only);
                     direct_start = null;
                 }
-                try hostDecommit(part_start, part_end - part_start);
+                if (validate_only) {
+                    try hostValidateUnmapBacking(part_start, part_end - part_start);
+                } else try hostDecommit(part_start, part_end - part_start);
             }
         }
-        if (direct_start) |start| try hostUnmapBacking(start, direct_end - start);
+        if (direct_start) |start| try hostUnmapBackingOperation(start, direct_end - start, validate_only);
     }
 
     fn discardMappingsLocked(self: *AddressSpace) void {
@@ -1676,7 +1747,15 @@ pub const AddressSpace = struct {
             };
             if (!allowed) return false;
             cursor = @min(end, mapping.end());
-            if (cursor == end) return true;
+            if (cursor == end) {
+                if (self.host_mapping_state_uncertain and builtin.os.tag == .windows) {
+                    return windowsRangeAccessible(address, size, switch (required) {
+                        .read => .read,
+                        .write => .write,
+                    });
+                }
+                return true;
+            }
         }
         return false;
     }
@@ -2500,6 +2579,22 @@ fn hostMapBacking(
         },
         else => return Error.UnsupportedHost,
     }
+}
+
+fn hostValidateUnmapBacking(address: u64, size: u64) Error!void {
+    if (builtin.os.tag != .windows) return;
+    const end = address + size;
+    var cursor = address;
+    while (cursor < end) {
+        const view = try windowsAllocationRange(cursor);
+        if (view.start != cursor or view.end > end) return Error.HostDecommitFailed;
+        cursor = view.end;
+    }
+}
+
+fn hostUnmapBackingOperation(address: u64, size: u64, comptime validate_only: bool) Error!void {
+    if (validate_only) return hostValidateUnmapBacking(address, size);
+    return hostUnmapBacking(address, size);
 }
 
 fn hostUnmapBacking(address: u64, size: u64) Error!void {
