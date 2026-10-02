@@ -4828,6 +4828,12 @@ const DrawScalarScratch = struct {
     fragment_registers: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister,
 };
 
+const SampledDescriptorScratch = struct {
+    image_infos: [maximum_sampled_images]vk.DescriptorImageInfo,
+    writes: [maximum_sampled_images]vk.WriteDescriptorSet,
+    bindings: [maximum_sampled_images]u32,
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     loader: Loader,
@@ -5341,6 +5347,7 @@ pub const Renderer = struct {
     index_scratch: @import("scratch_pool.zig").Pool = .{ .minimum_cache_bytes = 1, .maximum_cache_bytes = 4 * 1024 * 1024 },
     checkpoint_scratch: gpu.resource_checkpoints.Pool = .{},
     draw_scalar_scratch: ?*DrawScalarScratch = null,
+    sampled_descriptor_scratch: ?*SampledDescriptorScratch = null,
     resource_preparation: gpu.resource_preparation.Pool = .{},
     resource_preparation_in_use: bool = false,
     resource_preparation_bindings: [2]?*const gpu.ShaderBindings = @splat(null),
@@ -5377,6 +5384,8 @@ pub const Renderer = struct {
         self.checkpoint_scratch.deinit(self.allocator);
         if (self.draw_scalar_scratch) |scratch| self.allocator.destroy(scratch);
         self.draw_scalar_scratch = null;
+        if (self.sampled_descriptor_scratch) |scratch| self.allocator.destroy(scratch);
+        self.sampled_descriptor_scratch = null;
         for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| resource.destroy(self.allocator);
         self.free_compute_resource_count = 0;
         for (self.free_graphics_resources[0..self.free_graphics_resource_count]) |resource| resource.destroy(self.allocator);
@@ -12176,7 +12185,7 @@ pub const Renderer = struct {
         }
         self.frame_profile.compute_sampled_loop_ns +|= elapsedHostNanoseconds(sampled_loop_started);
         var lookup_started = hostTimestampNs();
-        self.updateSampledImageDescriptors(
+        try self.updateSampledImageDescriptors(
             result.sampled_images[0..result.sampled_image_count],
             result.sampled_image_mappings[0..result.sampled_image_mapping_count],
         );
@@ -20098,7 +20107,7 @@ pub const Renderer = struct {
         );
         self.frame_profile.graphics_append_resource_ns +|= elapsedHostNanoseconds(append_started);
         const descriptor_started = hostTimestampNs();
-        self.updateSampledImageDescriptors(
+        try self.updateSampledImageDescriptors(
             graphics_resources.images[0..graphics_resources.image_count],
             graphics_resources.mappings[0..graphics_resources.mapping_count],
         );
@@ -22704,12 +22713,22 @@ pub const Renderer = struct {
         self: *Renderer,
         images: []const PreparedSampledImage,
         mappings: []const gpu.ShaderSpirvSampledImageBinding,
-    ) void {
+    ) std.mem.Allocator.Error!void {
         std.debug.assert(images.len <= self.device_info.sampled_image_capacity);
         if (images.len == 0) return;
-        var image_infos: [maximum_sampled_images]vk.DescriptorImageInfo = undefined;
-        var writes: [maximum_sampled_images]vk.WriteDescriptorSet = undefined;
-        var bindings: [maximum_sampled_images]u32 = undefined;
+        // These arrays cover large bindless tables, but are also used for
+        // ordinary draws with only a few images. Keep one exclusively borrowed
+        // allocation instead of probing hundreds of stack pages on every draw.
+        // All used entries are rewritten before the synchronous Vulkan call.
+        const scratch = self.sampled_descriptor_scratch orelse try self.allocator.create(SampledDescriptorScratch);
+        self.sampled_descriptor_scratch = null;
+        defer {
+            if (self.sampled_descriptor_scratch) |nested| self.allocator.destroy(nested);
+            self.sampled_descriptor_scratch = scratch;
+        }
+        const image_infos = &scratch.image_infos;
+        const writes = &scratch.writes;
+        const bindings = &scratch.bindings;
         sampledImageDescriptorBindings(mappings, bindings[0..images.len]);
         for (images, 0..) |prepared, index| {
             std.debug.assert(bindings[index] != std.math.maxInt(u32));
@@ -22731,7 +22750,7 @@ pub const Renderer = struct {
         self.device_functions.update_descriptor_sets(
             self.device,
             @intCast(images.len),
-            @ptrCast(&writes),
+            writes,
             0,
             null,
         );
