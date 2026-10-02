@@ -409,3 +409,114 @@ guest draws, sampled/storage image checks, synchronization and presentation;
 the build reports 4/4 successful steps. Evidence is in
 `out/subnautica-smoke-coherence-20261002.log`. This resolves the test-fixture
 mismatch recorded above, not a game performance defect or the live hash crash.
+
+## Sampled descriptor workspace
+
+A later live profile still includes stack probing on the renderer thread.
+The sampled-descriptor update function reserved 753,720 bytes for three arrays
+sized to the 8192-image limit, including draws binding only a few images.
+Those arrays now use an exclusively borrowed renderer allocation. Used entries
+are fully rewritten, nested use gets separate storage, and the Vulkan update
+remains one synchronous call with the same descriptor count and contents.
+
+154 backend/index tests pass, as do the complete default Vulkan smoke,
+graphics descriptor reuse and large indirect-image probes. The latter checks
+4352 mixed 2D/3D views, exact aliases, null bounds, relocation and a shared
+sampler. The smoke PDB records a 56-byte update frame after the change; a
+matching game-run frame check and live measurement follow below. This is a
+stack-work reduction, not evidence of a game FPS increase on its own.
+
+The preceding native-diagnostic build also restores the saved world. Native
+access violations now log the remaining integer registers and up to 32
+same-module candidates from a readable 4 KiB stack prefix. These candidates
+are deliberately labelled as a scan, not an unwound backtrace. No debugger is
+needed during ordinary execution, and the new diagnostic does not suppress
+an exception.
+
+## Captured host hash failure and failed-unmap safety
+
+The diagnostic repeat `out/subnautica-host-stack-repeat-20261002` exits with
+`0xc0000005`. Its same-module stack candidates resolve to
+`hash → fingerprint → fingerprintGuestMemory → commitCompletedFrame →
+submitOneShot → readbackRenderTarget`. The failing read is `0x285cc0000`.
+Disassembly confirms the call is inside the branch holding the guest read
+lease, so another ordinary successful unmap cannot race this particular read.
+The completed render-target backing check is the failing consumer; this does
+not by itself identify what invalidated the native pages.
+
+A separate native regression reproduces an inconsistent memory table: unmap
+of an aligned 128 KiB direct mapping requested for its first 80 KiB removes
+the first 64 KiB Windows view, then rejects the partial second view. The old
+interval table still reports all 128 KiB as readable. The original regression
+fails and also leaves native views behind, causing four later tests to fail.
+
+Unmap now validates every affected native view before modifying any of them,
+including mixed private/direct runs and guest protection splits within a
+view. It updates interval metadata immediately after the actual unmap;
+optional placeholder coalescing cannot keep removed pages marked readable.
+If an unexpected host unmap or protection operation still fails after it
+starts, future native access checks verify real Windows page access rather
+than trusting interval metadata alone. Ordinary successful operations retain
+the metadata fast path.
+
+**29 memory tests pass**, including both unmap variants and a native protection
+failure which leaves the first page inaccessible. The latter verifies that
+reads and leases reject those pages. This is a demonstrated memory-manager
+bug fix; attribution of the captured game failure and live loading reliability
+still require follow-up runs.
+
+The descriptor candidate initially compiles but fails installation because
+C: has no free space. No incomplete executable is installed. The cache cleanup
+request is rejected by automatic policy, and no files are deleted. Rebuilding
+with local/global Zig caches and temporary files under E: completes all 7/7
+steps. Later builds use those E: paths too.
+
+## Installed candidate and 12.03 FPS world sample
+
+The combined descriptor/unmap candidate passes 7/7 ReleaseFast build steps
+and is installed as `zig-out/bin/game-run.exe` with its matching PDB.
+Executable SHA-256:
+`53866d159ff3aaa924717d8185a688c43777815c807a1c8584cee9870b29c317`.
+PDB SHA-256:
+`1e9e86afbc00dac7bcb2ba6d01ce56be812412b6f11ce5f6345bf5a06344bb97`.
+The game-run PDB also confirms a **56-byte** sampled-descriptor update frame.
+The 60 AGC submission tests pass after the memory changes.
+
+`out/subnautica-unmap-live-20261002` restores the unchanged save. An initial
+30-second observation includes a roughly 10-second respawn stall and averages
+7.80 FPS; it is retained as `respawn-rate.json`, not used as a stationary-world
+comparison. After respawning, a fixed-view, unpaused foreground sample records
+**361 flips (3217–3578) / 30.010505 seconds = 12.03 FPS**. No compiler,
+sampling profiler, debugger or detailed resource trace runs during that sample.
+One-second intervals range from 10 to 13 flips. Weather and frost change, and
+the prior samples have different warm-up conditions, so no isolated speedup
+percentage is claimed. **30 FPS remains unmet.**
+
+![Stationary world during the unpaused 12.03 FPS sample](../images/subnautica-below-zero-descriptor-world.png)
+
+*Unedited 1765×993 client capture of 1920×1080 guest output.*
+
+A later read-only inspection reports `host_mapping_state_uncertain=false`:
+this successful run uses normal metadata access checks. Bounded resource
+logging still finds one unresolved scalar load at pixel program
+`0x20d5d4700 + 0x8`, the same instruction pattern as before. Sampled frames
+have zero draw/dispatch failures and unsupported compute programs. A later
+10-second profile still finds memory copies, scalar evaluation and stack
+probing in other functions. This run does not prove reliable loading or
+complete rendering correctness.
+
+In a separate fixed paused view, diagnostic toggles give 12.23 FPS for the
+normal settings, 12.30 with buffer-content hashing, 12.20 with vertex-fetch
+bounds, and 12.26 after restoring both defaults. Each observation lasts about
+30.01 seconds. No broad gain is established; the recorded vertex trimming
+counter remains zero. These are paused rendering rates, not gameplay results.
+Both options are restored before deliberately stopping the process for a fresh
+loading repeat. Their shipped defaults are unchanged.
+
+The fresh repeat `out/subnautica-unmap-repeat-20261002`, using the same
+executable and unchanged save, also restores the world and responds to a
+three-second forward movement. Its screenshots record the world before and
+after movement. It is deliberately stopped before the next GPU regression
+suite. These two successful loads do not establish that the intermittent
+loading failure is eliminated. The website update passes all 98 tests,
+type checking, lint and its production build.
