@@ -520,3 +520,238 @@ after movement. It is deliberately stopped before the next GPU regression
 suite. These two successful loads do not establish that the intermittent
 loading failure is eliminated. The website update passes all 98 tests,
 type checking, lint and its production build.
+
+## Indirect-image scratch outside common resource preparation
+
+The next profile-guided change isolates the 256 KiB indirect-image candidate
+table from ordinary draw and dispatch preparation. A renderer allocation is
+borrowed exclusively until staging finishes and retained for reuse; nested
+preparation receives independent storage. Uniform-null descriptors use an
+immutable empty table. The candidate resolver remains bounded and keeps its
+existing recovery, deduplication and null-check behavior. No shader instruction
+or guest draw is removed.
+
+The ReleaseFast smoke PDB records `prepareComputeResources` at **34,592 bytes**,
+down from 1,346,784, and `appendGraphicsResources` at **2,912 bytes**, down from
+795,200. Large by-value resolver temporaries now live in the indirect recovery
+helper (1,973,488 bytes), which is called only when needed. This does not reduce
+the rare fallback's maximum stack requirement; it avoids probing that space
+on ordinary draws and dispatches.
+
+154 backend/index tests, the complete default Vulkan smoke and five targeted
+GPU probes pass: large indirect images (4352 views), indexed images, uniform
+null images, inactive image tables and graphics descriptor reuse. Game-run
+frame sizes and a live sample will be checked against the installed candidate.
+
+The installed game executable is
+`f511b5b3666b02eb0693293919f46cb1a0305bdf77a76eb9220aa78e09eab77d`,
+with PDB `0fbe872b77bb0d72927a990346fc249f41cc22f26718cc056b7c2b48d94f9dd8`.
+Its PDB records **35,824 / 2,912 bytes** for compute/graphics resource
+preparation, against **1,346,784 / 795,200 bytes** in the preceding executable.
+
+`out/subnautica-candidate-scratch-live-20261002` restores the save. Three
+unpaused 30-second observations are retained:
+
+- Initial view facing the wreck: 217 flips / 30.017364 seconds = **7.23 FPS**.
+- Respawn observation, including about five seconds without flips:
+  272 / 30.054452 seconds = **9.05 FPS**. This is not a steady-view result.
+- Fixed view after respawn: 351 / 30.012017 seconds = **11.70 FPS**, with
+  one-second intervals of 10–13 flips.
+
+Weather and effects evolve; these samples do not isolate a speedup or
+regression against the preceding 12.03 FPS observation. The post-change
+10-second profile no longer lists stack probing among the dominant samples;
+guest copies, scalar evaluation, resource preparation and driver calls remain.
+The process is deliberately stopped after measurement.
+
+A separate bounded trace identifies the unresolved resource at **frame 3542,
+draw 526**, pixel shader `0x24d614700 + 0x8`. That exact draw has zero active
+colour attachments, colour write mask zero, depth test/write disabled and
+stencil enabled. It retains the texture-and-coefficient pixel program. Thus
+the reported gap is tied to a stencil-only pass, rather than an unidentified
+visible colour pass. The counter remains enabled; no shader is silently
+removed and no claim of complete rendering correctness is made. The traced
+frame performs diagnostic readbacks and is excluded from FPS measurements.
+
+## Bounded pointer-recovery initialization
+
+The remaining resource profile includes repeated initialization in
+`appendMissingPointerLoads`. Its unknown register snapshot is now immutable
+shared storage, and the seen-PC bitmap clears only words below the eligible
+prefix. Out-of-prefix producer records never touch uninitialized words; the
+original maximum-PC limit remains unchanged.
+
+**72 scalar/resource tests pass in ReleaseSafe**, including prefix zero,
+non-word-aligned ends, bitmap word boundaries, the last supported PC and an
+out-of-range producer. Recovery still respects branch definitions, changing
+guest contents, clobbered pointer halves, and complete 16-word reads.
+
+The default Vulkan smoke and scalar-pointer, unbound-snapshot, resource-worker
+and graphics-descriptor-reuse probes also pass. The combined ReleaseFast build
+completes 7/7 steps. Installed executable SHA-256:
+`4001d11c94ac97e55516be9238ecff3541fdf56db6d8e8ab53902075f099fa5e`;
+matching PDB:
+`52b4a554a0d682afd403db0430c98849fdfc98ed18d00e397807bc64ef842ab4`.
+
+## Full system drive affects startup independently of the candidate
+
+Two launches of the combined executable exit immediately after the first flip
+with `0x40010006`; a control using the preceding `f511b5b3…` executable exits
+identically. A 45-second debugger observation reaches the menu and records
+`CLogger::Write WriteFile failed(0x00000070)` debug strings. C: has zero free
+bytes. Windows defines `0x70` as
+[ERROR_DISK_FULL](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-).
+The emitting component and its exact log path have not been identified.
+
+Setting **TEMP and TMP only for the child process** to
+`E:/PS5PCEM/out/build-temp` lets the same combined executable reach the menu
+without a debugger (`out/subnautica-pointer-temp-20261002`). No global
+environment, driver settings or exception handling is changed. The debugger
+run is excluded from performance results. This startup condition is distinct
+from the earlier loading hash access violation. C: cleanup remains unperformed
+after its automatic approval rejection.
+
+The same process restores the unchanged save and, after a natural respawn,
+records **359 flips / 30.009704 seconds = 11.96 FPS** in the unpaused snowy
+world. One-second intervals contain 10–13 flips. The final capture retains
+the survival HUD and world; no profiler, build or detailed trace runs during
+the sample. An earlier 8.76 FPS observation ends on the death/loading screen
+and is excluded from steady gameplay results. The runner stops this process
+at its recorded 1,200-second diagnostic deadline.
+
+## Native mapping churn and a narrower Windows optimization
+
+A separate paused observation has irregular 0.4–1.45 second stalls. A ten-second
+host profile samples the rendering thread in `ZwWaitForAlertByThreadId` 1,084
+times. A guest thread has 600 samples in `ZwUnmapViewOfSectionEx` and 449 in
+`NtMapViewOfSectionEx`. Candidate return addresses found on the renderer stack
+include mapping access checks and read-lease acquisition; these stack scans
+are not fully unwound call stacks.
+
+A bounded 12-second firmware trace confirms repeated release/unmap/remap of
+the same **4 MiB** block at VA `0x2fbb00000`, physical offset `0xcdf18000`.
+The physical offset is 16 KiB aligned but not 64 KiB aligned, selecting 256
+native section views per mapping. The address-space lock is held during these
+operations. This is evidence of a separate source of renderer stalls; it does
+not establish the origin or necessity of the guest's allocation churn.
+
+Paused worker controls record 3.87, 4.60 and 4.60 FPS with the original ceiling
+of four workers, 7.56 with workers disabled, then 4.17 after restoration.
+The first attempted disable was rejected by the diagnostic helper's assertion
+and made no write; that 4.60 FPS sample is an untoggled control. Irregular VM
+stalls confound this small experiment. The shipped worker policy is unchanged
+and the process's original ceiling of four is restored.
+
+The next patch keeps the existing 16/64 KiB view selection and unmap preflight.
+An address-space bitmap tracks successful commitment by **physical offset**;
+mapping an already committed section page no longer repeats its commitment
+syscall. The new view still receives the requested protection and a fresh
+allocation identity. Windows documents that committed `SEC_RESERVE` section
+pages cannot be decommitted with `VirtualFree`:
+[CreateFileMapping](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createfilemappinga).
+The bitmap dies with its backing section. Allocation-range queries also reuse
+their initial `VirtualQuery` result instead of immediately asking for it again.
+
+Thirty memory tests and sixty AGC submission/alias tests pass in ReleaseSafe.
+The new native test covers remapping after removal of all views, a wider view
+mixing previously committed and untouched pages, fresh read-only/no-access
+permissions, reservation replacement, writable alias coherence and partial
+removal of 16 KiB views. The existing rejected-partial-unmap regression remains
+green. The default Vulkan smoke also passes.
+
+An isolated native benchmark repeatedly maps/unmaps a 4 MiB range at a
+16 KiB-aligned physical offset, checking preserved data each time. Ten batches
+of 100 cycles per executable give a median **169.62 ms before / 139.17 ms after**,
+an **18.0% reduction in this mapping microbenchmark**. This is not an 18.0%
+gameplay speedup; a fresh game process is required to check the combined build.
+
+## Reproduced Windows diagnostic-output termination
+
+Both fresh launches of the physical-commit build exit at the first flip with
+`0x40010006`, including with TEMP/TMP on E:. The earlier successful relocation
+is therefore **not a reliable startup workaround**. The memory benchmark
+remains valid, but this prevents a gameplay measurement of that intermediate
+executable (`3c90fbbf157280a954d3f775589d5e38052a728923adac1d4cc7882a8ca0bcaa`).
+
+A standalone reproducer narrows the failure to the emulator's firmware stack
+switch. `OutputDebugStringA` returns normally on the original Windows stack,
+then terminates with exactly `0x40010006` when called through
+`hle.host_stack.call`, without any game, graphics driver calls or full-disk
+operation. Microsoft specifies that
+[OutputDebugString does nothing when no debugger is active](https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-outputdebugstringa).
+Thus the log-write failure is a trigger exposing an emulator stack defect,
+not a sufficient explanation for why diagnostic output kills the process.
+
+The HLE switch now saves, updates and restores Windows
+`NT_TIB.StackBase/StackLimit` together with RSP. Windows can dispatch the
+diagnostic exception on the stack that actually contains its frames.
+The native guest bridge also snapshots and restores HLE active state,
+suspended guest-stack roots and Windows bounds when a guest escape bypasses
+normal returns. Nested callbacks restore their enclosing HLE state.
+No diagnostic exception is swallowed by an added handler.
+
+The same standalone executable now returns through both ANSI and Unicode
+debug-output calls and exits zero. All **8 firmware-stack tests** and
+**9 native bridge/dispatch tests** pass in ReleaseSafe, including register-only
+GC roots, nested calls, normal bounds restoration, escaped callbacks,
+`scePthreadExit` and contained guest access/illegal-instruction faults.
+
+The new 7/7 ReleaseFast build is installed as `zig-out/bin/game-run.exe` with
+its matching PDB. Executable SHA-256:
+`0d190f939d3d6a48f16466912abee2bc09d5865f63de362924677e2a93668b12`;
+PDB:
+`e22bb763703a7078d412a30ba5e72ed982d59ddb7dad4e9f6c201312435cb8e1`.
+`out/subnautica-stack-bounds-live-20261002` reaches the title screen and
+restores the saved snowy world **without a debugger or TEMP/TMP override**.
+This verifies the startup correction in the game despite the still-full C:
+drive; it does not establish that the earlier loading hash fault is fixed.
+
+The first 30-second observation crosses a natural death/respawn and records
+3.87 FPS; it is excluded from steady-view results. The subsequent unpaused
+stationary view records **238 flips / 30.016528 seconds = 7.93 FPS**. It still
+contains long stalls (one logged frame takes 1,006 ms), with ordinary logged
+frames around 81 ms. This is below the earlier 11.96 FPS observation and does
+not establish a gain from the memory optimization. Shader gap counters remain
+enabled: zero draw/dispatch failures and unsupported compute are reported in
+the sampled frame, with one unresolved scalar resource still present.
+
+The post-sample profile still finds the rendering thread waiting in native
+address-space checks and read leases (715 native-wait samples out of roughly
+1,700). This observation does not contain the earlier dominant map/unmap PCs
+among its selected hottest threads, so it should not be described as the same
+fully identified wait source. Resource preparation, copies and mapping-lock
+contention still require work. The measured process is deliberately stopped;
+termination takes longer than the first 30-second wait, and absence of its
+PID is verified before another process starts.
+
+Two new dated website history blocks retain the resource-preparation sample
+and the Windows stack correction separately, with unedited world captures in
+all eight locales. Website validation passes **98 tests**, type checking,
+lint and the production build.
+
+`out/subnautica-stack-bounds-repeat-20261002` is a second ordinary launch of
+the identical installed executable, again without a debugger or TEMP override.
+It reaches the menu and restores the same save with the snowy world and HUD.
+A three-second forward input is delivered, but the immediately following
+capture is blank white. The process is deliberately stopped before that
+observation can distinguish a capture/presentation transient from a rendering
+failure; this run does **not** establish successful movement rendering.
+The source archive still hashes to
+`c30b4a242d29ba7cd6b9334484126895c8bcdcc6f2b9d3f0ed02f9953ed0a5d4`.
+This repeat is deliberately stopped after the input attempt. It supports the
+specific startup fix, while the full-playthrough and intermittent loading
+limitations at the top of this report remain open.
+
+A third ordinary launch, `out/subnautica-stack-bounds-movement-20261002`,
+also restores the save. Here a before/after pair explicitly shows the camera
+moving forward after the three-second input, with the world and HUD rendered.
+A later white capture contains **"You died."**, identifying a death transition
+in this repeat. That is consistent with the earlier blank-white capture being
+the same transition; the earlier frame alone cannot prove that explanation.
+The third process then returns to the rendered snowy world and survival HUD
+after respawn. This bounds the observed white transition rather than treating
+it as a verified persistent graphics failure.
+Its extra 30-second observation records 10.04 FPS but crosses another
+death/respawn, so it is also excluded from steady gameplay comparisons.
+The process is deliberately stopped after these checks; the reported
+7.93 FPS sample remains the valid stationary observation for this build.
