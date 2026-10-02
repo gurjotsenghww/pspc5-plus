@@ -12780,7 +12780,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     var guest = GuestMemory{};
-    const backend = renderer.dcbBackend(guest.interface());
+    // Later kernels reuse earlier attachment addresses for CPU-written input.
+    // Expose those changes just as the game runner does, instead of leaving
+    // the renderer with no way to distinguish them from retained GPU output.
+    var memory = guest.interface();
+    memory.fingerprint = GuestMemory.fingerprint;
+    const backend = renderer.dcbBackend(memory);
     if (init.minimal.environ.containsUnempty(allocator, "PS5_IMAGE_SMOKE_ONLY") catch false) {
         try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
         try runComputeSampledImageKernel(allocator, &renderer, &guest, backend);
