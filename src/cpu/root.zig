@@ -1460,6 +1460,8 @@ const WindowsX64Machine = struct {
                 record.NumberParameters >= 2 and
                 declined_host_access_violations.fetchAdd(1, .monotonic) == 0)
             {
+                handling_native_fault = true;
+                defer handling_native_fault = false;
                 const allocation_base = hostAllocationBase(context.Rip);
                 var return_address: u64 = 0;
                 var next_return_address: u64 = 0;
@@ -1482,6 +1484,27 @@ const WindowsX64Machine = struct {
                         next_return_address,
                     },
                 );
+                std.debug.print(
+                    "[cpu host fault registers] rcx=0x{x} rdx=0x{x} rbx=0x{x} rbp=0x{x} rsi=0x{x} rdi=0x{x} r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x} r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n",
+                    .{ context.Rcx, context.Rdx, context.Rbx, context.Rbp, context.Rsi, context.Rdi, context.R8, context.R9, context.R10, context.R11, context.R12, context.R13, context.R14, context.R15 },
+                );
+                // Optimized leaf functions often keep saved registers at RSP,
+                // rather than a return address. Scan a bounded readable stack
+                // prefix for same-module candidates, without allocating or
+                // invoking a symbol loader from the exception handler. These
+                // are candidates, not an unwound backtrace.
+                if (allocation_base != 0) {
+                    var candidates: usize = 0;
+                    var offset: usize = 0;
+                    while (offset < 4096 and candidates < 32) : (offset += @sizeOf(u64)) {
+                        const address = std.math.add(u64, context.Rsp, offset) catch break;
+                        if (!memory.isHostRangeReadable(address, @sizeOf(u64))) break;
+                        const value = @as(*align(1) const u64, @ptrFromInt(address)).*;
+                        if (value < allocation_base or hostAllocationBase(value) != allocation_base) continue;
+                        std.debug.print("[cpu host stack candidate] sp+0x{x}=0x{x} module+0x{x}\n", .{ offset, value, value - allocation_base });
+                        candidates += 1;
+                    }
+                }
             }
             return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
         }
