@@ -18,6 +18,10 @@ pub var persistent_definition_cache_enabled = std.atomic.Value(bool).init(true);
 pub var persistent_definition_cache_hits = std.atomic.Value(u64).init(0);
 pub var persistent_definition_cache_misses = std.atomic.Value(u64).init(0);
 
+// Reaching-definition recovery only reads this snapshot. Sharing the immutable
+// unknown state avoids copying 128 register records for every preparation.
+const unknown_registers: scalar.ScalarRegisters = @splat(.{});
+
 /// Recover pointer loads omitted by the representative scalar walk. An empty
 /// snapshot forces every address input to come from its reaching definition;
 /// a value observed on another path or loop iteration is not evidence here.
@@ -34,13 +38,16 @@ pub fn appendMissingPointerLoads(
     count: usize,
     prefix_end: u32,
 ) usize {
-    var seen = std.StaticBitSet(64 * 1024).initEmpty();
+    if (prefix_end == 0) return count;
+    var seen: std.StaticBitSet(64 * 1024) = undefined;
+    // No instruction at or beyond prefix_end is eligible. Initialize only
+    // words that can be queried, retaining the existing maximum-PC bound.
+    const slots: usize = @intCast(@min(seen.capacity(), (@as(u64, prefix_end) + 3) / 4));
+    const mask_bits = @bitSizeOf(@TypeOf(seen).MaskInt);
+    @memset(seen.masks[0 .. (slots + mask_bits - 1) / mask_bits], 0);
     for (output[0..count]) |entry| if (entry.producer_pc) |pc| {
-        if (pc / 4 < seen.capacity()) seen.set(pc / 4);
+        if (pc / 4 < slots) seen.set(pc / 4);
     };
-    // The resolver borrows only registers. Keeping a complete Evaluation here
-    // reserves unused load-history storage in every draw's stack frame.
-    const empty: scalar.ScalarRegisters = @splat(.{});
     var end = count;
     var resource_instructions = checkpoints.Iterator.init(instructions, plan, .resource);
     while (resource_instructions.next()) |instruction_index| {
@@ -50,13 +57,13 @@ pub fn appendMissingPointerLoads(
             else => continue,
         }
         const inst = candidate.*;
-        if (inst.pc >= prefix_end or inst.pc / 4 >= seen.capacity() or seen.isSet(inst.pc / 4)) continue;
+        if (inst.pc >= prefix_end or inst.pc / 4 >= slots or seen.isSet(inst.pc / 4)) continue;
         const destination = scalar.scalarRegisterIndex(inst.dst) orelse continue;
         const pointer_register = scalar.scalarRegisterIndex(inst.src0) orelse continue;
         if (pointer_register >= 127 or inst.data_words == 0 or
             inst.data_words > 16 or destination + inst.data_words > 128 or inst.memory_offset < 0) continue;
         if (output.len - end < inst.data_words) break;
-        var resolver = Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = graph, .snapshot = &empty, .definition_cache = cache };
+        var resolver = Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = graph, .snapshot = &unknown_registers, .definition_cache = cache };
         var base: [2]u32 = undefined;
         if (!(resolver.words(@intCast(pointer_register), inst.pc, &base) catch false) or base[1] > 0xffff) continue;
         const pointer = @as(u64, base[0]) | (@as(u64, base[1]) << 32);
@@ -414,6 +421,43 @@ test "missing pointer recovery preserves all sixteen words and rejects partial r
     }
     memory.readable = 60;
     try std.testing.expectEqual(@as(usize, 0), appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, null, &output, 0, 16));
+}
+
+test "pointer recovery honors prefix and bitmap boundaries without reading unused words" {
+    const M = struct {
+        reads: usize = 0,
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address != 0x1000 or bytes.len != 4) return false;
+            self.reads += 1;
+            std.mem.writeInt(u32, bytes[0..4], 0x12345678, .little);
+            return true;
+        }
+    };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x1000;
+    for ([_]u32{ 0, 252, 256, 260, 262140, 262144 }) |pc| {
+        const instructions = [_]rdna2.Instruction{
+            .{ .pc = pc, .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .data_words = 1, .word_count = 2 },
+            .{ .pc = pc + 8, .family = .sopp, .opcode = .s_endpgm },
+        };
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        for ([_]u32{ 0, pc, pc + 1, std.math.maxInt(u32) }) |prefix| {
+            for ([_]bool{ false, true }) |already_seen| {
+                var memory = M{};
+                var output: [2]rdna2.spirv.ScalarRegister = undefined;
+                output[0] = .{ .register = 4, .value = 99, .producer_pc = if (already_seen) pc else std.math.maxInt(u32) };
+                const count = appendMissingPointerLoads(&bindings, .{ .context = &memory, .read_fn = M.read }, &instructions, &graph, null, null, &output, 1, prefix);
+                const recovered = !already_seen and pc < prefix and pc < 262144;
+                try std.testing.expectEqual(@as(usize, if (recovered) 2 else 1), count);
+                try std.testing.expectEqual(@as(usize, @intFromBool(recovered)), memory.reads);
+                try std.testing.expectEqual(@as(u32, 99), output[0].value);
+                if (recovered) try std.testing.expectEqual(@as(u32, 0x12345678), output[1].value);
+            }
+        }
+    }
 }
 
 test "empty scalar buffers resolve independently of dynamic offsets" {
