@@ -1747,15 +1747,9 @@ pub fn getModuleInfoForUnwind(
     return errno.ok;
 }
 
-/// Writes guest output to the host's standard streams.
-///
-/// Only the standard descriptors are handled. A title's own diagnostics are the
-/// clearest statement of what went wrong, and refusing this call silences them:
-/// the guest runtime then fails without ever explaining itself, which is far
-/// more expensive to debug than the write is to support.
-///
-/// Any other descriptor still reports that files are unimplemented, rather than
-/// pretending a write succeeded and letting the guest believe data was stored.
+/// Writes guest standard streams, virtual sockets and mounted files.
+/// libScePosix imports resolve here, so ordinary descriptors must use the same
+/// validated filesystem write and errno translation as libkernel's write.
 pub fn guestWrite(descriptor: i32, buffer: ?[*]const u8, length: u64) callconv(abi.guest) i64 {
     if (descriptor != 1 and descriptor != 2) {
         if (filesystem.isVirtualSocket(descriptor)) {
@@ -1768,8 +1762,7 @@ pub fn guestWrite(descriptor: i32, buffer: ?[*]const u8, length: u64) callconv(a
                 return -1;
             });
         }
-        setErrno(errno.Posix.ebadf);
-        return -1;
+        return @import("kernel_files.zig").posixWrite(descriptor, buffer, @intCast(length));
     }
     const bytes = buffer orelse {
         setErrno(errno.Posix.efault);

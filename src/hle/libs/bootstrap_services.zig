@@ -1977,10 +1977,68 @@ fn saveDataDirNameSearch(_: u64, result_address: u64) callconv(abi.guest) i32 {
 const maximum_listed_slots = 64;
 
 /// The descriptive parameters of a slot, in the order the API numbers them.
-const save_data_param_title: u32 = 0;
-const save_data_param_subtitle: u32 = 1;
-const save_data_param_detail: u32 = 2;
-const save_data_param_user: u32 = 3;
+const save_data_param_all: u32 = 0;
+const save_data_param_title: u32 = 1;
+const save_data_param_subtitle: u32 = 2;
+const save_data_param_detail: u32 = 3;
+const save_data_param_user: u32 = 4;
+const save_data_param_mtime: u32 = 5;
+
+const SaveDataParam = extern struct {
+    title: [128]u8 = @splat(0),
+    subtitle: [128]u8 = @splat(0),
+    detail: [1024]u8 = @splat(0),
+    user_parameter: u32 = 0,
+    padding: u32 = 0,
+    modified_seconds: i64 = 0,
+    reserved: [32]u8 = @splat(0),
+};
+
+fn writeParameterString(destination: []u8, value: []const u8) void {
+    @memset(destination, 0);
+    const count = @min(value.len, destination.len - 1);
+    @memcpy(destination[0..count], value[0..count]);
+}
+
+test "save parameters round trip the complete firmware structure and individual fields" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    filesystem.attach(testing.io, tmp.dir);
+    defer filesystem.detach();
+    filesystem.attachSaveDataHome(tmp.dir, "PPSA00001");
+    _ = try filesystem.mountSaveDataSlot("slot0000", true);
+    var payload: [0x530]u8 align(8) = @splat(0);
+    @memcpy(payload[0..5], "title");
+    @memcpy(payload[0x80..][0..8], "subtitle");
+    @memset(payload[0x100..0x4ff], 'd');
+    std.mem.writeInt(u32, payload[0x500..0x504], 0x12345678, .little);
+    try testing.expectEqual(errno.ok, saveDataSetParam(0, 0, @intFromPtr(&payload), payload.len, 0));
+    // Close and reopen the mount: output must come from persisted metadata.
+    filesystem.unmountSaveData();
+    _ = try filesystem.mountSaveDataSlot("slot0000", true);
+    var output: [0x530]u8 align(8) = @splat(0xaa);
+    var written: u64 = 0;
+    try testing.expectEqual(errno.ok, saveDataGetParam(0, 0, @intFromPtr(&output), output.len, @intFromPtr(&written)));
+    try testing.expectEqual(@as(u64, 0x530), written);
+    try testing.expectEqualSlices(u8, payload[0..0x504], output[0..0x504]);
+    try testing.expect(std.mem.readInt(i64, output[0x508..0x510], .little) > 0);
+    try testing.expect(std.mem.allEqual(u8, output[0x510..], 0));
+    try testing.expectEqual(invalid_argument, saveDataGetParam(0, 0, @intFromPtr(&output), output.len - 1, 0));
+    try testing.expectEqual(invalid_argument, saveDataSetParam(0, 0, @intFromPtr(&payload), payload.len - 1, 0));
+    try testing.expectEqual(errno.ok, saveDataSetParam(0, 2, @intFromPtr("changed"), 8, 0));
+    try testing.expectEqual(errno.ok, saveDataGetParam(0, 0, @intFromPtr(&output), output.len, 0));
+    try testing.expectEqualStrings("changed", savedata.boundedName(output[0x80..0x100]));
+    try testing.expectEqualSlices(u8, payload[0x100..0x504], output[0x100..0x504]);
+    var user: u32 = 0;
+    try testing.expectEqual(errno.ok, saveDataGetParam(0, 4, @intFromPtr(&user), @sizeOf(u32), @intFromPtr(&written)));
+    try testing.expectEqual(@as(u32, 0x12345678), user);
+    try testing.expectEqual(@as(u64, 4), written);
+    var mtime: i64 = 0;
+    try testing.expectEqual(errno.ok, saveDataGetParam(0, 5, @intFromPtr(&mtime), @sizeOf(i64), 0));
+    try testing.expect(mtime > 0);
+    try testing.expectEqual(invalid_argument, saveDataSetParam(0, 5, @intFromPtr(&mtime), @sizeOf(i64), 0));
+}
 
 /// Reads one descriptive parameter of a mounted slot.
 fn saveDataGetParam(
@@ -1995,17 +2053,36 @@ fn saveDataGetParam(
         return errno.KernelError.efault.raw();
     }
 
-    var storage: [1024]u8 = undefined;
+    if (written_address != 0 and !kernel_memory.isGuestRangeAccessible(written_address, @sizeOf(u64))) {
+        return errno.KernelError.efault.raw();
+    }
+    var storage: [2048]u8 = undefined;
     const text = filesystem.readSaveDataParameters(filesystem.mountedSaveDataSlot(), &storage) orelse "";
     const decoded = savedata.decodeParameters(text);
     const value = switch (parameter) {
+        save_data_param_all => {
+            if (size < @sizeOf(SaveDataParam)) return invalid_argument;
+            const output: *align(1) SaveDataParam = @ptrFromInt(value_address);
+            output.* = .{ .user_parameter = decoded.user_parameter, .modified_seconds = decoded.modified_seconds };
+            writeParameterString(&output.title, decoded.title);
+            writeParameterString(&output.subtitle, decoded.subtitle);
+            writeParameterString(&output.detail, decoded.detail);
+            reportParameterLength(written_address, @sizeOf(SaveDataParam));
+            return errno.ok;
+        },
         save_data_param_title => decoded.title,
         save_data_param_subtitle => decoded.subtitle,
         save_data_param_detail => decoded.detail,
         save_data_param_user => {
             if (size < @sizeOf(u32)) return invalid_argument;
-            @as(*u32, @ptrFromInt(value_address)).* = decoded.user_parameter;
+            @as(*align(1) u32, @ptrFromInt(value_address)).* = decoded.user_parameter;
             reportParameterLength(written_address, @sizeOf(u32));
+            return errno.ok;
+        },
+        save_data_param_mtime => {
+            if (size < @sizeOf(i64)) return invalid_argument;
+            @as(*align(1) i64, @ptrFromInt(value_address)).* = decoded.modified_seconds;
+            reportParameterLength(written_address, @sizeOf(i64));
             return errno.ok;
         },
         else => return invalid_argument,
@@ -2015,13 +2092,13 @@ fn saveDataGetParam(
     const length = @min(value.len, @as(usize, @intCast(size)) - 1);
     @memcpy(destination[0..length], value[0..length]);
     destination[length] = 0;
-    reportParameterLength(written_address, length);
+    reportParameterLength(written_address, length + 1);
     return errno.ok;
 }
 
 fn reportParameterLength(address: u64, length: usize) void {
     if (address == 0 or !kernel_memory.isGuestRangeAccessible(address, @sizeOf(u64))) return;
-    @as(*u64, @ptrFromInt(address)).* = length;
+    @as(*align(1) u64, @ptrFromInt(address)).* = length;
 }
 
 /// Records the descriptive parameters a title attaches to the mounted slot.
@@ -2039,48 +2116,39 @@ fn saveDataSetParam(
     const slot = filesystem.mountedSaveDataSlot();
     if (slot.len == 0) return invalid_argument;
 
-    var storage: [1024]u8 = undefined;
+    var storage: [2048]u8 = undefined;
     const existing = filesystem.readSaveDataParameters(slot, &storage) orelse "";
     var decoded = savedata.decodeParameters(existing);
-    // The decoded values point into `storage`, which the encode below reuses;
-    // copy the ones that are being kept before that happens.
-    var kept: [768]u8 = undefined;
-    var kept_length: usize = 0;
-    const title = retainValue(&kept, &kept_length, decoded.title);
-    const subtitle = retainValue(&kept, &kept_length, decoded.subtitle);
-    const detail = retainValue(&kept, &kept_length, decoded.detail);
-    decoded = .{
-        .title = title,
-        .subtitle = subtitle,
-        .detail = detail,
-        .user_parameter = decoded.user_parameter,
-    };
 
     const source: [*]const u8 = @ptrFromInt(value_address);
     switch (parameter) {
+        save_data_param_all => {
+            if (size < @sizeOf(SaveDataParam)) return invalid_argument;
+            const input: *align(1) const SaveDataParam = @ptrFromInt(value_address);
+            decoded = .{
+                .title = savedata.boundedName(&input.title),
+                .subtitle = savedata.boundedName(&input.subtitle),
+                .detail = savedata.boundedName(&input.detail),
+                .user_parameter = input.user_parameter,
+            };
+        },
         save_data_param_title => decoded.title = savedata.boundedName(source[0..@intCast(size)]),
         save_data_param_subtitle => decoded.subtitle = savedata.boundedName(source[0..@intCast(size)]),
         save_data_param_detail => decoded.detail = savedata.boundedName(source[0..@intCast(size)]),
         save_data_param_user => {
             if (size < @sizeOf(u32)) return invalid_argument;
-            decoded.user_parameter = @as(*const u32, @ptrFromInt(value_address)).*;
+            decoded.user_parameter = @as(*align(1) const u32, @ptrFromInt(value_address)).*;
         },
         else => return invalid_argument,
     }
 
-    var encoded_storage: [1024]u8 = undefined;
+    decoded.modified_seconds = @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, std.time.ns_per_s));
+    // The longest firmware fields total 1280 bytes, before record names and
+    // numeric metadata. Keep the input storage alive while encoding separately.
+    var encoded_storage: [2048]u8 = undefined;
     const encoded = savedata.encodeParameters(&encoded_storage, decoded) orelse return invalid_argument;
     filesystem.writeSaveDataParameters(slot, encoded) catch return errno.KernelError.eio.raw();
     return errno.ok;
-}
-
-/// Copies a value out of a buffer that is about to be reused.
-fn retainValue(storage: []u8, length: *usize, value: []const u8) []const u8 {
-    if (value.len == 0 or length.* + value.len > storage.len) return "";
-    const start = length.*;
-    @memcpy(storage[start..][0..value.len], value);
-    length.* += value.len;
-    return storage[start..][0..value.len];
 }
 
 const app_content_exports = [_]symbols.Export{

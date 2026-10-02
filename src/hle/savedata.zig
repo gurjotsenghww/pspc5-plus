@@ -39,6 +39,7 @@ pub const Parameters = struct {
     subtitle: []const u8 = "",
     detail: []const u8 = "",
     user_parameter: u32 = 0,
+    modified_seconds: i64 = 0,
 };
 
 /// Whether a byte can stand in a host path segment.
@@ -149,6 +150,11 @@ pub fn encodeParameters(storage: []u8, parameters: Parameters) ?[]const u8 {
     var number: [16]u8 = undefined;
     const digits = std.fmt.bufPrint(&number, "{d}", .{parameters.user_parameter}) catch return null;
     if (!appendRecord(storage, &length, "user", digits)) return null;
+    if (parameters.modified_seconds != 0) {
+        var timestamp: [24]u8 = undefined;
+        const seconds = std.fmt.bufPrint(&timestamp, "{d}", .{parameters.modified_seconds}) catch return null;
+        if (!appendRecord(storage, &length, "mtime", seconds)) return null;
+    }
     return storage[0..length];
 }
 
@@ -186,10 +192,12 @@ pub fn decodeParameters(text: []const u8) Parameters {
         if (std.mem.eql(u8, key, "user")) {
             parameters.user_parameter = std.fmt.parseInt(u32, value, 10) catch 0;
         }
+        if (std.mem.eql(u8, key, "mtime")) {
+            parameters.modified_seconds = std.fmt.parseInt(i64, value, 10) catch 0;
+        }
     }
     return parameters;
 }
-
 
 /// Where a title's identity is recorded in its own installation.
 pub const title_parameter_path = "sce_sys/param.json";

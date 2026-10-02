@@ -254,7 +254,7 @@ fn posixClose(descriptor: i32) callconv(abi.guest) i64 {
     return 0;
 }
 
-fn posixWrite(descriptor: i32, buffer: ?[*]const u8, length: usize) callconv(abi.guest) i64 {
+pub fn posixWrite(descriptor: i32, buffer: ?[*]const u8, length: usize) callconv(abi.guest) i64 {
     const source = buffer orelse return posixFail(Error.InvalidArgument);
     if (length != 0 and !memory_api.isGuestRangeAccessible(@intFromPtr(source), length)) {
         return posixFail(Error.InvalidArgument);
@@ -465,4 +465,45 @@ test "file exports register under published identifiers" {
     try testing.expect(db.findByName("sceKernelOpen", .function) != null);
     try testing.expect(db.findByName("sceKernelMkdir", .function) != null);
     try testing.expect(db.findByName("write", .function) != null);
+}
+
+test "registered POSIX write persists temporary saves and preserves descriptor errors" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    filesystem.attachTemporaryData(scratch.dir);
+    defer filesystem.detachTemporaryData();
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    try runtime_api.register(&db, testing.allocator);
+    const entry = db.find(.{
+        .id = @import("../nid.zig").fromName("write"),
+        .library = posix_library,
+        .module = module,
+        .type = .function,
+    }) orelse return error.TestExpectedSymbol;
+    const write_file: *const fn (i32, ?[*]const u8, usize) callconv(abi.guest) i64 = @ptrFromInt(entry.address);
+    const error_entry = db.findByName("__error", .function) orelse return error.TestExpectedSymbol;
+    const error_address: *const fn () callconv(abi.guest) *i32 = @ptrFromInt(error_entry.address);
+    const fd = kernelOpen("/temp0/TempSave/gameinfo.json", filesystem.O.rdwr | filesystem.O.creat | filesystem.O.trunc, 0);
+    try testing.expect(fd >= filesystem.first_descriptor);
+    try testing.expectEqual(@as(i64, 4), write_file(fd, "save", 4));
+    try testing.expectEqual(@as(i64, 1), write_file(fd, "!", 1));
+    try testing.expectEqual(errno.ok, kernelClose(fd));
+    try testing.expectEqual(@as(i64, -1), write_file(fd, "x", 1));
+    try testing.expectEqual(errno.Posix.ebadf, error_address().*);
+
+    const reopened = kernelOpen("/temp0/TempSave/gameinfo.json", filesystem.O.rdonly, 0);
+    defer _ = kernelClose(reopened);
+    var contents: [5]u8 = undefined;
+    try testing.expectEqual(@as(i64, contents.len), kernelRead(reopened, &contents, contents.len));
+    try testing.expectEqualStrings("save!", &contents);
+    try testing.expectEqual(@as(i64, -1), write_file(reopened, "x", 1));
+    try testing.expectEqual(errno.Posix.eacces, error_address().*);
+
+    const socket = try filesystem.openVirtualSocket();
+    defer filesystem.close(socket) catch {};
+    try testing.expectEqual(@as(i64, 4), write_file(socket, "wake", 4));
 }
