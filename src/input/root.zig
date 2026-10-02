@@ -114,6 +114,14 @@ pub fn read() State {
 
 fn mergeKeyboard(state: *State, keys: Mapping) void {
     if (comptime builtin.os.tag != .windows) return;
+    // GetAsyncKeyState observes the whole desktop. Typing in another program
+    // must not move the guest or press Options/Cross in a background game.
+    // A fresh poll releases keyboard state on focus loss; controller state
+    // already merged by hybrid mode is left intact.
+    const foreground = Win32.GetForegroundWindow() orelse return;
+    var owner: u32 = 0;
+    _ = Win32.GetWindowThreadProcessId(foreground, &owner);
+    if (owner != Win32.GetCurrentProcessId()) return;
     const bindings = [_]struct { key: u8, mask: u32 }{
         .{ .key = keys.cross, .mask = Button.cross },
         .{ .key = keys.circle, .mask = Button.circle },
@@ -324,6 +332,9 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const xinput_y: u16 = 0x8000;
 
     extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buffer: ?[*]u8, size: u32) callconv(.winapi) u32;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "user32" fn GetForegroundWindow() callconv(.winapi) ?*anyopaque;
+    extern "user32" fn GetWindowThreadProcessId(window: *anyopaque, process_id: *u32) callconv(.winapi) u32;
     extern "user32" fn GetAsyncKeyState(key: i32) callconv(.winapi) i16;
     extern "xinput1_4" fn XInputGetState(user_index: u32, state: *XInputState) callconv(.winapi) u32;
 } else struct {};

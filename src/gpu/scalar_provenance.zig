@@ -1010,7 +1010,12 @@ fn evaluateInto(
             .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => {},
             .v_writelane_b32 => lane_spills.store(result, inst.*),
             .v_readlane_b32 => lane_spills.restore(result, inst.*),
-            else => executeScalar(result, bindings.program_address, inst, &scc),
+            // Ordinary vector operations cannot change the scalar state.
+            // Dependency recording and spill invalidation still happen above;
+            // retain the normal path for scalar destinations, VCC/EXEC aliases,
+            // lane transfers and unknown instruction families.
+            else => if (inst.family == .unknown or scalarWalkVisits(inst.*))
+                executeScalar(result, bindings.program_address, inst, &scc),
         }
         if (steps != null and !dense_walk) {
             if (lane_spills.occupied != 0) {
@@ -1263,6 +1268,19 @@ fn recordResourceUserData(result: *Evaluation, inst: *const rdna2.Instruction) v
 }
 
 fn executeScalar(result: *Evaluation, program_address: u64, inst: *const rdna2.Instruction, scc: *?bool) void {
+    switch (inst.family) {
+        .vop1, .vop2, .vopc, .vop3, .vop3p => {
+            // Per-lane comparisons and carry outputs replace a scalar mask,
+            // including its upper word. They cannot retain a constant from
+            // an earlier scalar definition. Lane reads only replace one word;
+            // tracked readlane spills are handled by the walk before this.
+            const words: u8 = if (inst.opcode == .v_readfirstlane_b32 or inst.opcode == .v_readlane_b32) 1 else 2;
+            invalidateDestination(result, inst.dst, words);
+            invalidateDestination(result, inst.dst2, 2);
+            return;
+        },
+        else => {},
+    }
     if (inst.opcode == .s_wqm_b32 or inst.opcode == .s_not_b32) {
         const a = source(result, inst.src0) orelse {
             invalidateDestination(result, inst.dst, 1);
@@ -1904,6 +1922,61 @@ fn testBindings(program: u64, srt: u64) shaders.StageBindings {
         .srt_address = srt,
         .direct_pointers = .{},
     };
+}
+
+test "vector scalar fast path preserves loads, dependency masks and scalar clobbers" {
+    var storage = [_]u8{0} ** 32;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 123);
+    memory.write(0x4010, 456);
+    const bindings = testBindings(0x3000, 0x4000);
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .smem, .opcode = .s_load_dwordx8, .word_count = 2, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 8 },
+        .{ .pc = 8, .family = .sop1, .opcode = .s_mov_b64, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 12, .family = .vop3, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 16, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr, .reg = 8 } },
+        .{ .pc = 20, .family = .vop3, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 24, .family = .vop2, .opcode = .v_add_f32, .dst = .{ .kind = .vgpr }, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .vgpr, .reg = 1 } },
+        .{ .pc = 28, .family = .vopc, .opcode = .v_cmp_eq_f32, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .vgpr }, .src1 = .{ .kind = .vgpr, .reg = 1 } },
+        .{ .pc = 32, .family = .vop1, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .vgpr } },
+        .{ .pc = 36, .family = .sopp, .opcode = .s_endpgm },
+    };
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, instructions.len), result.instruction_count);
+    try std.testing.expectEqual(@as(usize, 1), memory.read_count);
+    try std.testing.expectEqual(@as(usize, 1), result.load_count);
+    try std.testing.expectEqual(@as(u32, 123), result.loads[0].values[0]);
+    try std.testing.expectEqual(@as(u32, 456), result.loads[0].values[4]);
+    try std.testing.expectEqual(@as(u32, 123), result.register(8).?.value);
+    try std.testing.expect(result.register(10) == null);
+    try std.testing.expect(result.register(12) == null);
+    try std.testing.expect(result.register(106) == null);
+    try std.testing.expectEqual(std.math.maxInt(u64), result.address_user_data_mask);
+}
+
+test "vector mask writes forget both scalar words without clobbering neighbours" {
+    const cases = [_]struct { code: [2]u32, words: usize, first: usize }{
+        .{ .code = .{ 0x7c04_0100, 0 }, .words = 1, .first = 106 }, // VOPC compare -> VCC
+        .{ .code = .{ 0x7daa_0e83, 0 }, .words = 1, .first = 126 }, // CMPX -> EXEC
+        .{ .code = .{ 0xd402_000c, 0x0002_0108 }, .words = 2, .first = 12 }, // VOP3 compare -> s[12:13]
+        .{ .code = .{ 0xd70f_0c00, 0x0002_0108 }, .words = 2, .first = 12 }, // VOP3B carry -> s[12:13]
+        .{ .code = .{ 0xd528_6a00, 0x0032_0080 }, .words = 2, .first = 106 }, // VOP3B addc -> VCC
+        .{ .code = .{ 0x5000_0100, 0 }, .words = 1, .first = 106 }, // VOP2 addc -> VCC
+    };
+    for (cases) |case| {
+        const inst = try rdna2.decodeInstruction(0, case.code[0..case.words], 0);
+        try std.testing.expect(scalarWalkVisits(inst));
+        var result = Evaluation{};
+        for (&result.registers, 0..) |*value, index| value.* = .{ .known = true, .value = @intCast(index + 1) };
+        var scc: ?bool = true;
+        executeScalar(&result, 0, &inst, &scc);
+        for (result.registers, 0..) |value, index| {
+            try std.testing.expectEqual(index != case.first and index != case.first + 1, value.known);
+            if (value.known) try std.testing.expectEqual(@as(u32, @intCast(index + 1)), value.value);
+        }
+        try std.testing.expectEqual(true, scc.?);
+    }
 }
 
 test "resource walk restores pointer halves from independent VGPR lane spills" {
