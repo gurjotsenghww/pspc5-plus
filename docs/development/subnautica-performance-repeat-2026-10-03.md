@@ -1,6 +1,11 @@
 # Subnautica: Below Zero — performance repeat, October 3, 2026
 
-**PPSA02457 v1.022.125**, measured with the installed GTA III resource-optimization
+**Latest fresh-process repeat:** **15.50 FPS** in the menu and **12.70 / 8.50 FPS**
+in two stationary world samples, **10.60 FPS combined**. The same executable
+and save were used. See [the second run](#second-fresh-process-repeat) below;
+the first run and its ten-second stall are retained separately.
+
+First launch: **PPSA02457 v1.022.125**, measured with the installed GTA III resource-optimization
 build. Two unpaused, stationary world samples record **7.27 and 11.77 FPS**,
 or **9.52 FPS** across their combined measured minute. The main menu records
 **14.67 FPS**. Long stalls remain; the 30 FPS target is unmet.
@@ -66,3 +71,40 @@ unchanged during this repeat.
 
 Raw counter samples, logs, manifest and before/after captures are retained in
 the ignored `out/subnautica-repeat-current-20261003-run1/` directory.
+
+## Second fresh-process repeat
+
+A second requested launch uses the identical installed executable, copied save,
+working directory, 1080p output, Speed preset and diagnostic settings. No code,
+renderer flags or game settings change between runs. Cached resources are warm.
+The low-temperature save again reaches the snowy crash site; death and respawn
+finish before either world interval begins. The player remains alive in the
+same stationary, unpaused viewpoint during both retained samples.
+
+| Scene | Presented frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Animated main menu | 465 | 30.000207 | 15.50 |
+| Snowy world, sample A | 381 | 30.000598 | 12.70 |
+| Same world view, sample B | 255 | 30.000330 | 8.50 |
+| World A + B, combined intervals | 636 | 60.000928 | 10.60 |
+
+Sample A delivers 11–14 frames per approximately one-second observation;
+sample B delivers 4–14. Neither measured interval contains a zero-frame
+one-second bin. The ten-second stop from the first launch does not recur in
+these two intervals, but shorter delays remain. The slowest periodic frame
+report inside them is 409 ms, including 335 ms in compute-dispatch processing.
+Periodic reports are not a complete frame-time trace or a 1% low measurement.
+
+![Second fresh-process Subnautica world measurement](../images/subnautica-below-zero-repeat2-2026-10-03.png)
+
+This unedited capture is taken after sample A, outside the measurement interval.
+The second capture shows the hypothermia warning and the player still alive;
+neither measurement crosses a death screen. No guest fault or device loss is
+reported. The test process is deliberately stopped afterward and the copied
+save archive retains its original hash.
+
+The previous launch averaged 9.52 FPS, versus 10.60 FPS here. Because the binary
+is unchanged, this difference demonstrates run-to-run variability and does not
+establish a new optimization or a fix for long stalls. 30 FPS and long-session
+stability remain unmet/unverified. Evidence for this launch is retained in
+`out/subnautica-repeat-current-20261003-run2/`.
