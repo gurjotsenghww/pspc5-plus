@@ -1748,6 +1748,38 @@ const save_data_mount_create_bits: u32 = 0x04 | 0x20;
 
 const save_data_error_not_found: i32 = @bitCast(@as(u32, 0x809f0008));
 
+const SaveDataDeleteRequest = extern struct {
+    user_id: i32,
+    padding: u32,
+    title_id: u64,
+    directory_name: u64,
+    unused: u32,
+    reserved: [32]u8,
+    padding2: u32,
+};
+
+fn saveDataDelete(request_address: u64) callconv(abi.guest) i32 {
+    const parameter_error: i32 = @bitCast(@as(u32, 0x809f0000));
+    if (request_address == 0 or !kernel_memory.isGuestRangeAccessible(request_address, @sizeOf(SaveDataDeleteRequest)))
+        return parameter_error;
+    const request: *align(1) const SaveDataDeleteRequest = @ptrFromInt(request_address);
+    if (request.user_id < 0) return @bitCast(@as(u32, 0x809f0011));
+    if (request.title_id != 0) {
+        if (!kernel_memory.isGuestRangeAccessible(request.title_id, 10)) return parameter_error;
+        const bytes: [*]const u8 = @ptrFromInt(request.title_id);
+        const title = savedata.boundedName(bytes[0..10]);
+        if (!std.mem.eql(u8, title, filesystem.titleIdentifier())) return parameter_error;
+    }
+    var slot_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const slot = readSlotName(request.directory_name, &slot_storage) orelse return parameter_error;
+    filesystem.deleteSaveDataSlot(slot) catch |err| return switch (err) {
+        error.Busy => @bitCast(@as(u32, 0x809f0003)),
+        error.InvalidArgument => parameter_error,
+        else => @bitCast(@as(u32, 0x809f000b)),
+    };
+    return errno.ok;
+}
+
 fn saveDataMount3(request_address: u64, result: ?*SaveDataMountResult) callconv(abi.guest) i32 {
     const output = result orelse return invalid_argument;
     if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(SaveDataMountResult))) {
@@ -2211,6 +2243,7 @@ const mouse_exports = [_]symbols.Export{
 // title's `/savedata0`; its files are then written through the ordinary file
 // API, which is how a title stores its progress.
 const save_data_exports = [_]symbols.Export{
+    .{ .name = "sceSaveDataDelete", .function = trace.wrap("sceSaveDataDelete", &saveDataDelete), .expect_id = "S1GkePI17zQ" },
     .{ .name = "sceSaveDataInitialize3", .function = trace.wrap("sceSaveDataInitialize3", &success), .expect_id = "TywrFKCoLGY" },
     .{ .name = "sceSaveDataSetupSaveDataMemory2", .function = trace.wrap("sceSaveDataSetupSaveDataMemory2", &saveDataSetupMemory), .expect_id = "oQySEUfgXRA" },
     .{ .name = "sceSaveDataGetSaveDataMemory2", .function = trace.wrap("sceSaveDataGetSaveDataMemory2", &saveDataGetMemory), .expect_id = "QwOO7vegnV8" },

@@ -12343,6 +12343,15 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("storage read placement passed: 16 dispatches per placement, 1 GiB input reads; host_cached={d}us device_local={d}us; changed-input sums verified\n", .{ elapsed[0] / 1000, elapsed[1] / 1000 });
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--eager-compute-readbacks")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .device_storage_budget_bytes = 1024 * 1024 });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        try renderer.probeEagerComputeReadbacks(0x1000);
+        std.debug.print("eager compute readbacks passed: two GPU outputs, one transfer, immediate guest visibility and intact neighbours\n", .{});
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--device-storage")) {
         for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false, 64 * 1024 * 1024, 0);
         try runBufferContentCacheProbe(allocator, 64 * 1024 * 1024);

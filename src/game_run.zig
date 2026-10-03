@@ -760,7 +760,9 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
     } else |_| std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or use_gta_iii_buffer_profile;
-    const default_copy_workers: u8 = if (use_gta_iii_buffer_profile or std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 4 else 1;
+    const default_copy_workers: u8 = if (use_gta_iii_buffer_profile or
+        std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or
+        std.ascii.eqlIgnoreCase(title_identifier, little_nightmares_enhanced_title_id)) 4 else 1;
     const gpu_copy_workers: u8 = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COPY_WORKERS")) |text| parse: {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(u8, text, 10) catch default_copy_workers, 1, gpu.parallel_copy.Pool.maximum_participants);

@@ -567,6 +567,31 @@ fn titleCacheMetadataAlias(relative: []const u8, storage: []u8) ?[]const u8 {
 /// never there.
 pub const SaveDataMountOutcome = enum { missing, existed, created };
 
+/// Deletes only an unmounted slot belonging to the running title. Unlike a
+/// creating mount, deletion must reject names that would be sanitized into a
+/// different slot. Open each parent separately without following symlinks.
+pub fn deleteSaveDataSlot(slot: []const u8) (Error || error{Busy})!void {
+    var checked: [savedata.maximum_slot_name]u8 = undefined;
+    if (slot.len == 0 or slot.len >= checked.len or
+        !std.mem.eql(u8, slot, savedata.sanitizeName(slot, &checked)))
+        return Error.InvalidArgument;
+    table_lock.lock();
+    defer table_lock.unlock();
+    if (savedata_root != null and std.ascii.eqlIgnoreCase(slot, mountedSaveDataSlot()))
+        return error.Busy;
+    const io = active_io orelse return Error.NotAttached;
+    const home = savedata_home orelse return Error.NotAttached;
+    const title = titleIdentifier();
+    if (title.len == 0 or !std.mem.eql(u8, title, savedata.sanitizeName(title, &checked)))
+        return Error.InvalidArgument;
+    const directory = home.openDir(io, title, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return Error.IoFailed,
+    };
+    defer directory.close(io);
+    directory.deleteTree(io, slot) catch return Error.IoFailed;
+}
+
 pub fn mountSaveDataSlot(slot: []const u8, may_create: bool) Error!SaveDataMountOutcome {
     const io = active_io orelse return Error.NotAttached;
     const home = savedata_home orelse return Error.NotAttached;
@@ -1021,6 +1046,10 @@ fn openWritableFile(
         };
     errdefer file.close(io);
 
+    if (truncate and !create) {
+        if (!writing) return Error.ReadOnly;
+        file.setLength(io, 0) catch return Error.IoFailed;
+    }
     const size = if (create and truncate) 0 else file.length(io) catch return Error.IoFailed;
 
     table_lock.lock();
@@ -1300,7 +1329,7 @@ noinline fn readGuestFile(space: *guest_memory.AddressSpace, file: std.Io.File, 
     return total;
 }
 
-/// Writes only to the redirected diagnostic descriptor. Reserving the range
+/// Writes to writable mounts and the diagnostic descriptor. Reserving the range
 /// under the table lock makes concurrent Unity logging positional and prevents
 /// two messages from overwriting one another.
 pub fn write(descriptor: i32, buffer: []const u8) Error!usize {
@@ -1331,6 +1360,38 @@ pub fn write(descriptor: i32, buffer: []const u8) Error!usize {
 
     file.writePositionalAll(io, buffer, offset) catch return Error.IoFailed;
     return buffer.len;
+}
+
+/// Positional writes preserve the descriptor's seek position. Keep the handle
+/// alive under the table lock until the write and size update have completed.
+pub fn pwrite(descriptor: i32, buffer: []const u8, offset: u64) Error!usize {
+    const end = std.math.add(u64, offset, buffer.len) catch return Error.InvalidArgument;
+    if (end > std.math.maxInt(i64)) return Error.InvalidArgument;
+    const io = active_io orelse return Error.NotAttached;
+    table_lock.lock();
+    defer table_lock.unlock();
+    const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
+    const entry = if (slot.*) |*value| value else return Error.BadDescriptor;
+    if (!entry.diagnostic_log and !entry.writable) return Error.ReadOnly;
+    const file = entry.file orelse return Error.BadDescriptor;
+    if (buffer.len == 0) return 0;
+    file.writePositionalAll(io, buffer, offset) catch return Error.IoFailed;
+    entry.size = @max(entry.size, end);
+    return buffer.len;
+}
+
+/// Changes the host file length without moving the guest seek position.
+pub fn ftruncate(descriptor: i32, length: u64) Error!void {
+    if (length > std.math.maxInt(i64)) return Error.InvalidArgument;
+    const io = active_io orelse return Error.NotAttached;
+    table_lock.lock();
+    defer table_lock.unlock();
+    const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
+    const entry = if (slot.*) |*value| value else return Error.BadDescriptor;
+    if (!entry.diagnostic_log and !entry.writable) return Error.ReadOnly;
+    const file = entry.file orelse return Error.BadDescriptor;
+    file.setLength(io, length) catch return Error.IoFailed;
+    entry.size = length;
 }
 
 pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
@@ -1802,6 +1863,35 @@ test "display boot overlay has consistent reads and stat without modifying title
     defer close(raw) catch {};
     const length = try read(raw, &bytes);
     try testing.expectEqualStrings(original, bytes[0..length]);
+}
+
+test "save-data delete is confined to an unmounted slot of the active title" {
+    var fixture = try Fixture.init("title data");
+    defer fixture.deinit();
+    attachSaveDataHome(fixture.tmp.dir, "PPSA15065");
+    defer {
+        unmountSaveData();
+        savedata_home = null;
+        title_identifier_length = 0;
+    }
+    try fixture.tmp.dir.createDirPath(testing.io, "PPSA15065/remove/data");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "PPSA15065/remove/data/save.bin", .data = "progress" });
+    try fixture.tmp.dir.createDirPath(testing.io, "PPSA15065/keep");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "PPSA15065/keep/save.bin", .data = "keep" });
+    try fixture.tmp.dir.createDirPath(testing.io, "OTHER/remove");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "OTHER/remove/save.bin", .data = "other" });
+    _ = try mountSaveDataSlot("remove", false);
+    try testing.expectError(error.Busy, deleteSaveDataSlot("remove"));
+    try testing.expectError(error.Busy, deleteSaveDataSlot("REMOVE"));
+    unmountSaveData();
+    for ([_][]const u8{ "", ".", "..", "../keep", "..\\keep", "remove/", "remove.", " remove", "C:remove" }) |name|
+        try testing.expectError(Error.InvalidArgument, deleteSaveDataSlot(name));
+    try deleteSaveDataSlot("remove");
+    try deleteSaveDataSlot("remove");
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.openDir(testing.io, "PPSA15065/remove", .{}));
+    var bytes: [16]u8 = undefined;
+    try testing.expectEqualStrings("keep", try fixture.tmp.dir.readFile(testing.io, "PPSA15065/keep/save.bin", &bytes));
+    try testing.expectEqualStrings("other", try fixture.tmp.dir.readFile(testing.io, "OTHER/remove/save.bin", &bytes));
 }
 
 test "save-data search hides interrupted slots without payload" {

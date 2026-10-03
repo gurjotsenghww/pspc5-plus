@@ -2670,8 +2670,23 @@ const DccClearTexel = struct {
 
 const CachedHtileTarget = struct {
     target: gpu.resources.DepthTarget,
+    // Layout construction walks the mip chain. These immutable bounds are
+    // queried for every staged buffer, including thousands of non-overlaps.
+    depth_bytes: u64,
+    stencil_bytes: u64,
+    metadata_bytes: u64,
     resolved: bool = false,
     last_used_sequence: u64 = 0,
+
+    fn init(target: gpu.resources.DepthTarget, sequence: u64) CachedHtileTarget {
+        return .{
+            .target = target,
+            .depth_bytes = if (gpu.TextureLayout.fromDepthTarget(target)) |layout| layout.required_source_bytes else |_| 0,
+            .stencil_bytes = if (target.stencil_format == 0) 0 else if (gpu.TextureLayout.fromStencilTarget(target)) |layout| layout.required_source_bytes else |_| 0,
+            .metadata_bytes = if (gpu.HtileLayout.fromDepthTarget(target)) |layout| layout.required_bytes else |_| 0,
+            .last_used_sequence = sequence,
+        };
+    }
 };
 
 const HtileResolveStats = struct {
@@ -12346,6 +12361,12 @@ pub const Renderer = struct {
     fn commitComputeWrites(self: *Renderer, resources: *const ComputeResources) anyerror!void {
         const profile_started = self.resourceTimestampNs();
         defer self.frame_profile.storage_commit_ns +|= elapsedHostNanoseconds(profile_started);
+        // Eager publication still completes before this dispatch returns.
+        // Independent small outputs can share a transfer submission and fence;
+        // overlapping views retain their existing ordered publication path.
+        const batch_eager = !self.defer_small_storage_writes_enabled and independentSmallComputeWrites(resources);
+        var eager_indices: [maximum_storage_descriptors]usize = undefined;
+        var eager_count: usize = 0;
         for (resources.writable, 0..) |writable, index| {
             if (!writable) continue;
             // The buffer now owns this allocation. A subsequent attachment
@@ -12371,6 +12392,11 @@ pub const Renderer = struct {
                 }
                 return Error.GuestBufferNotStaged;
             };
+            if (batch_eager) {
+                eager_indices[eager_count] = buffer_index;
+                eager_count += 1;
+                continue;
+            }
             try self.flushComputedMetadata(buffer_index);
             if (self.defer_small_storage_writes_enabled or
                 resources.sizes[index] >= deferred_storage_write_min_bytes)
@@ -12378,6 +12404,23 @@ pub const Renderer = struct {
                 continue;
             }
             try self.flushGuestStorageBuffer(buffer_index);
+        }
+        if (eager_count != 0) {
+            const indices = eager_indices[0..eager_count];
+            defer for (indices) |index| {
+                self.guest_buffers.items[index].completion_readback_ready = false;
+            };
+            var selected = std.StaticBitSet(maximum_retained_buffer_entries).initEmpty();
+            for (indices) |index| {
+                const entry = &self.guest_buffers.items[index];
+                if (entry.gpu_dirty and entry.host_transfer != null and !self.discardUnmappedGuestBuffer(index))
+                    selected.set(index);
+            }
+            try self.prepareBufferReadbacks(selected);
+            for (indices) |index| {
+                try self.flushComputedMetadata(index);
+                try self.flushGuestStorageBuffer(index);
+            }
         }
     }
 
@@ -14118,10 +14161,7 @@ pub const Renderer = struct {
             cached.last_used_sequence = self.htile_target_sequence;
             return index;
         }
-        const entry = CachedHtileTarget{
-            .target = target,
-            .last_used_sequence = self.htile_target_sequence,
-        };
+        const entry = CachedHtileTarget.init(target, self.htile_target_sequence);
         if (self.htile_targets.items.len < maximum_depth_targets) {
             try self.htile_targets.append(self.allocator, entry);
             return self.htile_targets.items.len - 1;
@@ -14199,10 +14239,15 @@ pub const Renderer = struct {
         }
         if (depth_count == 0) return null;
         for (depth_addresses[0..depth_count]) |address| {
-            const allocation = try self.allocator.alloc(u8, depth_bytes);
-            defer self.allocator.free(allocation);
-            if (!memory.read(memory.context, address, allocation)) return Error.GuestMemoryReadFailed;
-            try applyHtileDepthFastClears(htile, metadata, target, depth, allocation);
+            var scratch = try self.image_scratch.acquire(self.allocator, depth_bytes);
+            defer scratch.release();
+            const allocation = scratch.bytes;
+            // A uniform clear replaces the entire allocation, so preserving
+            // its previous bytes would copy data that is immediately discarded.
+            if (!applyUniformHtileDepthClear(stats, target, depth, allocation)) {
+                if (!memory.read(memory.context, address, allocation)) return Error.GuestMemoryReadFailed;
+                try applyHtileDepthFastClears(htile, metadata, target, depth, allocation);
+            }
             if (!memory.write(memory.context, address, allocation)) return Error.GuestMemoryWriteFailed;
         }
 
@@ -14264,31 +14309,30 @@ pub const Renderer = struct {
         for (self.htile_targets.items) |cached| {
             if (cached.resolved) continue;
             const target = cached.target;
-            const depth = gpu.TextureLayout.fromDepthTarget(target) catch continue;
+            if (cached.depth_bytes == 0) continue;
             const depth_hit = (target.read_address != 0 and byteRangesOverlap(
                 address,
                 size,
                 target.read_address,
-                depth.required_source_bytes,
+                cached.depth_bytes,
             )) or (target.write_address != 0 and byteRangesOverlap(
                 address,
                 size,
                 target.write_address,
-                depth.required_source_bytes,
+                cached.depth_bytes,
             ));
             var stencil_hit = false;
-            if (!depth_hit and target.stencil_format != 0) {
-                const stencil = gpu.TextureLayout.fromStencilTarget(target) catch continue;
+            if (!depth_hit and cached.stencil_bytes != 0) {
                 stencil_hit = (target.stencil_read_address != 0 and byteRangesOverlap(
                     address,
                     size,
                     target.stencil_read_address,
-                    stencil.required_source_bytes,
+                    cached.stencil_bytes,
                 )) or (target.stencil_write_address != 0 and byteRangesOverlap(
                     address,
                     size,
                     target.stencil_write_address,
-                    stencil.required_source_bytes,
+                    cached.stencil_bytes,
                 ));
             }
             if (!depth_hit and !stencil_hit) continue;
@@ -17592,6 +17636,52 @@ pub const Renderer = struct {
         try std.testing.expect(!entry.gpu_dirty);
         if (!memory.read(memory.context, address, &actual)) return Error.GuestMemoryReadFailed;
         for (0..4) |word| try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, actual[word * 4 ..][0..4], .little));
+    }
+
+    /// Validate eager publication of two independent GPU outputs with one
+    /// transfer submission, including bytes outside the output ranges.
+    pub fn probeEagerComputeReadbacks(self: *Renderer, address: u64) anyerror!void {
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const resources = try ComputeResources.init(self.allocator);
+        defer self.allocator.destroy(resources);
+        const previous = self.defer_small_storage_writes_enabled;
+        self.defer_small_storage_writes_enabled = false;
+        defer self.defer_small_storage_writes_enabled = previous;
+        const seed: [128]u8 = @splat(0x5a);
+        if (!memory.write(memory.context, address, &seed)) return Error.GuestMemoryWriteFailed;
+        for (0..2) |slot| {
+            const base = address + slot * 64;
+            _ = try self.stageGuestStorageBufferAt(@intCast(slot), base, 32);
+            resources.addresses[slot] = base;
+            resources.sizes[slot] = 32;
+            resources.writable[slot] = true;
+            resources.write_ranges[slot] = .{ .whole = true };
+        }
+        try self.waitForSubmittedWork();
+        const command = try self.beginOneShot();
+        defer self.releaseOneShot(command);
+        for (0..2) |slot| {
+            const index = for (self.guest_buffers.items, 0..) |entry, i| {
+                if (entry.guest_address == address + slot * 64 and entry.size == 32) break i;
+            } else return Error.GuestBufferNotStaged;
+            const entry = &self.guest_buffers.items[index];
+            try std.testing.expect(entry.host_transfer != null);
+            const barrier = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit, .destination_access_mask = vk.access_transfer_write_bit, .buffer = entry.device_local.handle, .offset = 0, .size = 32 };
+            self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+            self.device_functions.cmd_fill_buffer(command, entry.device_local.handle, 0, 32, @as(u32, @intCast(0x12340000 + slot)));
+            entry.last_gpu_use = command_buffer_pending_tick;
+        }
+        try self.submitOneShot(command);
+        try self.waitForSubmittedWork();
+        const before = self.submitted_tick;
+        try self.commitComputeWrites(resources);
+        try std.testing.expectEqual(before + 1, self.submitted_tick);
+        var actual: [128]u8 = undefined;
+        if (!memory.read(memory.context, address, &actual)) return Error.GuestMemoryReadFailed;
+        for (0..2) |slot| {
+            for (0..8) |word| try std.testing.expectEqual(@as(u32, @intCast(0x12340000 + slot)), std.mem.readInt(u32, actual[slot * 64 + word * 4 ..][0..4], .little));
+            try std.testing.expectEqualSlices(u8, seed[0..32], actual[slot * 64 + 32 ..][0..32]);
+        }
     }
 
     /// Compare the GPU cost of identical SSBO reads from CPU-cached RAM and
@@ -28370,8 +28460,7 @@ pub const Renderer = struct {
         if (size == 0) return;
         for (self.htile_targets.items) |*cached| {
             if (!cached.target.htile_enabled or cached.target.htile_address == 0) continue;
-            const layout = gpu.HtileLayout.fromDepthTarget(cached.target) catch continue;
-            if (!byteRangesOverlap(address, size, cached.target.htile_address, layout.required_bytes)) continue;
+            if (!byteRangesOverlap(address, size, cached.target.htile_address, cached.metadata_bytes)) continue;
             cached.resolved = false;
         }
     }
@@ -28744,6 +28833,10 @@ pub const Renderer = struct {
                 (!large_outputs and entry.size >= deferred_storage_write_min_bytes)) continue;
             if (!self.discardUnmappedGuestBuffer(index)) selected.set(index);
         }
+        try self.prepareBufferReadbacks(selected);
+    }
+
+    fn prepareBufferReadbacks(self: *Renderer, selected: std.StaticBitSet(maximum_retained_buffer_entries)) (Error || std.mem.Allocator.Error)!void {
         if (selected.count() < 2) return;
         try self.finishDrawBatchRecording(false);
         const command = try self.beginOneShot();
@@ -32229,6 +32322,46 @@ fn dispatchGroupCounts(dimensions: [3]u32, local_size: [3]u32, initiator: u32) [
     return result;
 }
 
+fn independentSmallComputeWrites(resources: *const ComputeResources) bool {
+    if (resources.store_preparation_incomplete) return false;
+    var count: usize = 0;
+    for (resources.writable, 0..) |writable, index| {
+        if (!writable) continue;
+        if (resources.sizes[index] == 0 or resources.sizes[index] >= deferred_storage_write_min_bytes) return false;
+        for (resources.writable[0..index], 0..) |earlier, other| {
+            if (earlier and byteRangesOverlap(resources.addresses[index], resources.sizes[index], resources.addresses[other], resources.sizes[other]))
+                return false;
+        }
+        count += 1;
+    }
+    return count >= 2;
+}
+
+test "eager compute batching requires multiple disjoint small complete writes" {
+    const resources = try std.testing.allocator.create(ComputeResources);
+    defer std.testing.allocator.destroy(resources);
+    resources.writable = @splat(false);
+    resources.store_preparation_incomplete = false;
+    resources.writable[0] = true;
+    resources.addresses[0] = 0x1000;
+    resources.sizes[0] = 128;
+    try std.testing.expect(!independentSmallComputeWrites(resources));
+    resources.writable[1] = true;
+    resources.addresses[1] = 0x1080;
+    resources.sizes[1] = 64;
+    try std.testing.expect(independentSmallComputeWrites(resources));
+    resources.addresses[1] = 0x107f;
+    try std.testing.expect(!independentSmallComputeWrites(resources));
+    resources.addresses[1] = 0x1000;
+    try std.testing.expect(!independentSmallComputeWrites(resources));
+    resources.addresses[1] = 0x1080;
+    resources.sizes[1] = deferred_storage_write_min_bytes;
+    try std.testing.expect(!independentSmallComputeWrites(resources));
+    resources.sizes[1] = 64;
+    resources.store_preparation_incomplete = true;
+    try std.testing.expect(!independentSmallComputeWrites(resources));
+}
+
 fn isSceneCollisionQuery(analysis: *const gpu.ShaderAnalysis) bool {
     var root_shape = false;
     for ([_]u32{ 0x6ac, 0x6a0 }) |pc| {
@@ -33970,6 +34103,36 @@ fn classifyHtileBlocks(
         }
     }
     return stats;
+}
+
+/// A constant surface has the same value in every swizzle order. Fill its
+/// complete allocation directly, including unused tile padding, only when the
+/// view covers the whole single-mip resource. Partial views keep the per-texel
+/// path so that earlier array slices and other mips are preserved.
+fn applyUniformHtileDepthClear(
+    stats: HtileResolveStats,
+    target: gpu.resources.DepthTarget,
+    depth: gpu.TextureSubresourceLayout,
+    allocation: []u8,
+) bool {
+    if (stats.base_blocks != 0 or stats.clearBlocks() == 0 or
+        (stats.clear_zero_blocks != 0 and stats.clear_one_blocks != 0) or
+        target.base_array_slice != 0 or target.maximum_mip != 0 or target.mip_level != 0 or
+        depth.required_source_bytes > allocation.len) return false;
+    const destination = allocation[0..@intCast(depth.required_source_bytes)];
+    const one = stats.clear_one_blocks != 0;
+    switch (target.format) {
+        1 => {
+            if (depth.block.bytes_per_element != 2 or destination.len % 2 != 0) return false;
+            @memset(destination, if (one) 0xff else 0);
+        },
+        3 => {
+            if (depth.block.bytes_per_element != 4 or destination.len % 4 != 0) return false;
+            @memset(std.mem.bytesAsSlice(u32, destination), std.mem.nativeToLittle(u32, if (one) 0x3f800000 else 0));
+        },
+        else => return false,
+    }
+    return true;
 }
 
 fn applyHtileDepthFastClears(
@@ -39005,6 +39168,76 @@ test "CMASK clear and expanded nibbles materialize only the selected 8x8 blocks"
 
     try layout.setValue(&metadata, 8, 0, 0, 5);
     try std.testing.expect(classifyCmaskBlocks(layout, &metadata) == null);
+}
+
+test "HTILE cached bounds retain non-overlap and metadata invalidation" {
+    var target = std.mem.zeroes(gpu.resources.DepthTarget);
+    target.read_address = 0x1000_0000;
+    target.write_address = target.read_address;
+    target.htile_address = 0x2000_0000;
+    target.width = 1280;
+    target.height = 720;
+    target.format = 3;
+    target.tile_mode = .depth;
+    target.stencil_tile_mode = .depth;
+    target.htile_enabled = true;
+    target.htile_pipe_aligned = true;
+    target.tile_stencil_disabled = true;
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.allocator = std.testing.allocator;
+    renderer.htile_targets = .empty;
+    renderer.htile_target_sequence = 0;
+    defer renderer.htile_targets.deinit(std.testing.allocator);
+    const first = try renderer.acquireHtileTarget(target);
+    const cached = &renderer.htile_targets.items[first];
+    try std.testing.expect(cached.depth_bytes >= @as(u64, 1280) * 720 * 4);
+    try std.testing.expect(cached.metadata_bytes != 0);
+    try std.testing.expectEqual(@as(u64, 0), cached.stencil_bytes);
+    try std.testing.expect(!try renderer.materializeHtileTargetAt(target.read_address - 4, 4));
+    try std.testing.expect(!try renderer.materializeHtileTargetAt(target.read_address + cached.depth_bytes, 4));
+    cached.resolved = true;
+    renderer.prepareHtileWrite(target.htile_address + cached.metadata_bytes, 4);
+    try std.testing.expect(cached.resolved);
+    renderer.prepareHtileWrite(target.htile_address + cached.metadata_bytes - 4, 4);
+    try std.testing.expect(!cached.resolved);
+    try std.testing.expectEqual(first, try renderer.acquireHtileTarget(target));
+    target.width = 2560;
+    const wider = try renderer.acquireHtileTarget(target);
+    try std.testing.expect(wider != first);
+    try std.testing.expect(renderer.htile_targets.items[wider].depth_bytes > renderer.htile_targets.items[first].depth_bytes);
+}
+
+test "HTILE uniform clear preserves depth values across formats samples and layers" {
+    for ([_]u8{ 1, 3 }) |format| for ([_]u8{ 0, 2 }) |samples| for ([_]bool{ false, true }) |one| {
+        var target = std.mem.zeroes(gpu.resources.DepthTarget);
+        target.width = 17;
+        target.height = 9;
+        target.format = format;
+        target.tile_mode = .depth;
+        target.samples_log2 = @intCast(samples);
+        target.last_array_slice = 1;
+        const texture = try gpu.TextureLayout.fromDepthTarget(target);
+        const depth = try texture.base();
+        const allocation = try std.testing.allocator.alloc(u8, @intCast(texture.required_source_bytes));
+        defer std.testing.allocator.free(allocation);
+        @memset(allocation, 0xaa);
+        const stats = HtileResolveStats{ .clear_zero_blocks = if (one) 0 else 12, .clear_one_blocks = if (one) 12 else 0 };
+        try std.testing.expect(applyUniformHtileDepthClear(stats, target, depth, allocation));
+        for (0..2) |layer| for (0..9) |y| for (0..17) |x| for (0..depth.samples()) |sample| {
+            const offset: usize = @intCast(try depth.sourceByteOffset(@intCast(x), @intCast(y), @intCast(layer), @intCast(sample)));
+            const actual: u32 = if (format == 1) std.mem.readInt(u16, allocation[offset..][0..2], .little) else std.mem.readInt(u32, allocation[offset..][0..4], .little);
+            try std.testing.expectEqual(@as(u32, if (!one) 0 else if (format == 1) 0xffff else 0x3f800000), actual);
+        };
+        target.base_array_slice = 1;
+        try std.testing.expect(!applyUniformHtileDepthClear(stats, target, depth, allocation));
+        target.base_array_slice = 0;
+        target.maximum_mip = 1;
+        try std.testing.expect(!applyUniformHtileDepthClear(stats, target, depth, allocation));
+        target.maximum_mip = 0;
+        try std.testing.expect(!applyUniformHtileDepthClear(.{ .clear_zero_blocks = 1, .clear_one_blocks = 1 }, target, depth, allocation));
+        try std.testing.expect(!applyUniformHtileDepthClear(.{ .base_blocks = 1, .clear_one_blocks = 1 }, target, depth, allocation));
+    };
 }
 
 test "HTILE fast-clear words materialize exact depth and stencil blocks" {

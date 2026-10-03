@@ -8,9 +8,8 @@
 //! in the thread's `errno`. Translating in one place keeps the two from
 //! drifting apart.
 //!
-//! Writes are refused rather than ignored: save data has no location policy or
-//! container format yet, and a title that believes its data was stored is far
-//! worse off than one told the filesystem is read-only.
+//! Writes use the filesystem's writable save, download and temporary mounts.
+//! Installed title content remains read-only.
 
 const std = @import("std");
 const abi = @import("../abi.zig");
@@ -180,7 +179,7 @@ fn kernelGetdirentries(
     return @intCast(count);
 }
 
-/// Writing is refused for every descriptor the filesystem owns.
+/// The filesystem enforces the descriptor's writable mount and open mode.
 fn kernelWrite(descriptor: i32, buffer: ?[*]const u8, length: usize) callconv(abi.guest) i64 {
     const source = buffer orelse return KernelError.efault.raw();
     if (length != 0 and !memory_api.isGuestRangeAccessible(@intFromPtr(source), length)) {
@@ -190,8 +189,18 @@ fn kernelWrite(descriptor: i32, buffer: ?[*]const u8, length: usize) callconv(ab
     return @intCast(count);
 }
 
-fn kernelPwrite(_: i32, _: ?[*]const u8, _: usize, _: i64) callconv(abi.guest) i64 {
-    return KernelError.eacces.raw();
+fn kernelPwrite(descriptor: i32, buffer: ?[*]const u8, length: usize, offset: i64) callconv(abi.guest) i64 {
+    if (offset < 0) return KernelError.einval.raw();
+    const source = buffer orelse return KernelError.efault.raw();
+    if (length != 0 and !memory_api.isGuestRangeAccessible(@intFromPtr(source), length)) return KernelError.efault.raw();
+    const count = filesystem.pwrite(descriptor, source[0..length], @intCast(offset)) catch |err| return kernelStatus(err);
+    return @intCast(count);
+}
+
+fn kernelFtruncate(descriptor: i32, length: i64) callconv(abi.guest) i32 {
+    if (length < 0) return KernelError.einval.raw();
+    filesystem.ftruncate(descriptor, @intCast(length)) catch |err| return kernelStatus(err);
+    return errno.ok;
 }
 
 fn kernelMkdir(path: ?[*:0]const u8, _: u16) callconv(abi.guest) i32 {
@@ -300,17 +309,13 @@ fn posixFstat(descriptor: i32, out: ?*filesystem.Stat) callconv(abi.guest) i64 {
     return 0;
 }
 
-/// Validates the descriptor and length before reporting the filesystem's
-/// read-only policy. This preserves the useful POSIX distinction between an
-/// invalid request and a valid file which cannot be modified.
 fn posixFtruncate(descriptor: i32, length: i64) callconv(abi.guest) i64 {
     if (length < 0) {
         runtime_api.setPosixErrno(errno.Posix.einval);
         return -1;
     }
-    var info = filesystem.Stat{};
-    filesystem.fstat(descriptor, &info) catch |err| return posixFail(err);
-    return posixFail(Error.ReadOnly);
+    filesystem.ftruncate(descriptor, @intCast(length)) catch |err| return posixFail(err);
+    return 0;
 }
 
 pub const exports = [_]symbols.Export{
@@ -328,7 +333,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelGetdirentries", .function = trace.wrap("sceKernelGetdirentries", &kernelGetdirentries), .expect_id = "taRWhTJFTgE" },
     .{ .name = "sceKernelFsync", .function = trace.wrap("sceKernelFsync", &readOnlyStatus), .expect_id = "fTx66l5iWIA" },
     .{ .name = "sceKernelFchmod", .function = trace.wrap("sceKernelFchmod", &readOnlyStatus), .expect_id = "UtszJWHrDcA" },
-    .{ .name = "sceKernelFtruncate", .function = trace.wrap("sceKernelFtruncate", &readOnlyStatus), .expect_id = "VW3TVZiM4-E" },
+    .{ .name = "sceKernelFtruncate", .function = trace.wrap("sceKernelFtruncate", &kernelFtruncate), .expect_id = "VW3TVZiM4-E" },
     .{ .name = "sceKernelRmdir", .function = trace.wrap("sceKernelRmdir", &readOnlyStatus), .expect_id = "naInUjYt3so" },
 
     .{ .name = "open", .function = trace.wrap("open", &posixOpen), .expect_id = "wuCroIGjt2g" },
@@ -400,6 +405,41 @@ test "the kernel entry points read a file end to end" {
 
     try testing.expectEqual(errno.ok, kernelClose(fd));
     try testing.expectEqual(KernelError.ebadf.raw(), kernelClose(fd));
+}
+
+test "positional save writes and truncation persist without moving the cursor" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    filesystem.attachTemporaryData(fixture.tmp.dir);
+    defer filesystem.detachTemporaryData();
+    const fd = kernelOpen("/temp0/slot.sav", filesystem.O.rdwr | filesystem.O.creat | filesystem.O.trunc, 0);
+    try testing.expect(fd >= filesystem.first_descriptor);
+    try testing.expectEqual(@as(i64, 3), kernelLseek(fd, 3, filesystem.Seek.set));
+    try testing.expectEqual(errno.ok, kernelFtruncate(fd, 8));
+    try testing.expectEqual(@as(i64, 4), kernelPwrite(fd, "save", 4, 1));
+    try testing.expectEqual(@as(i64, 3), kernelLseek(fd, 0, filesystem.Seek.cur));
+    try testing.expectEqual(@as(i64, 0), posixFtruncate(fd, 5));
+    try testing.expectEqual(@as(i64, 3), kernelLseek(fd, 0, filesystem.Seek.cur));
+    try testing.expectEqual(@as(i64, 5), kernelLseek(fd, 0, filesystem.Seek.end));
+    try testing.expectEqual(@as(i64, 0), posixFtruncate(fd, 7));
+    try testing.expectEqual(errno.ok, kernelClose(fd));
+    const reopened = kernelOpen("/temp0/slot.sav", filesystem.O.rdonly, 0);
+    defer _ = kernelClose(reopened);
+    var data: [7]u8 = undefined;
+    try testing.expectEqual(@as(i64, 7), kernelRead(reopened, &data, data.len));
+    try testing.expectEqualSlices(u8, &.{ 0, 's', 'a', 'v', 'e', 0, 0 }, &data);
+    try testing.expectEqual(KernelError.eacces.raw(), kernelPwrite(reopened, "x", 1, 0));
+    try testing.expectEqual(KernelError.eacces.raw(), kernelFtruncate(reopened, 0));
+    try testing.expectEqual(KernelError.einval.raw(), kernelPwrite(reopened, "x", 1, -1));
+    try testing.expectEqual(KernelError.ebadf.raw(), kernelFtruncate(fd, 0));
+    try testing.expectEqual(KernelError.efault.raw(), kernelPwrite(reopened, null, 1, 0));
+    try testing.expectEqual(@as(i64, -1), posixFtruncate(reopened, -1));
+    try testing.expectEqual(@as(i64, -1), posixFtruncate(reopened, 0));
+    const truncated = kernelOpen("/temp0/slot.sav", filesystem.O.rdwr | filesystem.O.trunc, 0);
+    defer _ = kernelClose(truncated);
+    var info = filesystem.Stat{};
+    try testing.expectEqual(errno.ok, kernelFstat(truncated, &info));
+    try testing.expectEqual(@as(i64, 0), info.size);
 }
 
 test "the POSIX entry points report failure the POSIX way" {

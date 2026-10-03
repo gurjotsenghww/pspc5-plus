@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Asynchronous file reads, which is how a large title loads everything.
+//! Asynchronous file reads and writes.
 //!
 //! A title hands over a batch of read requests and an identifier comes back;
 //! later it asks whether that batch is done and collects the results. Engines
@@ -16,10 +16,9 @@
 //! between requests that a title could come to depend on before there is any
 //! real device to justify it.
 //!
-//! Writes are accepted as batches and then reported, request by request, as
-//! having failed. The filesystem stores nothing, and a title that is told its
-//! save was written when it was not will carry on and lose it somewhere further
-//! along, where nothing points back to here.
+//! Save writes use the same completed-batch model and positional filesystem
+//! writes. Installed game content remains read-only; writable save and staging
+//! mounts persist the bytes before a request reports success.
 
 const std = @import("std");
 const abi = @import("../abi.zig");
@@ -178,13 +177,32 @@ fn performRead(request: *const Request) void {
     record.state = state_completed;
 }
 
-/// Records a write as having failed, without pretending otherwise.
-fn refuseWrite(request: *const Request) void {
+fn performWrite(request: *const Request) void {
     const record = request.result.?;
-    // The same refusal the filesystem gives a direct write, so a title sees one
-    // answer about storage however it asks.
-    record.return_value = KernelError.eacces.raw();
     record.state = state_aborted;
+    if (request.offset < 0 or request.length == 0) {
+        record.return_value = KernelError.einval.raw();
+        return;
+    }
+    const buffer = request.buffer orelse {
+        record.return_value = KernelError.efault.raw();
+        return;
+    };
+    if (!memory.isGuestRangeAccessible(@intFromPtr(buffer), request.length)) {
+        record.return_value = KernelError.efault.raw();
+        return;
+    }
+    const count = filesystem.pwrite(request.descriptor, buffer[0..request.length], @intCast(request.offset)) catch |err| {
+        record.return_value = switch (err) {
+            error.ReadOnly => KernelError.eacces.raw(),
+            error.BadDescriptor => KernelError.ebadf.raw(),
+            error.InvalidArgument => KernelError.einval.raw(),
+            else => KernelError.eio.raw(),
+        };
+        return;
+    };
+    record.return_value = @intCast(count);
+    record.state = state_completed;
 }
 
 fn submit(
@@ -196,6 +214,7 @@ fn submit(
     const batch = requests orelse return KernelError.efault.raw();
     const out = identifier_out orelse return KernelError.efault.raw();
     if (count <= 0 or count > maximum_requests) return KernelError.einval.raw();
+    if (!memory.isGuestRangeAccessible(@intFromPtr(out), @sizeOf(i32))) return KernelError.efault.raw();
 
     const total: usize = @intCast(count);
     if (!memory.isGuestRangeAccessible(@intFromPtr(batch), total * @sizeOf(Request))) {
@@ -206,7 +225,8 @@ fn submit(
     // outcome cannot report one, and finding that out halfway through would
     // leave some requests done and the caller unable to learn which.
     for (batch[0..total]) |*request| {
-        if (request.result == null) return KernelError.efault.raw();
+        const result = request.result orelse return KernelError.efault.raw();
+        if (!memory.isGuestRangeAccessible(@intFromPtr(result), @sizeOf(Result))) return KernelError.efault.raw();
     }
 
     // Every slot outstanding is a real condition for a caller to see, and the
@@ -215,7 +235,7 @@ fn submit(
     const identifier = claimIdentifier();
     if (identifier == 0) return KernelError.eagain.raw();
     for (batch[0..total]) |*request| {
-        if (writing) refuseWrite(request) else performRead(request);
+        if (writing) performWrite(request) else performRead(request);
     }
     setBatchState(identifier, state_completed);
 
@@ -379,7 +399,7 @@ test "a batch outside what one submission may carry is refused" {
     );
 }
 
-test "a write is reported as having failed, not quietly accepted" {
+test "an invalid asynchronous write reports a failed request" {
     // A title told its data was written when it was not carries on and loses it
     // somewhere further along, where nothing points back to here.
     reset();
@@ -396,6 +416,47 @@ test "a write is reported as having failed, not quietly accepted" {
     try testing.expectEqual(errno.ok, submitWriteCommands(@ptrCast(&request), 1, 0, &identifier));
     try testing.expectEqual(state_aborted, record.state);
     try testing.expect(record.return_value < 0);
+}
+
+test "asynchronous save writes persist positional batches and reject read-only descriptors" {
+    reset();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    filesystem.attach(testing.io, tmp.dir);
+    defer filesystem.detach();
+    filesystem.attachSaveDataHome(tmp.dir, "PPSA00001");
+    _ = try filesystem.mountSaveDataSlot("slot", true);
+    const fd = try filesystem.open("/savedata0/save.bin", filesystem.O.rdwr | filesystem.O.creat);
+    _ = try filesystem.write(fd, "........");
+    _ = try filesystem.seek(fd, 2, filesystem.Seek.set);
+    var data = "SAVE".*;
+    var outcomes: [2]Result = @splat(.{ .return_value = 0, .state = 0 });
+    var requests = [_]Request{
+        .{ .offset = 0, .length = 4, .buffer = &data, .result = &outcomes[0], .descriptor = fd },
+        .{ .offset = 6, .length = 4, .buffer = &data, .result = &outcomes[1], .descriptor = fd },
+    };
+    var id: i32 = 0;
+    try testing.expectEqual(errno.ok, submitWriteCommands(&requests, 2, 0, &id));
+    for (outcomes) |result| {
+        try testing.expectEqual(state_completed, result.state);
+        try testing.expectEqual(@as(i64, 4), result.return_value);
+    }
+    try testing.expectEqual(@as(i64, 2), try filesystem.seek(fd, 0, filesystem.Seek.cur));
+    try filesystem.close(fd);
+    filesystem.unmountSaveData();
+    try testing.expectEqual(filesystem.SaveDataMountOutcome.existed, try filesystem.mountSaveDataSlot("slot", false));
+    const reopened = try filesystem.open("/savedata0/save.bin", filesystem.O.rdonly);
+    defer filesystem.close(reopened) catch {};
+    var bytes: [10]u8 = undefined;
+    try testing.expectEqual(@as(usize, 10), try filesystem.read(reopened, &bytes));
+    try testing.expectEqualStrings("SAVE..SAVE", &bytes);
+    requests[0].descriptor = reopened;
+    try testing.expectEqual(errno.ok, submitWriteCommands(&requests, 1, 0, &id));
+    try testing.expectEqual(state_aborted, outcomes[0].state);
+    try testing.expectEqual(@as(i64, KernelError.eacces.raw()), outcomes[0].return_value);
+    requests[0].offset = -1;
+    try testing.expectEqual(errno.ok, submitWriteCommands(&requests, 1, 0, &id));
+    try testing.expectEqual(@as(i64, KernelError.einval.raw()), outcomes[0].return_value);
 }
 
 test "an unknown batch is refused, and a deleted one stops being known" {
