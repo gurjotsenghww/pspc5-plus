@@ -118,13 +118,14 @@ fn openWritableTitleData(io: std.Io, home: []const u8, title_identifier: []const
     return cwd.openDir(io, path, .{});
 }
 
-fn reportUnresolvedImport(_: ?*anyopaque, diagnostic: runtime.module_graph.UnresolvedImport) void {
-    std.debug.print("  unresolved {s}: {s} {s} {s}\n", .{
+fn reportUnresolvedImport(context: ?*anyopaque, diagnostic: runtime.module_graph.UnresolvedImport) void {
+    const writer: *std.Io.Writer = @ptrCast(@alignCast(context.?));
+    writer.print("  unresolved {s}: {s} {s} {s}\n", .{
         diagnostic.path,
         diagnostic.import.id,
         diagnostic.import.library orelse diagnostic.import.library_code,
         @tagName(diagnostic.import.symbol_type),
-    });
+    }) catch {};
 }
 
 fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?vulkan.DisplayBuffer {
@@ -384,7 +385,7 @@ fn run(init: std.process.Init) !bool {
     var graph = emu.loadModuleGraph(io, executable_path, .{
         .preload_modules = preload_modules.items,
         .deferred_modules = deferred_modules.items,
-        .diagnostics = .{ .unresolved_fn = &reportUnresolvedImport },
+        .diagnostics = .{ .context = stderr, .unresolved_fn = &reportUnresolvedImport },
     }) catch |err| {
         try stderr.print("cannot link {s}: {s}\n", .{ executable_path, @errorName(err) });
         try stderr.flush();

@@ -18,6 +18,11 @@ const videodec2 = @import("videodec2.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
 
+pub const ipmi_exports = [_]symbols.Export{
+    .{ .name = "_ZN4IPMI6Client6ConfigC1Ev", .function = trace.wrap("IPMI::Client::Config::Config", &services.ipmiClientConfigInit), .expect_id = "O1lQ2+do5r4" },
+    .{ .name = "_ZN4IPMI6Client6createEPPS0_PKNS0_6ConfigEPvS6_", .function = trace.wrap("IPMI::Client::create", &services.ipmiClientCreate), .expect_id = "0zsTiDhM0nU" },
+};
+
 pub const agc_exports = [_]symbols.Export{
     .{ .name = "libSceAgc:7Wa3aeJgeVU", .function = trace.wrap("libSceAgc:7Wa3aeJgeVU", &services.accept), .id_override = "7Wa3aeJgeVU" },
     .{ .name = "libSceAgc:rP5xLdOf26k", .function = trace.wrap("libSceAgc:rP5xLdOf26k", &services.accept), .id_override = "rP5xLdOf26k" },
@@ -649,6 +654,7 @@ pub const all = [_]Table{
     .{ .library = "libSceHmd2", .module = "libSceHmd2", .exports = &hmd2_exports },
     .{ .library = "libSceHttp", .module = "libSceHttp", .exports = &http_exports },
     .{ .library = "libSceImeDialog", .module = "libSceImeDialog", .exports = &imedialog_exports },
+    .{ .library = "libSceIpmi", .module = "libSceIpmi", .exports = &ipmi_exports },
     .{ .library = "libSceJson2", .module = "libSceJson", .exports = &json2_exports },
     .{ .library = "libSceJpegDec", .module = "libSceJpegDec", .exports = &jpegdec_exports },
     .{ .library = "libSceNet", .module = "libSceNet", .exports = &net_exports },

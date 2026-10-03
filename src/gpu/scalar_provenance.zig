@@ -1372,6 +1372,22 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: *const rdna2.I
         return;
     }
 
+    // BITSET reads its destination as well as the bit index. AGC compute
+    // prologs use it to insert the stride into a pointer's descriptor word.
+    // Losing that old value here makes an otherwise valid V# unrecoverable.
+    if (inst.opcode == .s_bitset0_b32 or inst.opcode == .s_bitset1_b32) {
+        const current = source(result, inst.dst);
+        const bit = source(result, inst.src0);
+        if (current == null or bit == null) {
+            invalidateDestination(result, inst.dst, 1);
+            return;
+        }
+        const mask = @as(u32, 1) << @as(u5, @truncate(bit.?.value));
+        const value = if (inst.opcode == .s_bitset1_b32) current.?.value | mask else current.?.value & ~mask;
+        write(result, inst.dst, value, Sources.merge(current.?.sources, bit.?.sources), inst.pc, current.?.user_bits | bit.?.user_bits);
+        return; // Neither form modifies SCC.
+    }
+
     // A failed wide logical operation must also forget its condition code.
     // Otherwise a lane-dependent mask can reuse an earlier true comparison
     // and keep the resource walk on a conditional back edge indefinitely.
@@ -2992,6 +3008,37 @@ test "descriptor BFE comparison drives conditional select" {
 
     try std.testing.expectEqual(true, scc.?);
     try std.testing.expectEqual(@as(u32, 0x0004_022c), result.register(7).?.value);
+}
+
+test "scalar BITSET preserves descriptor bits, dependencies and SCC" {
+    for ([_]u32{ 18, 50, 31, 0xffff_ffff }) |bit| {
+        var result = Evaluation{};
+        result.registers[1] = .{ .known = true, .value = 0x20, .user_bits = 2 };
+        result.registers[8] = .{ .known = true, .value = bit, .user_bits = 256 };
+        var scc: ?bool = true;
+        var inst = rdna2.Instruction{
+            .pc = 0x10,
+            .opcode = .s_bitset1_b32,
+            .dst = .{ .kind = .sgpr, .reg = 1 },
+            .src0 = .{ .kind = .sgpr, .reg = 8 },
+            .src_count = 1,
+        };
+        executeScalar(&result, 0, &inst, &scc);
+        try std.testing.expectEqual(@as(u32, 0x20) | (@as(u32, 1) << @as(u5, @truncate(bit))), result.register(1).?.value);
+        try std.testing.expectEqual(@as(u64, 258), result.register(1).?.user_bits);
+        try std.testing.expectEqual(@as(?u32, 0x10), result.register(1).?.producer_pc);
+        try std.testing.expectEqual(@as(?bool, true), scc);
+        inst.opcode = .s_bitset0_b32;
+        executeScalar(&result, 0, &inst, &scc);
+        try std.testing.expectEqual(@as(u32, 0x20), result.register(1).?.value);
+        try std.testing.expectEqual(@as(?bool, true), scc);
+        result.registers[8] = .{};
+        executeScalar(&result, 0, &inst, &scc);
+        try std.testing.expect(result.register(1) == null);
+        result.registers[8] = .{ .known = true, .value = bit };
+        executeScalar(&result, 0, &inst, &scc);
+        try std.testing.expect(result.register(1) == null);
+    }
 }
 
 test "a sampler assembled from immediates resolves to its descriptor words" {

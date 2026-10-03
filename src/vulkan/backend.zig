@@ -150,6 +150,7 @@ pub const Error = error{
     MissingComputeProgram,
     MissingGraphicsProgram,
     InvalidDispatchPacket,
+    InvalidDispatchDimensions,
     UnsupportedIndirectDispatch,
     UnsupportedDrawPacket,
     UnsupportedReleaseDataSelection,
@@ -358,6 +359,7 @@ pub const DeviceInfo = struct {
     max_compute_shared_memory_size: u32 = 32768,
     max_compute_work_group_invocations: u32 = 128,
     max_compute_work_group_size: [3]u32 = .{ 128, 128, 64 },
+    max_compute_work_group_count: [3]u32 = .{ 65535, 65535, 65535 },
     timestamp_valid_bits: u32 = 0,
     timestamp_period: f32 = 0,
     subgroup_size: u32 = 0,
@@ -5423,6 +5425,7 @@ pub const Renderer = struct {
     last_sync_error: ?anyerror = null,
     last_flip_error: ?anyerror = null,
     last_compute_program: u64 = 0,
+    invalid_dispatch_reports: u32 = 0,
     compute_watch_hits: [96]ComputeWatchHit = undefined,
     compute_watch_hit_count: u32 = 0,
 
@@ -8084,6 +8087,7 @@ pub const Renderer = struct {
     }
 
     fn dispatchSpirvWithGds(self: *Renderer, words: []const u32, group_count: [3]u32, module: ?spirv_cache.Lease, uses_gds: bool) (Error || std.mem.Allocator.Error)!DispatchReport {
+        try @import("compute_shape.zig").validateDispatch(group_count, self.device_info.max_compute_work_group_count);
         const lookup = try self.getComputePipeline(words, module);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
@@ -8237,6 +8241,7 @@ pub const Renderer = struct {
     ) anyerror!DispatchReport {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         self.last_shader_read_failure = null;
+        try @import("compute_shape.zig").validateDispatch(group_count, self.device_info.max_compute_work_group_count);
         const reader = gpu.ShaderMemoryReader{ .context = self, .read_fn = readShaderMemory };
         const program_address = gpu.resources.ShaderStage.compute.programAddress(state) orelse {
             return Error.MissingComputeProgram;
@@ -28432,6 +28437,10 @@ pub const Renderer = struct {
 
     fn dcbRelease(context: ?*anyopaque, release: gpu.state.ReleaseMem) bool {
         const self = fromContext(context);
+        if (self.traceCurrentGraphicsFrame()) std.debug.print(
+            "[vulkan dcb] release trace address=0x{x} selection={d} data=0x{x} destination={d} interrupt={d}\n",
+            .{ release.address, release.data_selection, release.data, release.destination, release.interrupt },
+        );
         self.release_callbacks += 1;
         self.release_was_queued = false;
         if (self.tryDeferInternalRelease(release) catch |err| {
@@ -30940,6 +30949,7 @@ pub const Renderer = struct {
             }
         }
         var dispatch_dimensions: [3]u32 = undefined;
+        var arguments_address: ?u64 = null;
         var initiator: u32 = 0;
         if (packet.opcode == gpu.pm4.dispatch_direct) {
             if (packet.body.len < 3) {
@@ -30973,6 +30983,7 @@ pub const Renderer = struct {
                 std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.InvalidDispatchPacket)});
                 return false;
             };
+            arguments_address = address;
             self.flushPendingGuestWrite(address, 12) catch |err| {
                 self.last_dispatch_error = err;
                 std.debug.print("[vulkan dcb] indirect dispatch args rejected: {s} addr=0x{x}\n", .{ @errorName(err), address });
@@ -31033,6 +31044,18 @@ pub const Renderer = struct {
             computeLocalSize(state, 0x209),
         };
         const group_count = dispatchGroupCounts(dispatch_dimensions, local_size, initiator);
+        @import("compute_shape.zig").validateDispatch(group_count, self.device_info.max_compute_work_group_count) catch {
+            self.last_dispatch_error = Error.InvalidDispatchDimensions;
+            self.frame_profile.failed_dispatches += 1;
+            if (self.invalid_dispatch_reports < 32) std.debug.print(
+                "[vulkan dcb] dispatch skipped: InvalidDispatchDimensions program=0x{x} args={?x} groups={d}x{d}x{d} limits={d}x{d}x{d}\n",
+                .{ program_address, arguments_address, group_count[0], group_count[1], group_count[2], self.device_info.max_compute_work_group_count[0], self.device_info.max_compute_work_group_count[1], self.device_info.max_compute_work_group_count[2] },
+            );
+            self.invalid_dispatch_reports +|= 1;
+            // Keep subsequent valid commands and completion labels reachable,
+            // while recording this operation as a rendering failure.
+            return true;
+        };
         if (group_count[0] == 0 or group_count[1] == 0 or group_count[2] == 0) {
             self.last_dispatch_error = null;
             return true;
@@ -36365,6 +36388,7 @@ fn choosePhysicalDevice(
         info.max_compute_shared_memory_size = limits.max_compute_shared_memory_size;
         info.max_compute_work_group_invocations = limits.max_compute_work_group_invocations;
         info.max_compute_work_group_size = limits.max_compute_work_group_size;
+        info.max_compute_work_group_count = limits.max_compute_work_group_count;
         info.timestamp_valid_bits = families[family_index].timestamp_valid_bits;
         info.timestamp_period = limits.timestamp_period;
         const other_descriptors = maximum_storage_descriptors + maximum_storage_images + 2;

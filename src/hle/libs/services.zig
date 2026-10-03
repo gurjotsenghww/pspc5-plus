@@ -51,6 +51,16 @@ pub fn offline(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.gues
     return unavailable;
 }
 
+/// IPMI is console service IPC, which is unavailable on the host. Keep its
+/// configuration opaque: the observed caller supplies its own fields, and
+/// client creation refuses the request without inspecting the configuration.
+/// Do not guess an SDK-dependent object extent or manufacture a client/vtable.
+pub fn ipmiClientConfigInit(_: ?*anyopaque) callconv(abi.guest) void {}
+
+pub fn ipmiClientCreate(_: ?*?*anyopaque, _: ?*const anyopaque, _: ?*anyopaque, _: ?*anyopaque) callconv(abi.guest) i32 {
+    return unavailable;
+}
+
 /// Hardware that is not attached — a headset, a tracker, an extra pad.
 pub fn noDevice(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
     return unavailable;
@@ -556,6 +566,24 @@ test "an absent service reports absence rather than success" {
     try testing.expect(offline(0, 0, 0, 0, 0, 0) < 0);
     try testing.expect(noDevice(0, 0, 0, 0, 0, 0) < 0);
     try testing.expectEqual(errno.ok, accept(0, 0, 0, 0, 0, 0));
+}
+
+test "IPMI imports resolve and refuse client creation without fabricating an object" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    const config_symbol = db.findById("O1lQ2+do5r4", .function) orelse return error.MissingIpmiConfig;
+    const create_symbol = db.findById("0zsTiDhM0nU", .function) orelse return error.MissingIpmiCreate;
+    try testing.expectEqualStrings("libSceIpmi", config_symbol.key.library.name);
+    try testing.expectEqualStrings("libSceIpmi", create_symbol.key.module.name);
+    const init_config: *const @TypeOf(ipmiClientConfigInit) = @ptrFromInt(config_symbol.address);
+    const create: *const @TypeOf(ipmiClientCreate) = @ptrFromInt(create_symbol.address);
+    var config: [256]u8 = @splat(0xa5);
+    var output: ?*anyopaque = null;
+    init_config(&config);
+    try testing.expectEqual(unavailable, create(&output, &config, null, null));
+    try testing.expect(output == null);
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 256), &config);
 }
 
 test "offline NP profile exposes a stable online id" {

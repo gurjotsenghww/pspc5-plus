@@ -10,6 +10,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const threading = @import("kernel_threading.zig");
 const runtime_api = @import("kernel_runtime.zig");
+const kernel_memory = @import("kernel_memory.zig");
 
 const KernelError = errno.KernelError;
 const maximum_queues = 64;
@@ -773,15 +774,49 @@ fn getEventUserData(event: ?*const Event) callconv(abi.guest) u64 {
     return if (event) |value| value.user_data else 0;
 }
 
-/// The POSIX primitive the queue interface is built on.
-///
-/// Reported as unimplemented rather than answered emptily. A caller that
-/// registered a change would otherwise believe it took effect, and one waiting
-/// for an event would spin against a queue that can never deliver — both fail
-/// far from here and with nothing to point at. The queue interface above is
-/// what titles actually use; this exists because a module links against it.
-fn kevent() callconv(abi.guest) i64 {
-    runtime_api.setPosixErrno(errno.Posix.enosys);
+/// Native AGC drivers register EVFILT_GRAPHICS through POSIX kevent, then wait
+/// through sceKernelWaitEqueue. Share the same registrations as the HLE driver
+/// so an executed RELEASE_MEM can wake that native consumer too. Other filters
+/// and POSIX event retrieval remain explicitly unsupported.
+fn kevent(
+    handle: i64,
+    changes: ?[*]const Event,
+    change_count: i32,
+    _: ?[*]Event,
+    event_count: i32,
+    _: ?*const anyopaque,
+) callconv(abi.guest) i32 {
+    if (change_count < 0 or event_count < 0) return keventFailure(KernelError.einval.raw());
+    if (event_count != 0) return keventFailure(KernelError.enosys.raw());
+    lock.lock();
+    const valid_handle = findQueue(handle) != null;
+    lock.unlock();
+    if (!valid_handle) return keventFailure(KernelError.ebadf.raw());
+    if (change_count == 0) return 0;
+    const list = changes orelse return keventFailure(KernelError.efault.raw());
+    const count: usize = @intCast(change_count);
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(list), count * @sizeOf(Event))) {
+        return keventFailure(KernelError.efault.raw());
+    }
+    for (list[0..count]) |change| {
+        const id: i32 = @bitCast(@as(u32, @truncate(change.ident)));
+        if (change.filter != graphics_filter or change.fflags != 0 or
+            change.ident != @as(u64, @bitCast(@as(i64, id))))
+        {
+            return keventFailure(KernelError.enosys.raw());
+        }
+        const status = switch (change.flags) {
+            event_add, event_add | event_clear => addGraphicsEvent(handle, id, change.user_data),
+            0x02 => deleteGraphicsEvent(handle, id), // EV_DELETE
+            else => return keventFailure(KernelError.enosys.raw()),
+        };
+        if (status != errno.ok) return keventFailure(status);
+    }
+    return 0;
+}
+
+fn keventFailure(status: i32) i32 {
+    runtime_api.setPosixErrno(errno.kernelToPosix(status));
     return -1;
 }
 
@@ -873,9 +908,46 @@ test "accessors tolerate a null event" {
     try std.testing.expectEqual(@as(u64, 0), getEventUserData(null));
 }
 
-test "the POSIX primitive reports that it is unimplemented" {
-    // Answering emptily would let a caller believe a registration took effect.
-    try std.testing.expectEqual(@as(i64, -1), kevent());
+test "POSIX kevent graphics registration wakes the native AGC consumer" {
+    reset();
+    var handle: i64 = 0;
+    try std.testing.expectEqual(errno.ok, createEqueue(&handle, "native-agc"));
+    defer _ = deleteEqueue(handle);
+    var change = [_]Event{.{ .ident = 0x21, .filter = graphics_filter, .flags = event_add, .data = 0x21, .user_data = 0xcafe }};
+    try std.testing.expectEqual(@as(i32, 0), kevent(handle, &change, 1, null, 0, null));
+    try std.testing.expectEqual(@as(usize, 0), triggerGraphicsEvent(0x20, 7));
+    try std.testing.expectEqual(@as(usize, 1), triggerGraphicsEvent(0x21, 9));
+
+    // Re-registering also updates a queued completion's callback token.
+    change[0].user_data = 0xbeef;
+    try std.testing.expectEqual(@as(i32, 0), kevent(handle, &change, 1, null, 0, null));
+    var events: [1]Event = .{.{}};
+    var count: i32 = 0;
+    const poll: u32 = 0;
+    try std.testing.expectEqual(errno.ok, waitEqueue(handle, &events, 1, &count, &poll));
+    try std.testing.expectEqual(@as(i32, 1), count);
+    try std.testing.expectEqual(@as(u64, 0x21), events[0].ident);
+    try std.testing.expectEqual(graphics_filter, events[0].filter);
+    try std.testing.expectEqual(@as(u64, 0xbeef), events[0].user_data);
+    try std.testing.expectEqual(@as(i64, 9), events[0].data);
+    try std.testing.expectEqual(@as(u32, 1), events[0].fflags);
+    change[0].flags = 0x02;
+    try std.testing.expectEqual(@as(i32, 0), kevent(handle, &change, 1, null, 0, null));
+    try std.testing.expectEqual(@as(usize, 0), triggerGraphicsEvent(0x21, 10));
+}
+
+test "POSIX kevent refuses invalid arguments and unsupported filters" {
+    reset();
+    var handle: i64 = 0;
+    try std.testing.expectEqual(errno.ok, createEqueue(&handle, "kevent-errors"));
+    defer _ = deleteEqueue(handle);
+    try std.testing.expectEqual(@as(i32, -1), kevent(-1, null, 0, null, 0, null));
+    try std.testing.expectEqual(@as(i32, -1), kevent(handle, null, -1, null, 0, null));
+    try std.testing.expectEqual(@as(i32, -1), kevent(handle, null, 1, null, 0, null));
+    try std.testing.expectEqual(@as(i32, -1), kevent(handle, null, 0, null, 1, null));
+    var change = [_]Event{.{ .filter = user_filter, .flags = event_add }};
+    try std.testing.expectEqual(@as(i32, -1), kevent(handle, &change, 1, null, 0, null));
+    try std.testing.expectEqual(@as(usize, 0), triggerGraphicsEvent(0, 0));
 }
 
 test "user edge events round-trip through an event queue" {

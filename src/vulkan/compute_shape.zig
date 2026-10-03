@@ -4,6 +4,26 @@
 //! Preserve the guest workgroup's linear invocation order within host limits.
 const std = @import("std");
 
+/// Vulkan dispatch counts have independent device limits on each axis. Do not
+/// clamp corrupt indirect arguments: that would execute a different workload.
+pub fn validateDispatch(groups: [3]u32, limits: [3]u32) error{InvalidDispatchDimensions}!void {
+    for (groups, limits) |count, limit| {
+        if (count > limit) return error.InvalidDispatchDimensions;
+    }
+}
+
+test "dispatch bounds reject corrupt indirect arguments and honor each device axis" {
+    const limits: [3]u32 = .{ 2147483647, 65535, 65535 };
+    try validateDispatch(.{ 1, 1, 1 }, limits);
+    try validateDispatch(limits, limits);
+    try validateDispatch(.{ 0, 1, 1 }, limits);
+    try std.testing.expectError(error.InvalidDispatchDimensions, validateDispatch(.{ 2527395840, 127, 150994945 }, limits));
+    try std.testing.expectError(error.InvalidDispatchDimensions, validateDispatch(.{ 1, 65536, 1 }, limits));
+    try std.testing.expectError(error.InvalidDispatchDimensions, validateDispatch(.{ 1, 1, 65536 }, limits));
+    try validateDispatch(.{ 65536, 1, 1 }, limits);
+    try std.testing.expectError(error.InvalidDispatchDimensions, validateDispatch(.{ 65536, 1, 1 }, .{ 65535, 65535, 65535 }));
+}
+
 pub fn fit(guest: [3]u32, limits: [3]u32, maximum_invocations: u32) error{InvalidComputeWorkgroup}!?[3]u32 {
     var total: u32 = 1;
     var fits = true;

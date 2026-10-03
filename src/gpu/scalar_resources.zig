@@ -199,6 +199,13 @@ pub const Resolver = struct {
         const component: u32 = @intCast(register - destination);
         switch (inst.opcode) {
             .s_mov_b32, .s_mov_b64 => return self.operand(inst.src0, component, index, depth + 1),
+            .s_bitset0_b32, .s_bitset1_b32 => {
+                if (component != 0) return null;
+                const current = (try self.operand(inst.dst, 0, index, depth + 1)) orelse return null;
+                const bit = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
+                const mask = @as(u32, 1) << @as(u5, @truncate(bit));
+                return if (inst.opcode == .s_bitset1_b32) current | mask else current & ~mask;
+            },
             .s_and_b32 => {
                 if (component != 0) return null;
                 const a = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
@@ -274,6 +281,38 @@ pub const Resolver = struct {
         return try self.reader.readU32(byte);
     }
 };
+
+test "BITSET descriptor recovery uses the previous destination and rejects clobbers" {
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    };
+    const original = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_nop, .word_count = 1 },
+        .{ .pc = 4, .opcode = .s_bitset1_b32, .dst = .{ .kind = .sgpr, .reg = 1 }, .src0 = .{ .kind = .integer_inline_constant, .value = 50 }, .word_count = 1 },
+        .{ .pc = 8, .opcode = .s_bitset0_b32, .dst = .{ .kind = .sgpr, .reg = 1 }, .src0 = .{ .kind = .integer_inline_constant, .value = 31 }, .word_count = 1 },
+        .{ .pc = 12, .opcode = .s_movk_i32, .dst = .{ .kind = .sgpr, .reg = 2 }, .src0 = .{ .kind = .literal_constant, .value = 80 }, .word_count = 1 },
+        .{ .pc = 16, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 3 }, .src0 = .{ .kind = .literal_constant, .value = 0x16204 }, .word_count = 2 },
+        .{ .pc = 24, .opcode = .buffer_store_dword, .family = .mubuf, .src1 = .{ .kind = .sgpr }, .word_count = 2 },
+        .{ .pc = 32, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x10000;
+    bindings.user_data[1] = 0x80000020;
+    for (0..3) |variant| {
+        var instructions = original;
+        if (variant != 0) instructions[0] = .{ .pc = 0, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = if (variant == 1) 1 else 8 }, .src0 = .{ .kind = .vgpr }, .word_count = 1 };
+        if (variant == 2) instructions[1].src0 = .{ .kind = .sgpr, .reg = 8 };
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &unknown_registers };
+        var words: [4]u32 = undefined;
+        try std.testing.expectEqual(variant == 0, try resolver.words(0, 24, &words));
+        if (variant == 0) try std.testing.expectEqualSlices(u32, &.{ 0x10000, 0x40020, 80, 0x16204 }, &words);
+    }
+}
 
 test "missing pointer constants follow branch definitions and stay draw-local" {
     const M = struct {

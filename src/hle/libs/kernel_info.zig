@@ -142,6 +142,13 @@ fn isNeoMode() callconv(abi.guest) i32 {
     return 0;
 }
 
+/// Whether the platform supports Trinity mode. AGC uses this capability probe
+/// to size its allocations (for example 1 MiB versus 1.5 MiB). Report baseline
+/// hardware, consistent with sceKernelIsTrinityMode and the operation mode.
+fn hasTrinityMode() callconv(abi.guest) i32 {
+    return 0;
+}
+
 fn getMainSocId() callconv(abi.guest) u32 {
     return main_soc_id;
 }
@@ -242,6 +249,7 @@ fn kernelGetTscFrequency() callconv(abi.guest) u64 {
 
 pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelIsNeoMode", .function = trace.wrap("sceKernelIsNeoMode", &isNeoMode), .expect_id = "WslcK1FQcGI" },
+    .{ .name = "sceKernelHasTrinityMode", .function = trace.wrap("sceKernelHasTrinityMode", &hasTrinityMode), .expect_id = "yu17wG8L5FI" },
     .{ .name = "sceKernelGetMainSocId", .function = trace.wrap("sceKernelGetMainSocId", &getMainSocId), .expect_id = "0vTn5IDMU9A" },
     .{ .name = "sceKernelGetCurrentCpu", .function = trace.wrap("sceKernelGetCurrentCpu", &getCurrentCpu), .expect_id = "g0VTBxfJyu0" },
     .{ .name = "sceKernelGetOperationMode", .function = trace.wrap("sceKernelGetOperationMode", &getOperationMode), .expect_id = "NH6xARDOVv8" },
@@ -280,6 +288,7 @@ test "machine facts are reported consistently" {
     // These are read once and branched on forever, so the values matter less
     // than their stability.
     try testing.expectEqual(@as(i32, 0), isNeoMode());
+    try testing.expectEqual(@as(i32, 0), hasTrinityMode());
     try testing.expectEqual(@as(i32, 0), getCurrentCpu());
     try testing.expectEqual(@as(i32, 0), titleWorkaroundIsEnabled());
     try testing.expectEqual(process_id, getPid());
@@ -342,6 +351,26 @@ test "machine-info exports register under published identifiers" {
     try register(&db, testing.allocator);
     try testing.expectEqual(exports.len, db.count());
     try testing.expect(db.findByName("sceKernelIsNeoMode", .function) != null);
+    try testing.expect(db.findByName("sceKernelHasTrinityMode", .function) != null);
     try testing.expect(db.findByName("sceKernelGetOperationMode", .function) != null);
     try testing.expect(db.findByName("sceKernelReadTsc", .function) != null);
+}
+
+test "AGC memory mode import resolves by its exact libkernel key and guest ABI" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+
+    var key = symbols.Key{
+        .id = "yu17wG8L5FI".*,
+        .library = library,
+        .module = module,
+        .type = .function,
+    };
+    const resolved = db.find(key) orelse return error.MissingAgcMemoryMode;
+    const query: *const fn () callconv(abi.guest) i32 = @ptrFromInt(resolved.address);
+    try testing.expectEqual(@as(i32, 0), query());
+    try testing.expectEqual(@as(i32, 0), query());
+    key.library.name = "libSceAgcDriver";
+    try testing.expect(db.find(key) == null);
 }
