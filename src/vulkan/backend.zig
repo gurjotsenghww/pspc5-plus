@@ -683,6 +683,8 @@ const DeviceFunctions = struct {
     cmd_write_timestamp: vk.PfnCmdWriteTimestamp,
     cmd_set_viewport: vk.PfnCmdSetViewport,
     cmd_set_scissor: vk.PfnCmdSetScissor,
+    cmd_set_depth_bias: vk.PfnCmdSetDepthBias,
+    cmd_set_stencil_reference: vk.PfnCmdSetStencilReference,
     cmd_bind_descriptor_sets: vk.PfnCmdBindDescriptorSets,
     cmd_dispatch: vk.PfnCmdDispatch,
     cmd_begin_render_pass: vk.PfnCmdBeginRenderPass,
@@ -767,6 +769,8 @@ const DeviceFunctions = struct {
             .cmd_write_timestamp = try deviceProc(get_proc, device, vk.PfnCmdWriteTimestamp, "vkCmdWriteTimestamp"),
             .cmd_set_viewport = try deviceProc(get_proc, device, vk.PfnCmdSetViewport, "vkCmdSetViewport"),
             .cmd_set_scissor = try deviceProc(get_proc, device, vk.PfnCmdSetScissor, "vkCmdSetScissor"),
+            .cmd_set_depth_bias = try deviceProc(get_proc, device, vk.PfnCmdSetDepthBias, "vkCmdSetDepthBias"),
+            .cmd_set_stencil_reference = try deviceProc(get_proc, device, vk.PfnCmdSetStencilReference, "vkCmdSetStencilReference"),
             .cmd_bind_descriptor_sets = try deviceProc(get_proc, device, vk.PfnCmdBindDescriptorSets, "vkCmdBindDescriptorSets"),
             .cmd_dispatch = try deviceProc(get_proc, device, vk.PfnCmdDispatch, "vkCmdDispatch"),
             .cmd_begin_render_pass = try deviceProc(get_proc, device, vk.PfnCmdBeginRenderPass, "vkCmdBeginRenderPass"),
@@ -1181,7 +1185,7 @@ test "graphics pipeline lease identity preserves content verification and owners
     try std.testing.expect(!entries[0].vertex_module.?.sameModule(vertex));
 }
 
-test "graphics pipeline key excludes dynamic viewport and preserves static state" {
+test "graphics pipeline key excludes dynamic draw values and preserves static state" {
     const original = GraphicsPipelineState.default(64, 64);
     var changed = GraphicsPipelineState.default(128, 32);
     changed.viewport_x_bits = @bitCast(@as(f32, -10));
@@ -1193,8 +1197,12 @@ test "graphics pipeline key excludes dynamic viewport and preserves static state
     changed.scissor_y = 5;
     changed.scissor_width = 17;
     changed.scissor_height = 19;
+    changed.depth_bias_constant_bits = @bitCast(@as(f32, -16384));
+    changed.depth_bias_slope_bits = @bitCast(@as(f32, 3));
+    changed.stencil_front_reference = 0x35;
+    changed.stencil_back_reference = 0xc2;
     try std.testing.expectEqualDeep(original.pipelineKey(), changed.pipelineKey());
-    inline for (.{ "depth_write_enable", "stencil_front_reference", "rasterization_samples", "rectangle_completion", "topology" }) |field| {
+    inline for (.{ "depth_write_enable", "depth_bias_enable", "stencil_test_enable", "stencil_front_compare_mask", "stencil_back_write_mask", "rasterization_samples", "rectangle_completion", "topology" }) |field| {
         var static_change = original;
         @field(static_change, field) += 1;
         try std.testing.expect(!std.meta.eql(original.pipelineKey(), static_change.pipelineKey()));
@@ -1771,7 +1779,7 @@ const GraphicsPipelineState = extern struct {
     stencil_back_write_mask: u32,
     stencil_back_reference: u32,
 
-    /// Render-area extent and dynamic viewport/scissor do not affect pipeline
+    /// Render-area extent and dynamic draw values do not affect pipeline
     /// compatibility. Keep the original state for recording each draw, and
     /// normalize only the cache/compilation copy. Attachment formats, samples,
     /// topology, depth and all other static state remain part of the key.
@@ -1789,7 +1797,19 @@ const GraphicsPipelineState = extern struct {
         key.scissor_y = 0;
         key.scissor_width = 1;
         key.scissor_height = 1;
+        key.depth_bias_constant_bits = 0;
+        key.depth_bias_slope_bits = 0;
+        key.stencil_front_reference = 0;
+        key.stencil_back_reference = 0;
         return key;
+    }
+
+    /// Resource reuse retains analyzed static state, but every draw supplies
+    /// fresh dynamic values, including separate front/back stencil references.
+    fn copyDynamicFrom(self: *GraphicsPipelineState, current: GraphicsPipelineState) void {
+        inline for (.{ "width", "height", "viewport_x_bits", "viewport_y_bits", "viewport_width_bits", "viewport_height_bits", "viewport_min_depth_bits", "viewport_max_depth_bits", "scissor_x", "scissor_y", "scissor_width", "scissor_height", "depth_bias_constant_bits", "depth_bias_slope_bits", "stencil_front_reference", "stencil_back_reference" }) |field| {
+            @field(self, field) = @field(current, field);
+        }
     }
 
     fn default(width: u32, height: u32) GraphicsPipelineState {
@@ -13283,7 +13303,7 @@ pub const Renderer = struct {
         };
     }
 
-    fn setGraphicsViewportScissor(self: *Renderer, command_buffer: vk.CommandBuffer, state: GraphicsPipelineState) void {
+    fn setGraphicsDynamicState(self: *Renderer, command_buffer: vk.CommandBuffer, state: GraphicsPipelineState) void {
         const viewport = vk.Viewport{
             .x = @bitCast(state.viewport_x_bits),
             .y = @bitCast(state.viewport_y_bits),
@@ -13296,10 +13316,17 @@ pub const Renderer = struct {
             .offset = .{ .x = state.scissor_x, .y = state.scissor_y },
             .extent = .{ .width = state.scissor_width, .height = state.scissor_height },
         };
-        // Set both for every draw: a new command buffer starts with undefined
+        // Set every dynamic value for every draw: a new command buffer starts with undefined
         // dynamic state, even if it reuses the preceding draw's pipeline.
         self.device_functions.cmd_set_viewport(command_buffer, 0, 1, @ptrCast(&viewport));
         self.device_functions.cmd_set_scissor(command_buffer, 0, 1, @ptrCast(&scissor));
+        self.device_functions.cmd_set_depth_bias(command_buffer, @bitCast(state.depth_bias_constant_bits), 0, @bitCast(state.depth_bias_slope_bits));
+        if (state.stencil_front_reference == state.stencil_back_reference) {
+            self.device_functions.cmd_set_stencil_reference(command_buffer, vk.stencil_face_front_bit | vk.stencil_face_back_bit, state.stencil_front_reference);
+        } else {
+            self.device_functions.cmd_set_stencil_reference(command_buffer, vk.stencil_face_front_bit, state.stencil_front_reference);
+            self.device_functions.cmd_set_stencil_reference(command_buffer, vk.stencil_face_back_bit, state.stencil_back_reference);
+        }
     }
 
     fn createGraphicsPipeline(
@@ -13380,7 +13407,7 @@ pub const Renderer = struct {
             .scissor_count = 1,
             .scissors = @ptrCast(&scissor),
         };
-        const dynamic_states = [_]u32{ vk.dynamic_state_viewport, vk.dynamic_state_scissor };
+        const dynamic_states = [_]u32{ vk.dynamic_state_viewport, vk.dynamic_state_scissor, vk.dynamic_state_depth_bias, vk.dynamic_state_stencil_reference };
         const dynamic_state = vk.PipelineDynamicStateCreateInfo{
             .dynamic_state_count = dynamic_states.len,
             .dynamic_states = &dynamic_states,
@@ -16621,7 +16648,7 @@ pub const Renderer = struct {
         };
         self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
         self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
-        self.setGraphicsViewportScissor(command_buffer, pipeline_state);
+        self.setGraphicsDynamicState(command_buffer, pipeline_state);
         if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0) {
             self.flushStorageDescriptors();
             self.device_functions.cmd_bind_descriptor_sets(
@@ -16782,7 +16809,7 @@ pub const Renderer = struct {
         };
         self.device_functions.cmd_begin_render_pass(command_buffer, &begin, vk.subpass_contents_inline);
         self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
-        self.setGraphicsViewportScissor(command_buffer, state);
+        self.setGraphicsDynamicState(command_buffer, state);
         if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0) {
             self.flushStorageDescriptors();
             self.device_functions.cmd_bind_descriptor_sets(command_buffer, vk.pipeline_bind_point_graphics, self.compute_pipeline_layout, 0, 1, @ptrCast(&self.descriptor_set), 0, null);
@@ -17013,7 +17040,7 @@ pub const Renderer = struct {
         };
         self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
         self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
-        self.setGraphicsViewportScissor(command_buffer, pipeline_state);
+        self.setGraphicsDynamicState(command_buffer, pipeline_state);
         if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0) {
             self.flushStorageDescriptors();
             self.device_functions.cmd_bind_descriptor_sets(
@@ -19551,6 +19578,97 @@ pub const Renderer = struct {
         std.debug.print("GPU timestamp samples={d} valid_bits={d} period_ns={d}\n", .{ self.gpu_timestamp_samples, self.device_info.timestamp_valid_bits, self.device_info.timestamp_period });
     }
 
+    pub fn probeDynamicDepthStencil(self: *Renderer) anyerror!void {
+        const old_transfer = self.depth_transfer_enabled;
+        self.depth_transfer_enabled = false;
+        defer self.depth_transfer_enabled = old_transfer;
+        const depth = GuestDepthTarget{
+            .address = 0x1000,
+            .allocation_bytes = 4096,
+            .width = 32,
+            .height = 32,
+            .guest_format = 3,
+            .format = vk.format_d32_sfloat,
+            .tile_mode = .linear,
+            .base_array_slice = 0,
+            .mip_level = 0,
+            .clear_depth = 1,
+        };
+        const depth_index = try self.acquireDepthTarget(depth);
+        var state = GraphicsPipelineState.default(32, 32);
+        state.color_write_masks = @splat(0);
+        state.depth_attachment_format = depth.format;
+        state.depth_test_enable = 1;
+        state.depth_write_enable = 1;
+        state.depth_compare_operation = 7; // ALWAYS: observe each new bias.
+        state.viewport_min_depth_bits = @bitCast(@as(f32, 0.5));
+        state.viewport_max_depth_bits = @bitCast(@as(f32, 0.5));
+        state.depth_bias_enable = 1;
+        const depth_misses = self.graphics_pipeline_cache_misses;
+        for ([_]f32{ 0, -16384, 16384, 0 }) |bias| {
+            var current = state;
+            current.depth_bias_constant_bits = @bitCast(bias);
+            // Exercise the same restoration used by both draw-reuse paths.
+            state.copyDynamicFrom(current);
+            try self.beginFrameDraw();
+            try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, depth, false, false, false, .{ .vertex_count = 3 });
+            const values = try self.readDepthProbeValues(depth_index, false);
+            try std.testing.expectEqual(@as(f32, 1), values[0]);
+            if (bias == 0) {
+                try std.testing.expectEqual(@as(f32, 0.5), values[1]);
+            } else if (bias < 0) {
+                try std.testing.expect(values[1] < 0.5 and values[1] > 0.49);
+            } else {
+                try std.testing.expect(values[1] > 0.5 and values[1] < 0.51);
+            }
+            try std.testing.expectEqual(depth_misses + 1, self.graphics_pipeline_cache_misses);
+        }
+        state.depth_bias_enable = 0;
+        try self.beginFrameDraw();
+        try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, depth, false, false, false, .{ .vertex_count = 3 });
+        try std.testing.expectEqual(depth_misses + 2, self.graphics_pipeline_cache_misses);
+
+        var stencil = depth;
+        stencil.address = 0x9000;
+        stencil.stencil_address = 0xb000;
+        stencil.stencil_allocation_bytes = 1024;
+        stencil.has_stencil = true;
+        stencil.format = vk.format_d32_sfloat_s8_uint;
+        stencil.clear_stencil = 0x48;
+        const stencil_index = try self.acquireDepthTarget(stencil);
+        state.depth_attachment_format = stencil.format;
+        state.stencil_test_enable = 1;
+        state.stencil_front_compare = 7;
+        state.stencil_back_compare = 7;
+        state.stencil_front_pass = vk.stencil_op_replace;
+        state.stencil_back_pass = vk.stencil_op_replace;
+        state.stencil_front_write_mask = 0xff;
+        state.stencil_back_write_mask = 0xff;
+        const stencil_misses = self.graphics_pipeline_cache_misses;
+        var original_front: ?bool = null;
+        for ([_][2]u8{ .{ 0x35, 0xb2 }, .{ 0xc7, 0x12 }, .{ 0, 0xff }, .{ 0x35, 0xb2 } }) |references| {
+            for ([_]bool{ false, true }) |flipped| {
+                var current = state;
+                current.stencil_front_reference = references[0];
+                current.stencil_back_reference = references[1];
+                current.viewport_y_bits = @bitCast(@as(f32, if (flipped) 32 else 0));
+                current.viewport_height_bits = @bitCast(@as(f32, if (flipped) -32 else 32));
+                state.copyDynamicFrom(current);
+                try self.beginFrameDraw();
+                try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, stencil, false, false, false, .{ .vertex_count = 3 });
+                const values = try self.readDepthProbeValues(stencil_index, true);
+                try std.testing.expectEqual(@as(u8, 0x48), values[0]);
+                if (original_front == null) {
+                    try std.testing.expect(values[1] == references[0] or values[1] == references[1]);
+                    original_front = values[1] == references[0];
+                }
+                const expected = references[if (original_front.? != flipped) 0 else 1];
+                try std.testing.expectEqual(expected, values[1]);
+                try std.testing.expectEqual(stencil_misses + 1, self.graphics_pipeline_cache_misses);
+            }
+        }
+    }
+
     pub fn probeDynamicViewportScissor(self: *Renderer) anyerror!void {
         const initial_misses = self.graphics_pipeline_cache_misses;
         try self.drawGraphicsProbe();
@@ -20272,19 +20390,7 @@ pub const Renderer = struct {
         if (exact_reuse and reuse_memory_matches) {
             self.frame_profile.draw_reuse_hits +|= 1;
             var reused_state = self.draw_reuse_pipeline;
-            reused_state.viewport_x_bits = pipeline_state.viewport_x_bits;
-            reused_state.viewport_y_bits = pipeline_state.viewport_y_bits;
-            reused_state.viewport_width_bits = pipeline_state.viewport_width_bits;
-            reused_state.viewport_height_bits = pipeline_state.viewport_height_bits;
-            reused_state.viewport_min_depth_bits = pipeline_state.viewport_min_depth_bits;
-            reused_state.viewport_max_depth_bits = pipeline_state.viewport_max_depth_bits;
-            reused_state.scissor_x = pipeline_state.scissor_x;
-            reused_state.scissor_y = pipeline_state.scissor_y;
-            reused_state.scissor_width = pipeline_state.scissor_width;
-            reused_state.scissor_height = pipeline_state.scissor_height;
-            reused_state.depth_bias_enable = pipeline_state.depth_bias_enable;
-            reused_state.depth_bias_constant_bits = pipeline_state.depth_bias_constant_bits;
-            reused_state.depth_bias_slope_bits = pipeline_state.depth_bias_slope_bits;
+            reused_state.copyDynamicFrom(pipeline_state);
             const reused_vertex = (self.draw_reuse_vertex orelse return Error.MissingGraphicsProgram).view();
             const reused_fragment = (self.draw_reuse_fragment orelse return Error.MissingGraphicsProgram).view();
             try self.drawGraphicsShadersWithModules(
@@ -20309,19 +20415,7 @@ pub const Renderer = struct {
             patchReusedUserDataScalars(self.draw_reuse_vertex_scalars[0..self.draw_reuse_vertex_scalar_count], &vertex_bindings);
             patchReusedUserDataScalars(self.draw_reuse_fragment_scalars[0..self.draw_reuse_fragment_scalar_count], &fragment_bindings);
             var reused_state = self.draw_reuse_pipeline;
-            reused_state.viewport_x_bits = pipeline_state.viewport_x_bits;
-            reused_state.viewport_y_bits = pipeline_state.viewport_y_bits;
-            reused_state.viewport_width_bits = pipeline_state.viewport_width_bits;
-            reused_state.viewport_height_bits = pipeline_state.viewport_height_bits;
-            reused_state.viewport_min_depth_bits = pipeline_state.viewport_min_depth_bits;
-            reused_state.viewport_max_depth_bits = pipeline_state.viewport_max_depth_bits;
-            reused_state.scissor_x = pipeline_state.scissor_x;
-            reused_state.scissor_y = pipeline_state.scissor_y;
-            reused_state.scissor_width = pipeline_state.scissor_width;
-            reused_state.scissor_height = pipeline_state.scissor_height;
-            reused_state.depth_bias_enable = pipeline_state.depth_bias_enable;
-            reused_state.depth_bias_constant_bits = pipeline_state.depth_bias_constant_bits;
-            reused_state.depth_bias_slope_bits = pipeline_state.depth_bias_slope_bits;
+            reused_state.copyDynamicFrom(pipeline_state);
             self.preserve_draw_reuse = true;
             defer self.preserve_draw_reuse = false;
             try self.beginFrameDraw();
