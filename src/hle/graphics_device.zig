@@ -153,6 +153,18 @@ pub fn findQueue(identifier: u32) ?QueueRegistration {
     return null;
 }
 
+pub fn copyQueues(out: *[maximum_queues]QueueRegistration) []const QueueRegistration {
+    lock.lock();
+    defer lock.unlock();
+    var count: usize = 0;
+    for (queues) |slot| {
+        if (!slot.active) continue;
+        out[count] = slot.registration;
+        count += 1;
+    }
+    return out[0..count];
+}
+
 pub fn setComputeMode(value: u32) void {
     lock.lock();
     defer lock.unlock();

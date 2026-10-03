@@ -67,6 +67,7 @@ const download_data_home = "out/download0";
 const temporary_data_home = "out/temp0";
 const terminator_2d_title_id = "PPSA25872";
 const tetris_effect_connected_title_id = "PPSA07923";
+const little_nightmares_enhanced_title_id = "PPSA10737";
 const yotei_title_id = "PPSA26344";
 const gta_iii_title_id = "PPSA03527";
 const quake_ii_title_id = "PPSA09477";
@@ -81,17 +82,23 @@ fn titleUsesTerminatorGpuProfile(title_identifier: []const u8) bool {
     return std.ascii.eqlIgnoreCase(title_identifier, terminator_2d_title_id);
 }
 
-/// Tetris Effect consumes small compute/storage results from the CPU. Deferring
-/// their writeback can expose stale allocator/work data and corrupt MallocBinned3,
-/// so keep the validated eager path scoped to this title.
+/// These titles consume small compute/storage results from the CPU. Tetris
+/// Effect and Little Nightmares have exposed MallocBinned3 corruption with
+/// deferred writeback; their observed gameplay runs use eager publication.
+/// Keep this compatibility choice scoped until deferred ownership is resolved.
 fn titleNeedsEagerStorageWrites(title_identifier: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(title_identifier, tetris_effect_connected_title_id);
+    return std.ascii.eqlIgnoreCase(title_identifier, tetris_effect_connected_title_id) or
+        std.ascii.eqlIgnoreCase(title_identifier, little_nightmares_enhanced_title_id);
 }
 
-test "Tetris Effect profile materializes storage writes eagerly" {
+test "CPU storage consumer profiles materialize writes eagerly" {
     try std.testing.expect(titleNeedsEagerStorageWrites("PPSA07923"));
     try std.testing.expect(titleNeedsEagerStorageWrites("ppsa07923"));
+    try std.testing.expect(titleNeedsEagerStorageWrites("PPSA10737"));
+    try std.testing.expect(titleNeedsEagerStorageWrites("ppsa10737"));
     try std.testing.expect(!titleNeedsEagerStorageWrites("PPSA25872"));
+    try std.testing.expect(!titleNeedsEagerStorageWrites("PPSA03527"));
+    try std.testing.expect(!titleNeedsEagerStorageWrites("PPSA02457"));
 }
 
 /// Reads the product code a title publishes in its own parameter document.

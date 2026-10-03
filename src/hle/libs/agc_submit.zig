@@ -3037,6 +3037,18 @@ pub fn submitDeviceStream(stream: []const u32) SubmitOutcome {
     return executeAcceptedStream("dcb", stream, null, 0, false);
 }
 
+/// Compute PM4 fetched from a registered native-driver doorbell ring. The
+/// scheduler snapshots the ring and indirect commands before the caller may
+/// advance the hardware read pointer. Completion still comes from RELEASE_MEM.
+pub fn submitDeviceComputeStream(stream: []const u32, event_id: u32) SubmitOutcome {
+    drainCompletionNotifications();
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    beginCompletionBatch();
+    defer finishCompletionBatch();
+    return executeSubmittedLockedForQueueWithRecovery("acb", stream, event_id, false);
+}
+
 /// Advance both queues and soft-satisfy any permanent WAIT_REG_MEM heads.
 /// Called from SuspendPoint so the driver observes GPU progress between frames.
 pub fn pumpQueues() void {
@@ -3084,6 +3096,10 @@ fn executeSubmittedLocked(label: []const u8, stream: []const u32) SubmitOutcome 
 }
 
 fn executeSubmittedLockedForQueue(label: []const u8, stream: []const u32, event_id: u32) SubmitOutcome {
+    return executeSubmittedLockedForQueueWithRecovery(label, stream, event_id, true);
+}
+
+fn executeSubmittedLockedForQueueWithRecovery(label: []const u8, stream: []const u32, event_id: u32, recover_waits: bool) SubmitOutcome {
     std.debug.assert(completion_batch_active);
     var host_time = kernel_runtime.beginHostTimeExclusion();
     defer host_time.end();
@@ -3107,7 +3123,7 @@ fn executeSubmittedLockedForQueue(label: []const u8, stream: []const u32, event_
     var force_rounds: u16 = 0;
     var first_forced_wait: ?gpu.state.WaitRegMem = null;
     var last_forced_wait: ?gpu.state.WaitRegMem = null;
-    while (submission_scheduler.isBlocked(kind) and force_rounds < 256) : (force_rounds += 1) {
+    while (recover_waits and submission_scheduler.isBlocked(kind) and force_rounds < 256) : (force_rounds += 1) {
         const wait = submission_scheduler.state(kind).blocked_wait orelse break;
         if (!forceSatisfyWait(kind, wait)) break;
         if (first_forced_wait == null) first_forced_wait = wait;

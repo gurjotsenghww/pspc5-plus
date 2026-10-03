@@ -5,8 +5,9 @@
 //!
 //! This is the boundary between the graphics driver and the kernel. The driver
 //! that a title ships builds command buffers itself and then hands them to the
-//! hardware through exactly one door: a control request on a device descriptor.
-//! Everything a GPU is asked to do arrives here.
+//! hardware through device requests and memory-mapped compute doorbells.
+//! Queue registration gives this layer the ring and doorbell addresses needed
+//! to receive submissions that do not issue another control request.
 //!
 //! Discovery and queue registration requests described below are carried out.
 //! Every other request remains *legible*: a request code is not an opaque number
@@ -243,7 +244,137 @@ fn answerGraphicsQueueRegistration(request: Request, payload: u64) bool {
     if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
     const source: *const graphics_device.QueueRegistration = @ptrFromInt(payload);
     graphics_device.registerQueue(source.*) catch return false;
+    ensureNativeRingWorker();
     return true;
+}
+
+// Native AGC submits compute work by writing an aperture doorbell, without an
+// ioctl. Each registered queue has a 16-KiB PM4 ring, a dword read pointer in
+// its control page, and an eight-byte doorbell slot indexed by identifier-1.
+// Merely retaining the registration leaves the read pointer at zero: after
+// 511 eight-dword kicks the driver spins forever waiting for free ring space.
+const native_ring_words = 0x4000 / @sizeOf(u32);
+var native_ring_worker_started: std.atomic.Value(bool) = .init(false);
+var native_ring_reports: u32 = 0;
+
+fn nativeRingPending(read_index: u32, write_index: u32) ?usize {
+    if (read_index >= native_ring_words or write_index >= native_ring_words or
+        read_index & 3 != 0 or write_index & 3 != 0) return null;
+    return (write_index + native_ring_words - read_index) % native_ring_words;
+}
+
+fn drainNativeRing(registration: graphics_device.QueueRegistration) void {
+    const doorbell = registration.aperture_address + @as(u64, registration.identifier - 1) * 8;
+    if (!memory.isGuestRangeAccessible(doorbell, 4) or
+        !memory.isGuestRangeAccessible(registration.control_address, 4) or
+        !memory.isGuestRangeAccessible(registration.queue_address, native_ring_words * 4)) return;
+    const write_pointer: *const u32 = @ptrFromInt(doorbell);
+    const read_pointer: *u32 = @ptrFromInt(registration.control_address);
+    const write_index = @atomicLoad(u32, write_pointer, .acquire);
+    const read_index = @atomicLoad(u32, read_pointer, .monotonic);
+    const count = nativeRingPending(read_index, write_index) orelse return;
+    if (count == 0) return;
+    const ring: *const [native_ring_words]u32 = @ptrFromInt(registration.queue_address);
+    var snapshot: [native_ring_words]u32 = undefined;
+    const first = @min(count, native_ring_words - read_index);
+    @memcpy(snapshot[0..first], ring[read_index..][0..first]);
+    @memcpy(snapshot[first..count], ring[0 .. count - first]);
+    // Native queue numbers 0x20..0x57 correspond to registered IDs 1..56.
+    // Keep their interrupt identity when the scheduler resumes a parked IB.
+    const outcome = agc_submit.submitDeviceComputeStream(snapshot[0..count], registration.identifier + 0x1f);
+    if (!outcome.accepted) return;
+    @atomicStore(u32, read_pointer, write_index, .release);
+    if (native_ring_reports < 16) {
+        std.debug.print("[gc ring] queue={d} consumed={d} read={d}->{d} completed={}\n", .{
+            registration.identifier, count, read_index, write_index, outcome.completed,
+        });
+        native_ring_reports += 1;
+    }
+}
+
+fn nativeRingWorkerMain() void {
+    while (!runtime_api.guestStopRequested()) {
+        var registrations: [graphics_device.maximum_queues]graphics_device.QueueRegistration = undefined;
+        for (graphics_device.copyQueues(&registrations)) |registration| drainNativeRing(registration);
+        agc_submit.pumpCompletionNotifications();
+        var interval: i64 = -20_000; // 2 ms; this is a host worker, not a guest pthread.
+        _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+    }
+}
+
+fn ensureNativeRingWorker() void {
+    if (comptime builtin.is_test or builtin.os.tag != .windows) return;
+    if (native_ring_worker_started.swap(true, .acq_rel)) return;
+    const thread = std.Thread.spawn(.{}, nativeRingWorkerMain, .{}) catch {
+        native_ring_worker_started.store(false, .release);
+        return;
+    };
+    thread.detach();
+}
+
+test "native compute ring pending span validates pointers and wraps" {
+    try std.testing.expectEqual(@as(?usize, 0), nativeRingPending(0, 0));
+    try std.testing.expectEqual(@as(?usize, 8), nativeRingPending(0, 8));
+    try std.testing.expectEqual(@as(?usize, 8), nativeRingPending(4088, 0));
+    try std.testing.expectEqual(@as(?usize, 12), nativeRingPending(4092, 8));
+    try std.testing.expectEqual(@as(?usize, null), nativeRingPending(4096, 8));
+    try std.testing.expectEqual(@as(?usize, null), nativeRingPending(0, 4096));
+    try std.testing.expectEqual(@as(?usize, null), nativeRingPending(1, 8));
+}
+
+test "native compute ring executes releases across wrap without replay" {
+    agc_submit.reset();
+    defer agc_submit.reset();
+    var ring: [native_ring_words]u32 = @splat(0);
+    var doorbell: u32 = 0;
+    var consumed: u32 = 0;
+    var label: u64 = 0;
+    const address = @intFromPtr(&label);
+    const registration = graphics_device.QueueRegistration{
+        .engine = 1,
+        .family = 0,
+        .index = 0,
+        .identifier = 1,
+        .queue_address = @intFromPtr(&ring),
+        .control_address = @intFromPtr(&consumed),
+        .aperture_address = @intFromPtr(&doorbell),
+        .aperture_slots = 12,
+        .completion_address = 0,
+        .completion_size = 0x1000,
+    };
+    for (1..526) |value| {
+        const packet = [_]u32{
+            0xc006_4900, 0x528, 2 << 29, @truncate(address), @truncate(address >> 32), @intCast(value), 0, 0,
+        };
+        @memcpy(ring[doorbell..][0..8], &packet);
+        doorbell = (doorbell + 8) % native_ring_words;
+        drainNativeRing(registration);
+        try std.testing.expectEqual(doorbell, consumed);
+        try std.testing.expectEqual(@as(u64, value), label);
+    }
+    label = 0x1234;
+    drainNativeRing(registration);
+    try std.testing.expectEqual(@as(u64, 0x1234), label);
+    doorbell = native_ring_words; // A bad producer pointer must not consume anything.
+    const before = consumed;
+    drainNativeRing(registration);
+    try std.testing.expectEqual(before, consumed);
+}
+
+test "native compute ring preserves an unmet wait until its real writer runs" {
+    agc_submit.reset();
+    defer agc_submit.reset();
+    var label: u64 = 0;
+    const address = @intFromPtr(&label);
+    const wait = [_]u32{ 0xc005_3c00, 0x13, @truncate(address), @truncate(address >> 32), 1, 0xffff_ffff, 1, 0x8000_0000 };
+    const pending = agc_submit.submitDeviceComputeStream(&wait, 0x20);
+    try std.testing.expect(pending.accepted);
+    try std.testing.expect(!pending.completed);
+    try std.testing.expectEqual(@as(u64, 0), label);
+    const release = [_]u32{ 0xc006_4900, 0x528, 2 << 29, @truncate(address), @truncate(address >> 32), 1, 0, 0 };
+    try std.testing.expect(agc_submit.submitDeviceStream(&release).completed);
+    try std.testing.expectEqual(@as(u64, 1), label);
+    try std.testing.expect(agc_submit.submitDeviceComputeStream(&.{ 0xc000_1000, 0 }, 0x20).completed);
 }
 
 fn answerGraphicsMode(request: Request, payload: u64) bool {
