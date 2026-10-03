@@ -98,6 +98,8 @@ pub const Manager = struct {
     next_generation: u64 = 1,
     enabled: bool = true,
     canonical_authority_enabled: bool = true,
+    lowest_address: u64 = std.math.maxInt(u64),
+    highest_end: u64 = 0,
 
     pub fn deinit(self: *Manager, allocator: std.mem.Allocator) void {
         self.entries.deinit(allocator);
@@ -124,7 +126,17 @@ pub const Manager = struct {
             .resident_generation = 0,
             .authority = if (self.canonical_authority_enabled) inherited.authority else 0,
         });
+        if (range.valid()) {
+            self.lowest_address = @min(self.lowest_address, range.address);
+            self.highest_end = @max(self.highest_end, range.end());
+        }
         return token;
+    }
+
+    /// A conservative bound, including registrations made with alias resolution
+    /// disabled. Removal need not shrink it: false positives only retain work.
+    pub fn mayOverlap(self: *const Manager, range: Range) bool {
+        return range.valid() and self.lowest_address < range.end() and range.address < self.highest_end;
     }
 
     pub fn unregister(self: *Manager, token: Token) void {
@@ -181,6 +193,7 @@ pub const Manager = struct {
 
     fn newestForRange(self: *const Manager, range: Range) Newest {
         var result = Newest{ .generation = 0, .authority = 0 };
+        if (!self.mayOverlap(range)) return result;
         for (self.entries.items) |candidate| {
             if (!candidate.range.overlaps(range) or candidate.generation < result.generation) continue;
             result = .{ .generation = candidate.generation, .authority = candidate.authority };
@@ -261,7 +274,7 @@ pub const Manager = struct {
     /// An explicit guest write changes content, whereas publishGuest only
     /// copies an existing GPU generation back to its guest backing store.
     pub fn markGuestWrite(self: *Manager, range: Range) void {
-        if (!self.enabled) return;
+        if (!self.enabled or !self.mayOverlap(range)) return;
         var generation: ?u64 = null;
         for (self.entries.items) |*candidate| {
             if (!candidate.range.overlaps(range)) continue;
@@ -275,6 +288,23 @@ pub const Manager = struct {
         }
     }
 };
+
+test "image bounds retain overlapping writes with alias resolution disabled" {
+    var manager = Manager{ .enabled = false };
+    defer manager.deinit(std.testing.allocator);
+    const signature = Signature{ .format = 37, .width = 32, .height = 32 };
+    try std.testing.expect(!manager.mayOverlap(.{ .address = 0x1000, .size = 4 }));
+    const token = try manager.register(std.testing.allocator, .sampled_image, .{ .address = 0x10000, .size = 0x2000 }, signature);
+    try std.testing.expect(!manager.mayOverlap(.{ .address = 0x1000, .size = 8 }));
+    try std.testing.expect(!manager.mayOverlap(.{ .address = 0x12000, .size = 8 }));
+    try std.testing.expect(manager.mayOverlap(.{ .address = 0xffff, .size = 2 }));
+    try std.testing.expect(manager.mayOverlap(.{ .address = 0x11fff, .size = 8 }));
+    manager.unregister(token);
+    _ = try manager.register(std.testing.allocator, .storage_image, .{ .address = 0x4000, .size = 0x1000 }, signature);
+    try std.testing.expect(manager.mayOverlap(.{ .address = 0x4000, .size = 4 }));
+    _ = try manager.register(std.testing.allocator, .color_target, .{ .address = std.math.maxInt(u64) - 8, .size = 8 }, signature);
+    try std.testing.expect(manager.mayOverlap(.{ .address = std.math.maxInt(u64) - 1, .size = 4 }));
+}
 
 test "explicit guest writes invalidate overlapping images without a resident writer" {
     var manager = Manager{};

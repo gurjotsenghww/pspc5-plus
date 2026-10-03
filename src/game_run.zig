@@ -68,6 +68,7 @@ const temporary_data_home = "out/temp0";
 const terminator_2d_title_id = "PPSA25872";
 const tetris_effect_connected_title_id = "PPSA07923";
 const yotei_title_id = "PPSA26344";
+const gta_iii_title_id = "PPSA03527";
 const quake_ii_title_id = "PPSA09477";
 const subnautica_below_zero_title_id = "PPSA02457";
 const terminator_audio_latency_ms: u16 = 128;
@@ -663,10 +664,12 @@ fn run(init: std.process.Init) !bool {
         adaptive_compiler_workers = false;
         break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 1, 4);
     } else |_| if (adaptive_cpu_workers) cpu_worker_limits.compilers else 2;
+    // GTA III's frequent ordering callbacks outweigh command lookahead.
+    // Retain the environment override for comparisons and other titles.
     const parallel_commands = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PARALLEL_COMMANDS")) |text| enabled: {
         defer allocator.free(text);
         break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
-    } else |_| true;
+    } else |_| !std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id);
     var adaptive_resource_workers = adaptive_cpu_workers;
     const resource_preparation_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RESOURCE_WORKERS")) |text| workers: {
         defer allocator.free(text);
@@ -726,6 +729,7 @@ fn run(init: std.process.Init) !bool {
     // unchanged buffers for every title; explicit zero values remain useful
     // for comparisons. Vertex-fetch bounds still use the verified profile.
     const use_quake_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, quake_ii_title_id);
+    const use_gta_iii_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id);
     const enable_gpu_page_tracker = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PAGE_TRACKER")) |text| enabled: {
         defer allocator.free(text);
         const request = std.mem.trim(u8, text, " \t\r\n");
@@ -734,7 +738,7 @@ fn run(init: std.process.Init) !bool {
     const bound_vertex_fetches = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BOUND_VERTEX_FETCHES")) |text| enabled: {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
-    } else |_| use_quake_buffer_profile;
+    } else |_| use_quake_buffer_profile or use_gta_iii_buffer_profile;
     const reuse_graphics_resources = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_REUSE_GRAPHICS_RESOURCES")) |text| enabled: {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
@@ -747,8 +751,8 @@ fn run(init: std.process.Init) !bool {
     const enable_gpu_buffer_content_cache = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BUFFER_CONTENT_CACHE")) |text| enabled: {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
-    } else |_| std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id);
-    const default_copy_workers: u8 = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 4 else 1;
+    } else |_| std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or use_gta_iii_buffer_profile;
+    const default_copy_workers: u8 = if (use_gta_iii_buffer_profile or std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 4 else 1;
     const gpu_copy_workers: u8 = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COPY_WORKERS")) |text| parse: {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(u8, text, 10) catch default_copy_workers, 1, gpu.parallel_copy.Pool.maximum_participants);
@@ -757,7 +761,9 @@ fn run(init: std.process.Init) !bool {
     // Tetris Journey Mode retains about 100 attachments. A 64-entry cache
     // evicts/reimports roughly 60 of them per frame, causing hundreds of MiB
     // of readbacks. Keep its working set resident, as for Yotei.
-    const default_render_targets: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or
+    // GTA III keeps more than 180 colour attachments, including cube mips.
+    // Keeping that measured working set avoids repeated readback and reupload.
+    const default_render_targets: usize = if (use_gta_iii_buffer_profile) 256 else if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or
         std.ascii.eqlIgnoreCase(title_identifier, tetris_effect_connected_title_id)) 128 else 64;
     const render_target_cache_limit = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RENDER_TARGETS")) |text| parse: {
         defer allocator.free(text);
@@ -806,10 +812,13 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 256);
     } else |_| 0;
+    // GTA III's completed-buffer working set is about 42 MiB. A 32 MiB
+    // pool repeatedly frees allocations needed by the next frame.
+    const default_buffer_recycle_mib: usize = if (use_gta_iii_buffer_profile) 64 else 32;
     const buffer_recycle_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BUFFER_RECYCLE_MIB")) |text| parse: {
         defer allocator.free(text);
-        break :parse @min(std.fmt.parseInt(usize, text, 10) catch 32, 256);
-    } else |_| 32;
+        break :parse @min(std.fmt.parseInt(usize, text, 10) catch default_buffer_recycle_mib, 256);
+    } else |_| default_buffer_recycle_mib;
     const device_detile_sources = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_DETILE_INPUT")) |text| parse: {
         defer allocator.free(text);
         break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
@@ -858,7 +867,7 @@ fn run(init: std.process.Init) !bool {
     vulkan.backend.assemble_resident_mip_chains = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_ASSEMBLE_MIPS")) |text| parse: {
         defer allocator.free(text);
         break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
-    } else |_| false;
+    } else |_| true;
     const default_retirement_slack_mib: u64 = if (speed_preset) 256 else 0;
     vulkan.backend.sampled_retirement_slack_bytes = (if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_RETIREMENT_SLACK_MIB")) |text| parse: {
         defer allocator.free(text);

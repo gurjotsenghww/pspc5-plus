@@ -24,6 +24,9 @@ pub const Plan = struct {
     /// opcodes that cannot change a scalar register or a checkpoint are absent.
     scalar_steps: []const u32,
     reads_only_resources: bool,
+    /// A full walk and the sparse checkpoint walks cannot exhaust different
+    /// loop budgets when control flow only moves forward.
+    forward_only: bool,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
@@ -45,6 +48,7 @@ pub const Plan = struct {
             .storage_images = storage_images,
             .scalar_steps = try collectScalarSteps(allocator, instructions, resource, sampled),
             .reads_only_resources = readsOnlyResources(instructions),
+            .forward_only = walksForward(instructions),
         };
     }
 
@@ -77,6 +81,42 @@ pub const Plan = struct {
         };
     }
 };
+
+fn walksForward(instructions: []const rdna2.Instruction) bool {
+    for (instructions) |inst| switch (inst.opcode) {
+        .s_setpc_b64 => return false,
+        .s_branch,
+        .s_cbranch_scc0,
+        .s_cbranch_scc1,
+        .s_cbranch_vccz,
+        .s_cbranch_vccnz,
+        .s_cbranch_execz,
+        .s_cbranch_execnz,
+        => if (inst.branch_target <= inst.pc) return false,
+        else => {},
+    };
+    return true;
+}
+
+test "shared scalar walk rejects loops and indirect transfers" {
+    const a = std.testing.allocator;
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .sopp, .opcode = .s_cbranch_scc0, .branch_target = 8 },
+        .{ .pc = 4, .family = .sopp, .opcode = .s_nop },
+        .{ .pc = 8, .family = .sopp, .opcode = .s_endpgm },
+    };
+    var forward = try Plan.init(a, &instructions);
+    defer forward.deinit(a);
+    try std.testing.expect(forward.forward_only);
+    instructions[1] = .{ .pc = 4, .family = .sopp, .opcode = .s_branch, .branch_target = 0 };
+    var loop = try Plan.init(a, &instructions);
+    defer loop.deinit(a);
+    try std.testing.expect(!loop.forward_only);
+    instructions[1] = .{ .pc = 4, .family = .sop1, .opcode = .s_setpc_b64 };
+    var indirect = try Plan.init(a, &instructions);
+    defer indirect.deinit(a);
+    try std.testing.expect(!indirect.forward_only);
+}
 
 /// Borrow immutable resource locations when they belong to this exact program.
 /// Pruned or replaced instruction allocations use the same opcode filter directly.
@@ -270,6 +310,33 @@ pub const Pool = struct {
         reader: shaders.MemoryReader,
         bindings: *const shaders.StageBindings,
     ) !Lease {
+        var lease = try self.acquire(allocator, instructions, plan, kind);
+        errdefer lease.release();
+        if (lease.pcs.len != 0) {
+            // The evaluator overwrites visited snapshots and clears skipped
+            // blocks before returning, including early stops and failed reads.
+            const steps = if (lease.plan_reused) plan.?.scalar_steps else null;
+            const evaluation = self.evaluation orelse try allocator.create(scalar.Evaluation);
+            self.evaluation = null;
+            defer {
+                if (self.evaluation) |nested| allocator.destroy(nested);
+                self.evaluation = evaluation;
+            }
+            scalar.evaluateDecodedResourceSnapshotsInto(evaluation, reader, bindings, instructions, lease.pcs, lease.snapshots, steps);
+            lease.instructions_walked = evaluation.instruction_count;
+        }
+        return lease;
+    }
+
+    /// Borrow storage without evaluating it, so one owner walk can populate
+    /// several consumers. The caller must initialize every snapshot.
+    pub fn acquire(
+        self: *Pool,
+        allocator: std.mem.Allocator,
+        instructions: []const rdna2.Instruction,
+        plan: ?*const Plan,
+        kind: Kind,
+    ) !Lease {
         const plan_reused = self.enabled and plan != null and plan.?.matches(instructions);
         const pcs = if (plan_reused) plan.?.pcs(kind) else try collect(allocator, instructions, kind);
         errdefer if (!plan_reused) allocator.free(pcs);
@@ -289,24 +356,6 @@ pub const Pool = struct {
         const storage = allocation orelse try allocator.alloc(scalar.ScalarRegisters, pcs.len);
         errdefer allocator.free(storage);
         const snapshots = storage[0..pcs.len];
-        var walked: u32 = 0;
-        if (pcs.len != 0) {
-            // The evaluator overwrites visited snapshots and clears skipped
-            // blocks before returning. No values live across preparations,
-            // even after an early stop or failed read. Scalar steps skip
-            // vector instructions that cannot change those snapshots.
-            const steps = if (plan_reused) plan.?.scalar_steps else null;
-            const evaluation = self.evaluation orelse try allocator.create(scalar.Evaluation);
-            self.evaluation = null;
-            defer {
-                // A nested preparation owns different storage. Retain one
-                // idle allocation after the outer walk completes.
-                if (self.evaluation) |nested| allocator.destroy(nested);
-                self.evaluation = evaluation;
-            }
-            scalar.evaluateDecodedResourceSnapshotsInto(evaluation, reader, bindings, instructions, pcs, snapshots, steps);
-            walked = evaluation.instruction_count;
-        }
         return .{
             .pcs = pcs,
             .snapshots = snapshots,
@@ -317,7 +366,6 @@ pub const Pool = struct {
             .plan_reused = plan_reused,
             .scratch_reused = scratch_reused,
             .cacheable = cacheable,
-            .instructions_walked = walked,
         };
     }
 

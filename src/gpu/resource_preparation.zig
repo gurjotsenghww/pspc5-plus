@@ -122,6 +122,7 @@ const Snapshot = struct {
 
 pub const Stats = struct {
     submitted: u64 = 0,
+    shared_walks: u64 = 0,
     used: u64 = 0,
     fallback: u64 = 0,
     worker_ns: u64 = 0,
@@ -134,6 +135,7 @@ pub const Pool = struct {
     worker_limit: usize = 2,
     adaptive: bool = false,
     minimum_steps: usize = minimum_scalar_steps,
+    share_scalar_walks: bool = true,
     queue: cpu.Queue = .{},
     configured_limit: ?usize = null,
     configured_adaptive: bool = false,
@@ -144,6 +146,7 @@ pub const Pool = struct {
     // allow a long checkpoint walk to overlap the other stage's scalar walk.
     const Stage = struct {
         active: bool = false,
+        inline_prepared: bool = false,
         bindings_address: ?*const shaders.StageBindings = null,
         bindings: shaders.StageBindings = undefined,
         plan: *const checkpoints.Plan = undefined,
@@ -157,6 +160,7 @@ pub const Pool = struct {
             self.resource_job.resource = null;
             self.bindings_address = null;
             self.active = false;
+            self.inline_prepared = false;
         }
     };
 
@@ -209,11 +213,52 @@ pub const Pool = struct {
         return stage;
     }
 
+    fn availableShared(self: *Pool, slot: usize, instructions: []const rdna2.Instruction, plan: ?*const checkpoints.Plan, bindings: *const shaders.StageBindings) ?*Stage {
+        if (!self.share_scalar_walks or slot >= self.stages.len or plan == null or
+            !plan.?.matches(instructions) or !plan.?.forward_only or
+            instructions.len > bindings.resource_instruction_budget or
+            plan.?.resource.len + plan.?.sampled.len == 0) return null;
+        const stage = &self.stages[slot];
+        if (stage.active) return null;
+        stage.snapshot.count = 0;
+        stage.snapshot.complete = true;
+        stage.snapshot.missing = false;
+        return stage;
+    }
+
+    fn retainShared(self: *Pool, stage: *Stage, bindings: *const shaders.StageBindings, plan: *const checkpoints.Plan, resource: checkpoints.Pool.Lease) void {
+        stage.snapshot.source = undefined;
+        stage.bindings_address = bindings;
+        stage.plan = plan;
+        stage.active = true;
+        stage.inline_prepared = true;
+        stage.scalar_job.started = false;
+        stage.scalar_job.failed = false;
+        stage.resource_job.started = false;
+        stage.resource_job.failed = false;
+        stage.resource_job.resource = resource;
+        self.stats.shared_walks += 1;
+    }
+
     /// Capture the original sampled walk at its original ordering point. The
     /// owner immediately consumes its result while independent scalar/storage
     /// jobs use only the captured bytes during subsequent texture staging.
     pub fn startSampled(self: *Pool, slot: usize, reader: shaders.MemoryReader, bindings: *const shaders.StageBindings, instructions: []const rdna2.Instruction, plan: ?*const checkpoints.Plan, scratch: *checkpoints.Pool, allocator: std.mem.Allocator) !?checkpoints.Pool.Lease {
         if (plan == null or plan.?.sampled.len == 0) return null;
+        if (self.availableShared(slot, instructions, plan, bindings)) |stage| {
+            var sampled = try scratch.acquire(allocator, instructions, plan, .sampled);
+            errdefer sampled.release();
+            var resource = try stage.resource_job.scratch.acquire(std.heap.page_allocator, instructions, plan, .resource);
+            stage.snapshot.source = reader;
+            scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&stage.scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, sampled.pcs, sampled.snapshots, resource.pcs, resource.snapshots);
+            sampled.instructions_walked = stage.scalar_result.instruction_count;
+            if (stage.snapshot.complete) {
+                self.retainShared(stage, bindings, plan.?, resource);
+            } else {
+                resource.release();
+            }
+            return sampled;
+        }
         const stage = self.available(slot, instructions, plan) orelse return null;
         stage.snapshot.source = reader;
         const lease = try scratch.prepare(allocator, instructions, plan, .sampled, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings);
@@ -222,6 +267,18 @@ pub const Pool = struct {
     }
 
     pub fn startScalar(self: *Pool, slot: usize, reader: shaders.MemoryReader, bindings: *const shaders.StageBindings, instructions: []const rdna2.Instruction, plan: ?*const checkpoints.Plan, scalar_result: *scalar.Evaluation) bool {
+        if (self.availableShared(slot, instructions, plan, bindings)) |stage| {
+            var resource = stage.resource_job.scratch.acquire(std.heap.page_allocator, instructions, plan, .resource) catch return false;
+            stage.snapshot.source = reader;
+            scalar.evaluateDecodedResourceStateAtCheckpointsInto(scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, resource.pcs, resource.snapshots, null);
+            if (stage.snapshot.complete) {
+                stage.scalar_result.copyFrom(scalar_result);
+                self.retainShared(stage, bindings, plan.?, resource);
+            } else {
+                resource.release();
+            }
+            return true;
+        }
         const stage = self.available(slot, instructions, plan) orelse return false;
         stage.snapshot.source = reader;
         scalar.evaluateDecodedResourceStateInto(scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions);
@@ -265,7 +322,7 @@ pub const Pool = struct {
 
     pub fn takeScalar(self: *Pool, slot: usize, bindings: *const shaders.StageBindings, instructions: []const rdna2.Instruction, reader: shaders.MemoryReader, result: *scalar.Evaluation) bool {
         const stage = &self.stages[slot];
-        if (!stage.active or !stage.scalar_job.started or stage.bindings_address != bindings or !stage.plan.matches(instructions)) return false;
+        if (!stage.active or (!stage.scalar_job.started and !stage.inline_prepared) or stage.bindings_address != bindings or !stage.plan.matches(instructions)) return false;
         self.join(&stage.scalar_job);
         if (stage.scalar_job.failed or !stage.snapshot.matches(reader)) {
             self.stats.fallback += 1;
@@ -341,11 +398,16 @@ const TestMemory = struct {
 };
 
 test "resource workers match serial checkpoints and never access guest memory" {
-    for ([_]usize{ 1, 2, 4 }) |limit| try exerciseResourcePool(limit, false);
-    try exerciseResourcePool(4, true);
+    for ([_]usize{ 1, 2, 4 }) |limit| try exerciseResourcePool(limit, false, false);
+    try exerciseResourcePool(4, true, false);
 }
 
-fn exerciseResourcePool(limit: usize, adaptive: bool) !void {
+test "shared resource walks preserve scalar history, skipped sites and live-input invalidation" {
+    try exerciseResourcePool(0, false, true);
+    try exerciseResourcePool(4, true, true);
+}
+
+fn exerciseResourcePool(limit: usize, adaptive: bool, shared: bool) !void {
     const a = std.testing.allocator;
     const code = [_]u32{
         0xf400_1a80, 125 << 25,
@@ -363,7 +425,7 @@ fn exerciseResourcePool(limit: usize, adaptive: bool) !void {
     defer plan.deinit(a);
     const pool = try a.create(Pool);
     defer a.destroy(pool);
-    pool.* = .{ .minimum_steps = 0, .worker_limit = limit, .adaptive = adaptive };
+    pool.* = .{ .minimum_steps = 0, .worker_limit = limit, .adaptive = adaptive, .share_scalar_walks = shared };
     defer pool.deinit();
     var serial = checkpoints.Pool{};
     defer serial.deinit(a);
@@ -407,14 +469,15 @@ fn exerciseResourcePool(limit: usize, adaptive: bool) !void {
         }
         pool.finish();
     }
-    try std.testing.expectEqual(@as(u64, 12), pool.stats.submitted);
+    try std.testing.expectEqual(@as(u64, if (shared) 0 else 12), pool.stats.submitted);
+    try std.testing.expectEqual(@as(u64, if (shared) 6 else 0), pool.stats.shared_walks);
     try std.testing.expectEqual(@as(u64, 12), pool.stats.used);
     try std.testing.expectEqual(@as(u64, 0), pool.stats.fallback);
     try std.testing.expect(!memory.wrong_thread);
-    for (&pool.stages) |*stage| {
+    for (&pool.stages) |*stage| if (!shared) {
         try std.testing.expect(stage.scalar_job.job.thread_id != 0 and stage.scalar_job.job.thread_id != memory.owner);
         try std.testing.expect(stage.resource_job.job.thread_id != 0 and stage.resource_job.job.thread_id != memory.owner);
-    }
+    };
 
     // A CPU write after capture invalidates both checkpoints and full scalar
     // reuse. The owner will perform the original live preparation instead.
@@ -429,6 +492,29 @@ fn exerciseResourcePool(limit: usize, adaptive: bool) !void {
     try std.testing.expect(scalar_result[0].memory_read_failed and !pool.stages[0].active);
     memory.value = 4;
     pool.worker_limit = 0;
+    if (shared) {
+        const budget = bindings.resource_instruction_budget;
+        bindings.resource_instruction_budget = @intCast(program.instructions.items.len - 1);
+        try std.testing.expect(!pool.startScalar(0, memory.reader(), &bindings, program.instructions.items, &plan, &scalar_result[0]));
+        bindings.resource_instruction_budget = budget;
+        // Storage-only consumers use the same full walk and retain its lease.
+        try std.testing.expect(pool.startScalar(0, memory.reader(), &bindings, program.instructions.items, &plan, &scalar_result[0]));
+        var expected = try serial.prepare(a, program.instructions.items, &plan, .resource, memory.reader(), &bindings);
+        defer expected.release();
+        var actual = pool.take(program.instructions.items, &bindings, .resource, memory.reader()) orelse return error.MissingSharedResult;
+        defer actual.release();
+        try std.testing.expectEqualDeep(expected.snapshots, actual.snapshots);
+        pool.finish();
+        // An incomplete sampled capture remains valid at its original point,
+        // but cannot supply later consumers or leave a borrowed lease behind.
+        memory.value = null;
+        var failed = (try pool.startSampled(0, memory.reader(), &bindings, program.instructions.items, &plan, &capture_scratch, a)).?;
+        failed.release();
+        try std.testing.expect(!pool.stages[0].active);
+        try std.testing.expect(pool.take(program.instructions.items, &bindings, .resource, memory.reader()) == null);
+        memory.value = 4;
+        pool.share_scalar_walks = false;
+    }
     try std.testing.expect(!pool.startScalar(0, memory.reader(), &bindings, program.instructions.items, &plan, &scalar_result[0]));
     pool.worker_limit = 2;
     pool.minimum_steps = program.instructions.items.len + 1;

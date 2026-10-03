@@ -1219,6 +1219,90 @@ pub fn publishDirectMemory(context: ?*anyopaque, address: u64, size: usize) bool
 /// Zero keeps the hot path silent; no guest bytes are changed by the observer.
 pub export var trace_guest_write_min_bytes: u64 = 0;
 pub export var trace_guest_write_reports: u32 = 0;
+pub export var skip_unchanged_guest_writes: bool = true;
+pub export var guest_write_compared_bytes: u64 = 0;
+pub export var guest_write_unchanged_bytes: u64 = 0;
+
+/// Keep unchanged pages armed when publishing a large GPU result. Completion
+/// and command-snapshot notifications still run once for the entire write.
+/// Narrow label writes retain their existing path and wake-up semantics.
+fn copyChangedGuestBytes(space: ?*guest_address_space.AddressSpace, destination: []u8, source: []const u8) usize {
+    std.debug.assert(destination.len == source.len);
+    const address = @intFromPtr(destination.ptr);
+    var unchanged: usize = 0;
+    var cursor: usize = 0;
+    var changed_start: ?usize = null;
+    while (cursor < source.len) {
+        const length = @min(source.len - cursor, guest_address_space.page_size - ((address + cursor) % guest_address_space.page_size));
+        const end = cursor + length;
+        if (std.mem.eql(u8, destination[cursor..end], source[cursor..end])) {
+            unchanged += length;
+            if (changed_start) |start| {
+                if (space) |mapped| mapped.notifyGuestWrite(address + start, cursor - start);
+                @memcpy(destination[start..cursor], source[start..cursor]);
+                changed_start = null;
+            }
+        } else {
+            // A single notification lets the tracker batch native protection
+            // changes across adjacent dirty pages. Equal pages split the run
+            // and stay armed; label publication still follows the entire copy.
+            if (changed_start == null) changed_start = cursor;
+        }
+        cursor = end;
+    }
+    if (changed_start) |start| {
+        if (space) |mapped| mapped.notifyGuestWrite(address + start, source.len - start);
+        @memcpy(destination[start..], source[start..]);
+    }
+    return unchanged;
+}
+
+test "equal GPU publications preserve page watches and changed pages advance" {
+    try exerciseEqualGpuPublications(.private);
+    try exerciseEqualGpuPublications(.direct_memory);
+}
+
+fn exerciseEqualGpuPublications(kind: guest_address_space.MappingKind) !void {
+    const page = guest_address_space.page_size;
+    const base = guest_address_space.user.start;
+    var space = try guest_address_space.AddressSpace.initWithDirectMemory(testing.allocator, 8 * page);
+    defer space.deinit();
+    try space.mapFixed(base, 8 * page, .read_write, kind, if (kind == .direct_memory) @as(u64, 0) else null);
+    space.enableGpuMemoryTracking();
+    const source = try testing.allocator.alloc(u8, 8 * page - 246);
+    defer testing.allocator.free(source);
+    @memset(source, 0x39);
+    const destination = @as([*]u8, @ptrFromInt(base + 123))[0..source.len];
+    _ = copyChangedGuestBytes(&space, destination, source);
+    var generations: [8]u64 = undefined;
+    for (&generations, 0..) |*generation, index| generation.* = try space.trackGpuRead(base + index * page, page);
+    try testing.expectEqual(source.len, copyChangedGuestBytes(&space, destination, source));
+    for (generations, 0..) |generation, index| try testing.expectEqual(generation, space.gpuGeneration(base + index * page, page));
+    source[2 * page - 123] = 0x72;
+    source[4 * page - 124] = 0x81;
+    const protection_calls = space.gpu_tracker.protection_calls;
+    try testing.expectEqual(source.len - 2 * page, copyChangedGuestBytes(&space, destination, source));
+    const expected_calls: u64 = if (builtin.os.tag == .windows and kind == .direct_memory) 1 else 2;
+    try testing.expectEqual(protection_calls + expected_calls, space.gpu_tracker.protection_calls);
+    try testing.expectEqualSlices(u8, source, destination);
+    for (generations, 0..) |generation, index| {
+        if (index == 2 or index == 3) {
+            try testing.expectEqual(@as(u64, 0), space.gpuGeneration(base + index * page, page));
+        } else try testing.expectEqual(generation, space.gpuGeneration(base + index * page, page));
+    }
+    try testing.expectEqual(@as(u8, 0), @as(*const u8, @ptrFromInt(base + 122)).*);
+    try testing.expectEqual(@as(u8, 0), @as(*const u8, @ptrFromInt(base + 8 * page - 123)).*);
+    // A trailing changed run and separated unaligned endpoints still copy
+    // exactly the caller's bytes, leaving both outside sentinels untouched.
+    for (0..8) |index| _ = try space.trackGpuRead(base + index * page, page);
+    source[0] = 0x93;
+    source[source.len - 1] = 0xa4;
+    try testing.expectEqual(source.len - 2 * (page - 123), copyChangedGuestBytes(&space, destination, source));
+    try testing.expectEqualSlices(u8, source, destination);
+    for (1..7) |index| try testing.expect(space.gpuGeneration(base + index * page, page) != 0);
+    try testing.expectEqual(@as(u8, 0), @as(*const u8, @ptrFromInt(base + 122)).*);
+    try testing.expectEqual(@as(u8, 0), @as(*const u8, @ptrFromInt(base + 8 * page - 123)).*);
+}
 
 pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
     if (video_out.writeLabelMemory(address, bytes)) return true;
@@ -1254,9 +1338,15 @@ pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) b
             address, resolved, bytes.len, @returnAddress(), before, bytes[0..@min(bytes.len, 32)],
         });
     }
-    if (addressSpaceFromContext(context)) |space| space.notifyGuestWrite(resolved, bytes.len);
     const destination: [*]u8 = @ptrFromInt(resolved);
-    gpu.parallel_copy.guest_copy_pool.copy(destination[0..bytes.len], bytes);
+    if (bytes.len >= 64 * 1024 and @atomicLoad(bool, &skip_unchanged_guest_writes, .monotonic)) {
+        const unchanged = copyChangedGuestBytes(addressSpaceFromContext(context), destination[0..bytes.len], bytes);
+        _ = @atomicRmw(u64, &guest_write_compared_bytes, .Add, bytes.len, .monotonic);
+        _ = @atomicRmw(u64, &guest_write_unchanged_bytes, .Add, unchanged, .monotonic);
+    } else {
+        if (addressSpaceFromContext(context)) |space| space.notifyGuestWrite(resolved, bytes.len);
+        gpu.parallel_copy.guest_copy_pool.copy(destination[0..bytes.len], bytes);
+    }
     if (resolved != address) kernel_runtime.wakeSyncAddress(resolved, std.math.maxInt(usize));
     // A completion published from the HLE side is a label like any other, and
     // a queue may be parked on it inside a snapshotted arena.

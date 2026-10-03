@@ -9,6 +9,7 @@ const shaders = @import("shaders.zig");
 const scalar = @import("scalar_provenance.zig");
 const definitions = @import("index_bounds.zig");
 const checkpoints = @import("resource_checkpoints.zig");
+const bit_sets = @import("bit_sets.zig");
 
 /// Diagnostic switch sampled once per recovery, allowing same-process timing.
 pub var definition_cache_enabled = std.atomic.Value(bool).init(true);
@@ -57,7 +58,7 @@ pub fn appendMissingPointerLoads(
             else => continue,
         }
         const inst = candidate.*;
-        if (inst.pc >= prefix_end or inst.pc / 4 >= slots or seen.isSet(inst.pc / 4)) continue;
+        if (inst.pc >= prefix_end or inst.pc / 4 >= slots or bit_sets.contains(&seen, inst.pc / 4)) continue;
         const destination = scalar.scalarRegisterIndex(inst.dst) orelse continue;
         const pointer_register = scalar.scalarRegisterIndex(inst.src0) orelse continue;
         if (pointer_register >= 127 or inst.data_words == 0 or

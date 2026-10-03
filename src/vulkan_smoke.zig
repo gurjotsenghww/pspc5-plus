@@ -3747,6 +3747,11 @@ fn runInternalReleaseQueueProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runDeferredReleaseProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |device_backing| try runDeferredReleaseCase(allocator, device_backing);
+    std.debug.print("Deferred releases passed: host/device buffers precede interrupt labels, internal labels retain large outputs, failed writes withhold completion, CPU reuse survives later cache drains\n", .{});
+}
+
+fn runDeferredReleaseCase(allocator: std.mem.Allocator, device_backing: bool) !void {
     const Audit = struct {
         guest: SizedGuestMemory(512 * 1024) = .{},
         expected: u32 = 0,
@@ -3766,12 +3771,16 @@ fn runDeferredReleaseProbe(allocator: std.mem.Allocator) !void {
                     self.label_observed_correct_data = self.label_observed_correct_data and
                         std.mem.readInt(u32, self.guest.bytes[at..][0..4], .little) == self.expected + i;
                 }
+                self.label_observed_correct_data = self.label_observed_correct_data and
+                    std.mem.readInt(u32, self.guest.bytes[0x10000..][0..4], .little) == self.expected + 3;
             }
             return SizedGuestMemory(512 * 1024).write(&self.guest, address, bytes);
         }
     };
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = true, .defer_internal_releases = true });
     defer renderer.deinit();
+    renderer.device_storage_budget_bytes = if (device_backing) 16 * 1024 * 1024 else 0;
+    renderer.device_storage_min_bytes = 4;
     var audit = Audit{};
     const backend = renderer.dcbBackend(.{ .context = &audit, .read = Audit.read, .write = Audit.write });
     const code = [_]u32{ vop1(1, 0, 4), 0xe0700000, 0x80000000, 0xbf810000 };
@@ -3791,7 +3800,7 @@ fn runDeferredReleaseProbe(allocator: std.mem.Allocator) !void {
             for (words, 0..) |word, j|
                 try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(j)), word);
             _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
-            const before: u32 = if (i < 3 and round != 0) @intCast(100 * round + i) else 0;
+            const before: u32 = if (round != 0) @intCast(100 * round + i) else 0;
             try std.testing.expectEqual(before, std.mem.readInt(u32, audit.guest.bytes[address..][0..4], .little));
         }
         const release = gpu.state.ReleaseMem{
@@ -3807,6 +3816,14 @@ fn runDeferredReleaseProbe(allocator: std.mem.Allocator) !void {
             .interrupt_context_id = 0,
             .standard_packet = true,
         };
+        if (round == 0) {
+            var internal = release;
+            internal.interrupt = 0;
+            internal.address = 0x8100;
+            try std.testing.expect(backend.vtable.release.?(backend.context, internal));
+            try std.testing.expect(backend.vtable.drain_releases.?(backend.context));
+            try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, audit.guest.bytes[0x10000..][0..4], .little));
+        }
         if (round == 2) {
             // A cache event without a payload keeps the work resident; an
             // addressed event is a host-visible completion boundary.
@@ -3829,18 +3846,29 @@ fn runDeferredReleaseProbe(allocator: std.mem.Allocator) !void {
         if (round == 3) {
             // A failed output write must not expose the completion label.
             audit.reject_second_output = true;
-            try std.testing.expect(!backend.vtable.release.?(backend.context, release));
+            _ = backend.vtable.release.?(backend.context, release);
+            try std.testing.expect(!backend.vtable.drain_releases.?(backend.context));
             try std.testing.expect(!audit.label_observed_correct_data);
             try std.testing.expectEqual(@as(u64, round), std.mem.readInt(u64, audit.guest.bytes[0x8000..][0..8], .little));
             audit.reject_second_output = false;
         }
+        const before_completion = renderer.submitted_tick;
         try std.testing.expect(backend.vtable.release.?(backend.context, release));
+        try std.testing.expect(backend.vtable.drain_releases.?(backend.context));
+        if (device_backing and round == 1) {
+            // One producer submission and one shared readback, rather than
+            // one transfer/wait per independent output.
+            try std.testing.expect(renderer.submitted_tick - before_completion <= 2);
+        }
         try std.testing.expect(audit.label_observed_correct_data);
         try std.testing.expectEqual(@as(u64, round + 1), std.mem.readInt(u64, audit.guest.bytes[0x8000..][0..8], .little));
-        // Large outputs retain their existing explicit-readback policy.
-        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, audit.guest.bytes[0x10000..][0..4], .little));
+        try std.testing.expectEqual(audit.expected + 3, std.mem.readInt(u32, audit.guest.bytes[0x10000..][0..4], .little));
     }
-    std.debug.print("Deferred releases passed: small writes precede completion labels, addressed events publish outputs, failed writes withhold completion, large outputs stay resident\n", .{});
+    // The CPU may recycle this allocation as soon as it sees completion.
+    // A later cache drain must not publish an obsolete GPU snapshot over it.
+    audit.guest.word(0x10000, 0xc001cafe);
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqual(@as(u32, 0xc001cafe), std.mem.readInt(u32, audit.guest.bytes[0x10000..][0..4], .little));
 }
 
 fn runImageResinfoProbe(allocator: std.mem.Allocator) !void {
@@ -5152,24 +5180,40 @@ fn runLayeredVolumeProbe(allocator: std.mem.Allocator) !void {
             var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
             _ = try executor.execute(&.{ command(gpu.pm4.num_instances, 1), 32, command(gpu.pm4.draw_index_auto, 2), 3, 0 });
             if (renderer.last_draw_error) |err| return err;
-            try renderer.flushPendingGuestWrites();
             try std.testing.expectEqual(@as(usize, 1), renderer.render_targets.items.len);
             const target = renderer.render_targets.items[0].target;
             try std.testing.expectEqual(@as(u32, 32), target.layout.layers);
             const linear = try allocator.alloc(u8, @intCast(target.layout.staging_bytes));
             defer allocator.free(linear);
-            try target.layout.detile(guest.bytes[0x10000..], linear);
+            var sampled_volume = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_3d });
+            sampled_volume.address = 0x10000;
+            sampled_volume.width = 32;
+            sampled_volume.height = 32;
+            sampled_volume.depth_or_layers = 32;
+            sampled_volume.pitch = 32;
+            sampled_volume.tile_mode = @enumFromInt(tile_mode);
+            sampled_volume.unified_format = 56;
+            sampled_volume.extended = true;
+            sampled_volume.dst_select = .{ 4, 5, 6, 7 };
+            try renderer.probeResidentColorVolume(sampled_volume, linear);
             for (0..32) |z| for (0..32) |y| for (0..32) |x| {
                 const pixel = linear[((z * 32 + y) * 32 + x) * 4 ..][0..4];
                 const expected = [4]u8{ @intFromFloat(@round((@as(f32, @floatFromInt(x)) + 0.5) * 255 / 32)), @intFromFloat(@round((@as(f32, @floatFromInt(y)) + 0.5) * 255 / 32)), @intFromFloat(@round(@as(f32, @floatFromInt(z)) * 255 / 32)), 255 };
                 for (expected, pixel) |want, got| try std.testing.expect(@abs(@as(i16, want) - got) <= 1);
             };
+            try renderer.flushPendingGuestWrites();
+            const published = try allocator.alloc(u8, linear.len);
+            defer allocator.free(published);
+            try target.layout.detile(guest.bytes[0x10000..], published);
+            try std.testing.expectEqualSlices(u8, linear, published);
             // DCC clears recur every frame without writing the base surface.
             // They must clear every resident layer before additive volume draws.
             const metadata = try allocator.alloc(u8, @intCast((target.layout.required_source_bytes + 255) / 256));
             defer allocator.free(metadata);
             @memset(metadata, 0);
             try std.testing.expect(executor.backend.vtable.write(executor.backend.context, 0x3f0000, metadata));
+            try renderer.probeResidentColorVolume(sampled_volume, linear);
+            try std.testing.expect(std.mem.allEqual(u8, linear, 0));
             try renderer.flushPendingGuestWrites();
             try target.layout.detile(guest.bytes[0x10000..], linear);
             try std.testing.expect(std.mem.allEqual(u8, linear, 0));
@@ -5204,7 +5248,7 @@ fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {
     try runResetDepthExtentCase(allocator, false, false);
     try runResetDepthExtentCase(allocator, true, false);
     try runResetDepthExtentCase(allocator, false, true);
-    std.debug.print("Reset depth-only extents passed: viewport/scissor recovery, raster/MRTZ depth, absent PS with stale color, changing scalars and depth samples across the attachment\n", .{});
+    std.debug.print("Reset depth-only extents passed: viewport/scissor recovery, raster/MRTZ depth, absent/stale PS with stale color, changing scalars and depth samples across the attachment\n", .{});
 }
 
 fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool, no_fragment: bool) !void {
@@ -5240,7 +5284,10 @@ fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool, n
         };
         for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
         if (no_fragment) {
-            try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 0);
+            // A stale, unreadable PS must not be fetched when DB says none of
+            // its outputs or side effects are enabled. Raster depth survives.
+            try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), if (with_viewport) 0xdead else 0);
+            try state.writeRegister(.context, 0x203, 0);
             // A larger attachment and a live target mask retained from a prior
             // pass must not change the extent or receive this depth draw.
             const stale_color = [_][2]u32{
@@ -5250,7 +5297,10 @@ fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool, n
             for (stale_color) |entry| try state.writeRegister(.context, entry[0], entry[1]);
             @memset(guest.bytes[0xa000..0xe000], 0xa5);
         }
-        if (fragment_depth) try state.writeRegister(.context, 0x200, 6 | (7 << 4)); // ALWAYS permits rising and falling depth.
+        if (fragment_depth) {
+            try state.writeRegister(.context, 0x200, 6 | (7 << 4)); // ALWAYS permits rising and falling depth.
+            try state.writeRegister(.context, 0x203, 1); // Z_EXPORT_ENABLE retains the real PS.
+        }
         if (with_viewport) {
             for ([_]f32{ 16, 16, -16, 16, 1, 0 }, 0..) |value, i|
                 try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
@@ -8301,6 +8351,25 @@ fn runMippedColorProbe(allocator: std.mem.Allocator) !void {
         try runMippedColorCase(allocator, tracked, tiled);
 }
 
+fn runColorCubePublicationProbe(allocator: std.mem.Allocator) !void {
+    const Memory = SizedGuestMemory(4 * 1024 * 1024);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    for ([_]gpu.resources.TileMode{ .standard_4kb, .render_target }) |mode| {
+        guest.* = .{};
+        var renderer = try vulkan.Renderer.init(allocator, .{ .render_target_cache_limit = 64, .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        var memory = guest.interface();
+        guest.watch_generation = 1;
+        memory.fingerprint = Memory.fingerprint;
+        memory.track_gpu_read = Memory.track;
+        memory.gpu_generation = Memory.generation;
+        _ = renderer.dcbBackend(memory);
+        try renderer.probeColorCubePublication(0x10000, mode);
+    }
+    std.debug.print("colour cube publication passed: GPU producers and UINT consumers, six faces, eight mips, two revisions, 4/64 KiB tiles and watched backing\n", .{});
+}
+
 fn runMippedColorCase(allocator: std.mem.Allocator, tracked: bool, tiled: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -11169,6 +11238,29 @@ fn runBufferContentCacheSizeProbe(allocator: std.mem.Allocator, device_budget: u
     try renderer.readbackGuestStorageBuffer(output, &result);
     try std.testing.expectEqual(@as(u32, 0x0bad_f00d), std.mem.readInt(u32, &result, .little));
     try renderer.flushPendingGuestWrites();
+    // Publication invalidates CPU watches even when the published GPU bytes
+    // are bound unchanged. Rearm and compare the entire resident snapshot;
+    // equal CPU stores can reuse it, but a racing store must upload new data.
+    guest.watch_generation = 1;
+    renderer.guest_memory.?.track_gpu_read = Memory.track;
+    renderer.guest_memory.?.gpu_generation = Memory.generation;
+    const published_uploads = renderer.buffer_uploads;
+    _ = try renderer.stageGuestStorageBufferAt(0, source, size);
+    try std.testing.expectEqual(published_uploads, renderer.buffer_uploads);
+    guest.word(source + size - 4, 0x0bad_f00d);
+    _ = try renderer.stageGuestStorageBufferAt(0, source, size);
+    try std.testing.expectEqual(published_uploads, renderer.buffer_uploads);
+    guest.changed();
+    guest.write_after_fingerprint = source + size - 4;
+    _ = try renderer.stageGuestStorageBufferAt(0, source, size);
+    try std.testing.expect(renderer.buffer_uploads > published_uploads);
+    const resident = try allocator.alloc(u8, size);
+    defer allocator.free(resident);
+    try renderer.readbackGuestStorageBuffer(source, resident);
+    try std.testing.expectEqual(@as(u32, 0x1234_abcd), std.mem.readInt(u32, resident[size - 4 ..][0..4], .little));
+    renderer.guest_memory.?.track_gpu_read = null;
+    renderer.guest_memory.?.gpu_generation = null;
+    guest.watch_generation = 0;
     renderer.guest_memory.?.fingerprint = null;
     guest.word(source + size - 4, 0x0102_0304);
     _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
@@ -11205,7 +11297,7 @@ fn runBufferContentCacheSizeProbe(allocator: std.mem.Allocator, device_budget: u
     renderer.draw_batch_active = true;
     defer renderer.draw_batch_active = false;
     _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
-    try std.testing.expect(renderer.pending_command_buffers.items.len != 0);
+    try std.testing.expect(renderer.open_batch_commands or renderer.pending_command_buffers.items.len != 0);
     // Mirror normal draw/dispatch preparation: use a fresh descriptor set
     // while the preceding set remains referenced by an executable command.
     const next_set = renderer.descriptor_sets[renderer.descriptor_sets.len - 1];
@@ -11214,7 +11306,7 @@ fn runBufferContentCacheSizeProbe(allocator: std.mem.Allocator, device_budget: u
     const queued_uploads = renderer.buffer_uploads;
     _ = try renderer.stageGuestStorageBufferAt(0, source, size);
     try std.testing.expectEqual(queued_uploads, renderer.buffer_uploads);
-    try std.testing.expect(renderer.pending_command_buffers.items.len != 0);
+    try std.testing.expect(renderer.open_batch_commands or renderer.pending_command_buffers.items.len != 0);
     guest.word(source, 0xaabb_ccdd);
     _ = try renderer.stageGuestStorageBufferAt(0, source, size);
     try std.testing.expectEqual(queued_uploads + 1, renderer.buffer_uploads);
@@ -12637,6 +12729,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--mipped-color")) {
         try runMippedColorProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--color-cube-publication")) {
+        try runColorCubePublicationProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--srgb-color")) {

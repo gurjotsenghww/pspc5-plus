@@ -465,12 +465,55 @@ const TrackedGpuPage = struct {
 /// guest uses 16 KiB pages, so the tracker deliberately has the same
 /// granularity instead of hashing whole textures and buffers every draw.
 const GpuPageTracker = struct {
+    const region_shift = 21;
+    const RangeGeneration = struct {
+        first: u64 = 0,
+        end: u64 = 0,
+        epoch: u64 = 0,
+        region_epoch: u64 = 0,
+        fingerprint: u64 = 0,
+    };
     pages: std.AutoHashMapUnmanaged(u64, TrackedGpuPage) = .empty,
+    /// Positive queries remain valid until any tracked page changes. Guard
+    /// both range endpoints; collisions only replace an optimization entry.
+    range_generations: [2048]RangeGeneration = @splat(.{}),
+    // Coarse change epochs let a cached query survive writes to unrelated
+    // allocations. Hash collisions only cause extra page walks. The fault
+    // handler updates this fixed table without allocating or scanning ranges.
+    region_epochs: [4096]u64 = @splat(0),
     lock: Lock = .{},
     generation_counter: u64 = 1,
     enabled: bool = false,
     /// Watch-related host protection attempts, for diagnostics and native probes.
     protection_calls: u64 = 0,
+
+    fn rangeGenerationSlot(self: *GpuPageTracker, first: u64, end: u64) *RangeGeneration {
+        // GPU allocations commonly share 64 KiB or larger alignment. Mix the
+        // high page bits before indexing so those ranges can use every slot.
+        var key = (first / page_size) ^ (((end - first) / page_size) *% 0x9e3779b97f4a7c15);
+        key ^= key >> 30;
+        key *%= 0xbf58476d1ce4e5b9;
+        key ^= key >> 27;
+        key *%= 0x94d049bb133111eb;
+        key ^= key >> 31;
+        return &self.range_generations[key & (self.range_generations.len - 1)];
+    }
+
+    fn rememberRangeGeneration(self: *GpuPageTracker, first: u64, end: u64, fingerprint: u64) u64 {
+        const value = if (fingerprint == 0) 1 else fingerprint;
+        self.rangeGenerationSlot(first, end).* = .{ .first = first, .end = end, .epoch = self.generation_counter, .region_epoch = self.rangeRegionEpoch(first, end), .fingerprint = value };
+        return value;
+    }
+
+    fn rangeRegionEpoch(self: *const GpuPageTracker, first: u64, end: u64) u64 {
+        var region = first >> region_shift;
+        const last = (end - 1) >> region_shift;
+        if (last - region >= self.region_epochs.len) return self.generation_counter;
+        var newest: u64 = 0;
+        while (region <= last) : (region += 1)
+            newest = @max(newest, self.region_epochs[region & (self.region_epochs.len - 1)]);
+        return newest;
+    }
 
     fn protectRun(self: *GpuPageTracker, address: u64, end: u64, protection: Protection) Error!u64 {
         self.protection_calls +|= 1;
@@ -485,10 +528,15 @@ const GpuPageTracker = struct {
         return end;
     }
 
-    fn nextGeneration(self: *GpuPageTracker) u64 {
+    fn nextGeneration(self: *GpuPageTracker, page: u64) u64 {
         const next = @atomicLoad(u64, &self.generation_counter, .monotonic) +% 1;
         const value = if (next == 0) 1 else next;
         @atomicStore(u64, &self.generation_counter, value, .release);
+        if (next == 0) {
+            @memset(&self.range_generations, .{});
+            @memset(&self.region_epochs, 0);
+        }
+        self.region_epochs[(page >> region_shift) & (self.region_epochs.len - 1)] = value;
         return value;
     }
 
@@ -505,6 +553,10 @@ const GpuPageTracker = struct {
 pub const AddressSpace = struct {
     allocator: std.mem.Allocator,
     mappings: std.ArrayList(Mapping) = .empty,
+    // Indices are hints only: every use rechecks the current interval and its
+    // permissions while holding mutex. Insertions, splits and removals cannot
+    // make a stale hint authorize access to a former mapping.
+    access_mapping_hints: [32]usize = @splat(0),
     /// Host-owned pieces of the guest windows. Windows has permanent
     /// mappings such as KUSER_SHARED_DATA inside the low window, so ownership
     /// is intentionally a list of free extents rather than three booleans.
@@ -1112,6 +1164,16 @@ pub const AddressSpace = struct {
         defer tracker.lock.unlock();
         if (!tracker.enabled) return 0;
 
+        // A positive observation already proves that every writable page is
+        // armed. Unrelated writes need not walk and recheck this whole range.
+        const cached = tracker.rangeGenerationSlot(first_page, end_page);
+        if (cached.first == first_page and cached.end == end_page and
+            (cached.epoch == tracker.generation_counter or cached.region_epoch == tracker.rangeRegionEpoch(first_page, end_page)))
+        {
+            cached.epoch = tracker.generation_counter;
+            return cached.fingerprint;
+        }
+
         var fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
         var page = first_page;
         while (page < end_page) {
@@ -1120,7 +1182,7 @@ pub const AddressSpace = struct {
                 hostMappingViewSize(mapping.kind, mapping.address, mapping.size, mapping.backing_offset) > page_size;
             const result = try tracker.pages.getOrPut(self.allocator, page);
             if (!result.found_existing) result.value_ptr.* = .{
-                .generation = tracker.nextGeneration(),
+                .generation = tracker.nextGeneration(page),
                 .restore_protection = mapping.protection,
             };
             result.value_ptr.restore_protection = mapping.protection;
@@ -1142,7 +1204,7 @@ pub const AddressSpace = struct {
                 while (next_page < run_end) : (next_page += page_size) {
                     const next = try tracker.pages.getOrPut(self.allocator, next_page);
                     if (!next.found_existing) next.value_ptr.* = .{
-                        .generation = tracker.nextGeneration(),
+                        .generation = tracker.nextGeneration(next_page),
                         .restore_protection = mapping.protection,
                     };
                     next.value_ptr.restore_protection = mapping.protection;
@@ -1164,7 +1226,7 @@ pub const AddressSpace = struct {
                 page += page_size;
             }
         }
-        return if (fingerprint == 0) 1 else fingerprint;
+        return tracker.rememberRangeGeneration(first_page, end_page, fingerprint);
     }
 
     /// Epoch for caches of page-generation queries. A native write fault must
@@ -1185,6 +1247,13 @@ pub const AddressSpace = struct {
         tracker.lock.lock();
         defer tracker.lock.unlock();
         if (!tracker.enabled) return 0;
+        const cached = tracker.rangeGenerationSlot(first_page, end_page);
+        if (cached.first == first_page and cached.end == end_page and
+            (cached.epoch == tracker.generation_counter or cached.region_epoch == tracker.rangeRegionEpoch(first_page, end_page)))
+        {
+            cached.epoch = tracker.generation_counter;
+            return cached.fingerprint;
+        }
 
         var fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
         var page = first_page;
@@ -1196,7 +1265,7 @@ pub const AddressSpace = struct {
             fingerprint ^= tracked.generation;
             fingerprint *%= 0x100_0000_01b3;
         }
-        return if (fingerprint == 0) 1 else fingerprint;
+        return tracker.rememberRangeGeneration(first_page, end_page, fingerprint);
     }
 
     /// Invalidates tracked pages before an emulator/HLE write. Native guest
@@ -1236,7 +1305,7 @@ pub const AddressSpace = struct {
             while (page < run_end) : (page += page_size) {
                 const changed = tracker.pages.getPtr(page).?;
                 changed.armed = false;
-                changed.generation = tracker.nextGeneration();
+                changed.generation = tracker.nextGeneration(page);
             }
         }
     }
@@ -1262,7 +1331,7 @@ pub const AddressSpace = struct {
         }
         _ = tracker.protectRun(page, page + page_size, tracked.restore_protection) catch return false;
         tracked.armed = false;
-        tracked.generation = tracker.nextGeneration();
+        tracked.generation = tracker.nextGeneration(page);
         return true;
     }
 
@@ -1725,7 +1794,7 @@ pub const AddressSpace = struct {
         var page = first_page;
         while (page < end_page) : (page += page_size) {
             const removed = tracker.pages.fetchRemove(page) orelse continue;
-            _ = tracker.nextGeneration();
+            _ = tracker.nextGeneration(page);
             if (removed.value.armed) {
                 hostProtect(page, page_size, removed.value.restore_protection) catch {};
             }
@@ -1735,7 +1804,7 @@ pub const AddressSpace = struct {
     const RequiredPermission = enum { read, write };
 
     fn coversWithProtectionLocked(
-        self: *const AddressSpace,
+        self: *AddressSpace,
         address: u64,
         size: u64,
         required: RequiredPermission,
@@ -1746,9 +1815,18 @@ pub const AddressSpace = struct {
         // Mappings are ordered and non-overlapping. Checked GPU reads often
         // target an allocation near the end of thousands of streamed ranges;
         // start at that allocation instead of scanning all earlier mappings.
-        var first = self.insertionIndex(address);
-        if (first > 0 and self.mappings.items[first - 1].end() > address) first -= 1;
-        for (self.mappings.items[first..]) |mapping| {
+        const hint = &self.access_mapping_hints[((address >> 14) ^ (address >> 23)) % self.access_mapping_hints.len];
+        const first = find: {
+            if (hint.* < self.mappings.items.len) {
+                const mapping = &self.mappings.items[hint.*];
+                if (mapping.address <= address and address < mapping.end()) break :find hint.*;
+            }
+            var index = self.insertionIndex(address);
+            if (index > 0 and self.mappings.items[index - 1].end() > address) index -= 1;
+            hint.* = index;
+            break :find index;
+        };
+        for (self.mappings.items[first..]) |*mapping| {
             if (mapping.end() <= cursor) continue;
             if (mapping.address > cursor) return false;
             const allowed = switch (required) {
@@ -2893,6 +2971,22 @@ test "GPU page tracker advances generations on HLE and native writes" {
     const first_epoch = space.gpuTrackingEpoch();
     try testing.expect(first != 0);
     try testing.expectEqual(first, space.gpuGeneration(address, @intCast(2 * page_size)));
+    // Repeated and byte-shifted views of the same pages share the proof.
+    try testing.expectEqual(first, space.gpuGeneration(address + 8, @intCast(2 * page_size - 8)));
+    // Writes and unmapping in another coarse region preserve this allocation's
+    // observation, while the HLE/native writes below must still invalidate it.
+    const unrelated = address + 4 * 1024 * 1024;
+    try space.mapFixed(unrelated, page_size, .read_write, .private, null);
+    _ = try space.trackGpuRead(unrelated, page_size);
+    try space.write(unrelated, "other");
+    try testing.expectEqual(first, space.gpuGeneration(address, @intCast(2 * page_size)));
+    const protection_calls = space.gpu_tracker.protection_calls;
+    try testing.expectEqual(first, try space.trackGpuRead(address + 8, @intCast(2 * page_size - 8)));
+    try testing.expectEqual(protection_calls, space.gpu_tracker.protection_calls);
+    try space.unmap(unrelated, page_size);
+    try testing.expectEqual(first, space.gpuGeneration(address, @intCast(2 * page_size)));
+    // An unobserved neighbor must not inherit the cached shorter range.
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, @intCast(3 * page_size)));
 
     try space.write(address + 8, "changed");
     const after_hle_write = space.gpuGeneration(address, @intCast(2 * page_size));
@@ -3135,6 +3229,38 @@ test "permission lookup preserves gaps boundaries and adjacent protections" {
     try testing.expect(!space.isWritable(std.math.maxInt(u64) - 1, 4));
     space.mappings.items = &.{};
     try testing.expect(!space.isReadable(0x1008, 1));
+}
+
+test "permission hints recheck replaced mappings protections and shortened lists" {
+    var mappings = [_]Mapping{
+        .{ .address = 0x10000, .size = 0x4000, .protection = .read_write, .kind = .private },
+        .{ .address = 0x20000, .size = 0x4000, .protection = .read_write, .kind = .private },
+        .{ .address = 0x24000, .size = 0x4000, .protection = .read_write, .kind = .private },
+    };
+    var space = AddressSpace{ .allocator = testing.allocator, .mappings = .{ .items = &mappings, .capacity = mappings.len } };
+    // Populate hints at an interior point and across adjacent intervals.
+    try testing.expect(space.isWritable(0x20008, 8));
+    try testing.expect(space.isReadable(0x23ffc, 8));
+    mappings[1].protection = .read_only;
+    try testing.expect(space.isReadable(0x20008, 8));
+    try testing.expect(!space.isWritable(0x20008, 8));
+    try testing.expect(!space.isWritable(0x23ffc, 8));
+    mappings[1].protection = .none;
+    mappings[1].kind = .reserved;
+    try testing.expect(!space.isReadable(0x20008, 8));
+    // Removing the first entry shifts every remaining index. The replacement
+    // at the same address has no access, while its neighbor remains readable.
+    space.mappings.items = mappings[1..];
+    try testing.expect(!space.isReadable(0x20008, 8));
+    try testing.expect(space.isWritable(0x24008, 8));
+    space.mappings.items = mappings[2..];
+    try testing.expect(!space.isReadable(0x20008, 8));
+    try testing.expect(space.isReadable(0x24008, 8));
+    mappings[2].address = 0x30000;
+    try testing.expect(!space.isReadable(0x24008, 8));
+    try testing.expect(space.isWritable(0x30008, 8));
+    space.mappings.items = &.{};
+    try testing.expect(!space.isReadable(0x30008, 8));
 }
 
 test "large semantic reservation can span small host holes" {

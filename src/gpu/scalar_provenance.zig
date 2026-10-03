@@ -11,6 +11,7 @@
 const std = @import("std");
 const rdna2 = @import("rdna2");
 const shaders = @import("shaders.zig");
+const bit_sets = @import("bit_sets.zig");
 
 pub const maximum_scalar_registers = 128;
 // Dense lighting shaders contain more than 250 distinct scalar loads. Keep
@@ -138,7 +139,7 @@ const BranchSites = struct {
     }
 
     fn isSet(self: *const BranchSites, index: usize) bool {
-        return self.initialized and self.bits.isSet(index);
+        return self.initialized and bit_sets.contains(&self.bits, index);
     }
 
     fn set(self: *BranchSites, index: usize) void {
@@ -568,8 +569,10 @@ const RegisterCheckpointCollector = struct {
     seen: std.StaticBitSet(maximum_resource_instructions) = .initEmpty(),
     cursor: usize = 0,
     previous_pc: u32 = 0,
+    secondary: ?*RegisterCheckpointCollector = null,
 
     fn captureBefore(self: *RegisterCheckpointCollector, evaluation: *const Evaluation, pc: u32) void {
+        if (self.secondary) |collector| collector.captureBefore(evaluation, pc);
         // Most instructions move forward, often between the same two resource
         // sites. Search only when control flow jumps backwards; revisited
         // checkpoints still merge through the existing seen-bit semantics.
@@ -590,7 +593,7 @@ const RegisterCheckpointCollector = struct {
         // Their registers must come from reaching definitions, never from
         // whichever unrelated scalar values preceded the branch.
         if (low == self.pcs.len or self.pcs[low] != pc or low >= self.seen.capacity()) return;
-        if (!self.seen.isSet(low)) {
+        if (!bit_sets.contains(&self.seen, low)) {
             self.snapshots[low] = evaluation.registers;
             self.seen.set(low);
         } else {
@@ -603,6 +606,7 @@ const RegisterCheckpointCollector = struct {
     }
 
     fn finish(self: *RegisterCheckpointCollector, evaluation: *const Evaluation) void {
+        if (self.secondary) |collector| collector.finish(evaluation);
         // A checkpoint after END may query final state. Unvisited sites
         // inside the program remain unknown, including after an early stop.
         // Visited snapshots were initialized by their first capture. Clear
@@ -610,7 +614,7 @@ const RegisterCheckpointCollector = struct {
         for (self.pcs, self.snapshots, 0..) |pc, *snapshot, index| {
             if (evaluation.stop_reason == .end_program and pc > evaluation.stop_pc) {
                 snapshot.* = evaluation.registers;
-            } else if (index >= self.seen.capacity() or !self.seen.isSet(index)) {
+            } else if (index >= self.seen.capacity() or !bit_sets.contains(&self.seen, index)) {
                 snapshot.* = @splat(.{});
             }
         }
@@ -644,6 +648,27 @@ pub fn evaluateDecodedResourceStateAtCheckpointsInto(
     steps: ?[]const u32,
 ) void {
     evaluateResourceCheckpointsInto(result, reader, bindings, instructions, checkpoint_pcs, snapshots, steps, true);
+}
+
+/// Capture independent sampled/storage consumers and specialization history
+/// in the same full scalar walk. Each sorted checkpoint list retains its own
+/// skipped-block and revisited-register semantics.
+pub fn evaluateDecodedResourceStateAtTwoCheckpointsInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    first_pcs: []const u32,
+    first_snapshots: []ScalarRegisters,
+    second_pcs: []const u32,
+    second_snapshots: []ScalarRegisters,
+) void {
+    std.debug.assert(first_pcs.len == first_snapshots.len);
+    std.debug.assert(second_pcs.len == second_snapshots.len);
+    var second = RegisterCheckpointCollector{ .pcs = second_pcs, .snapshots = second_snapshots };
+    var first = RegisterCheckpointCollector{ .pcs = first_pcs, .snapshots = first_snapshots, .secondary = &second };
+    evaluateInto(result, reader, bindings, null, true, instructions, &first, null, true);
+    first.finish(result);
 }
 
 /// Resource discovery consumes the snapshots, not the specialization load
@@ -1866,6 +1891,23 @@ fn testResourceCheckpoints(
     try std.testing.expectEqual(complete.memory_read_failed, lightweight.memory_read_failed);
     try std.testing.expectEqual(complete.address_user_data_mask, lightweight.address_user_data_mask);
     try std.testing.expectEqual(@as(usize, 0), lightweight.load_count);
+    if (steps == null) {
+        // Two consumers may overlap and independently skip checkpoint sites.
+        // Reuse the regression cases for branches, loops and failed loads.
+        const second = try std.testing.allocator.alloc(ScalarRegisters, snapshots.len);
+        defer std.testing.allocator.free(second);
+        trace = .{ .source_reader = reader };
+        var shared: Evaluation = undefined;
+        evaluateDecodedResourceStateAtTwoCheckpointsInto(&shared, traced, bindings, instructions, pcs, without_history, pcs, second);
+        try std.testing.expectEqual(read_count, trace.count);
+        try std.testing.expectEqual(digest, trace.digest.final());
+        try std.testing.expectEqualDeep(snapshots, without_history);
+        try std.testing.expectEqualDeep(snapshots, second);
+        try std.testing.expectEqualDeep(complete.registers, shared.registers);
+        try std.testing.expectEqual(complete.stop_reason, shared.stop_reason);
+        try std.testing.expectEqual(complete.instruction_count, shared.instruction_count);
+        try std.testing.expectEqualDeep(complete.loadSlice(), shared.loadSlice());
+    }
     return complete;
 }
 
