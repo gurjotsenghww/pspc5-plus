@@ -628,5 +628,48 @@ synchronization validation. The existing wide-table fragment changes from
 5,272 to 4,071 SPIR-V words (22.8% smaller), with identical expected pixel
 results. The narrow-table case remains 3,493 words. This is a reduction in
 generated code, not a measured game FPS increase. The `16761f86ba35`
-ReleaseFast runner builds successfully and is undergoing an isolated game
-repeat with the same two-worker, warmup-disabled configuration.
+ReleaseFast runner builds successfully. Its repeat uses the same two-worker,
+warmup-disabled configuration and presents **37 frames in 30.043 seconds
+(1.232 FPS)** at the visible tree difficulty menu. The preceding 1.265 FPS
+sample differs by one frame; no performance improvement is demonstrated.
+
+The run reaches the close tree view and a subsequent incomplete 3D cinematic.
+Flip 1558 takes 63.711 seconds, including 60.006 seconds in compute work;
+flip 1560 takes 21.190 seconds, with graphics and compute pipeline creation
+accounting for 6.635 and 8.667 seconds respectively. These loading-frame costs
+are not a steady gameplay FPS measurement. Packed UNORM blending still rejects
+a six-attachment draw. The captured later tree view has major missing lighting
+and material detail; character control is not reached.
+
+![Incomplete post-tree cinematic in the sparse-region repeat](../images/yotei-sparse-post-tree-2026-10-04.png)
+
+The diagnostic guard stops the owned process after 1,158 seconds when system
+commit remains within 768 MiB of its limit for three samples. The final sample
+is 58,832,732,160 committed bytes against a 59,294,818,304-byte limit. This is a
+deliberate memory-pressure stop, not a spontaneous game crash. The later
+compute sample at `0xe74` is not observed before this stop, so this run does
+not prove that issue fixed.
+
+The local `zig-out/bin/game-run.exe` and matching PDB were updated to
+`16761f86ba356020f9902dc591c7bb6b6c7ee3f678102a968ccdb2714a14d02a`.
+The previous `58977d5e64d0` executable and PDB are retained under
+`out/yotei-gameplay-20261004/installed-backup-58977d5e64d0/`.
+Public release archives are unchanged.
+
+
+## Reusing immutable SMEM region headers
+
+Pointer-form scalar loads now read each captured region's base and live Vulkan
+range once in the shader entry block. These values are immutable during an
+invocation and dominate all branch and loop uses. Payload loads remain at their
+original instruction sites. A word's bounds predicate is also reused instead
+of rebuilding it after the load; split-region selection and zero outside a
+captured scalar range retain their previous behavior.
+
+ReleaseSafe `--scalar-pointers` verifies relocation, carry across 4 GiB,
+split reads, overlapping SOFFSET and a range that shrinks between dispatches
+without rebuilding the module. The 12 FLAT-material cases, 26 sparse-pointer
+cases and workgroup image table also pass with Khronos synchronization
+validation and no VUID or synchronization errors. The wide FLAT-material probe
+shrinks from 4,071 to 3,943 words; the narrow version changes from 3,493 to
+3,365. These code-size results do not establish a game FPS improvement.

@@ -63,6 +63,7 @@ pub const StorageBufferBinding = struct {
 /// the captured guest base address (low/high words), followed by its bytes.
 /// Keeping the base in the buffer allows the same pipeline to serve changing
 /// guest allocations. Several regions may serve one load instruction.
+/// The captured base and descriptor range are immutable during the invocation.
 pub const ScalarMemoryBinding = struct {
     resource_sgpr: u32,
     instruction_pc: u32,
@@ -952,6 +953,7 @@ const Builder = struct {
     bvh_intersection_mode1: bool,
     snapshot_unbound_reads: bool,
     flat_memory_headers: std.ArrayList([3]u32) = .empty,
+    scalar_memory_headers: std.AutoHashMapUnmanaged(u32, struct { base: [2]u32, extent: u32 }) = .empty,
     sampled_bindings: []const SampledImageBinding,
     storage_image_bindings: []const StorageImageBinding,
     ngg_lds_exports: []const NggLdsExport,
@@ -1769,6 +1771,7 @@ const Builder = struct {
         self.lane_spills.deinit(self.allocator);
         self.private_spills.deinit(self.allocator);
         self.flat_memory_headers.deinit(self.allocator);
+        self.scalar_memory_headers.deinit(self.allocator);
     }
 
     fn id(self: *Builder) u32 {
@@ -4667,6 +4670,20 @@ const Builder = struct {
     }
 
     fn initializeStageInputs(self: *Builder) Error!void {
+        // Many SMEM instructions and branch arms share the same captured
+        // region. Its base and live descriptor range are immutable for this
+        // invocation; entry-block IDs dominate every use, including loops.
+        // Payload reads remain at their original instruction sites.
+        for (self.scalar_memory_bindings) |region| {
+            if (self.scalar_memory_headers.contains(region.descriptor_index)) continue;
+            const header = BufferAddress{
+                .binding = .{ .resource_sgpr = 0, .descriptor_index = region.descriptor_index },
+                .byte_offset = try self.constant(.bits32, 0),
+            };
+            const extent = try self.bufferExtent(header);
+            const base = [2]u32{ try self.loadBufferWord(header, 0), try self.loadBufferWord(header, 1) };
+            try self.scalar_memory_headers.put(self.allocator, region.descriptor_index, .{ .base = base, .extent = extent });
+        }
         // Snapshot address/length headers are immutable during the dispatch.
         // Load them in the entry block so all FLAT sites and loop iterations
         // can share these IDs, including sites on different branch paths.
@@ -8445,17 +8462,16 @@ const Builder = struct {
         return address;
     }
 
-    /// Whether a word access lies inside the descriptor's live Vulkan range.
-    /// Keeping the range dynamic prevents streamed buffer sizes from becoming
-    /// part of the generated module (and consequently the pipeline cache key).
-    fn wordInRange(self: *Builder, address: BufferAddress, delta: u32) Error!?u32 {
-        if (self.storage_array == 0 or self.storage_block_pointer_type == 0) return null;
+    fn bufferExtent(self: *Builder, address: BufferAddress) Error!u32 {
+        if (address.descriptor_index == null) {
+            if (self.scalar_memory_headers.get(address.binding.descriptor_index)) |header| return header.extent;
+        }
         // Query the descriptor's live range. Baking `extent_bytes` into SPIR-V
         // makes an otherwise identical shader a new pipeline whenever a sprite
         // batch contains a different number of vertices.
         const descriptor = address.descriptor_index orelse try self.constant(.bits32, address.binding.descriptor_index);
         const cached = &self.buffer_extents[descriptor % self.buffer_extents.len];
-        const extent = if (cached.descriptor == descriptor) cached.extent else blk: {
+        return if (cached.descriptor == descriptor) cached.extent else blk: {
             const block_pointer = self.id();
             try self.emit(&self.body, 65, &.{ self.storage_block_pointer_type, block_pointer, self.storage_array, descriptor });
             if (address.descriptor_index != null) try self.emit(&self.annotations, 71, &.{ block_pointer, 5300 });
@@ -8466,6 +8482,14 @@ const Builder = struct {
             cached.* = .{ .descriptor = descriptor, .extent = extent };
             break :blk extent;
         };
+    }
+
+    /// Whether a word access lies inside the descriptor's live Vulkan range.
+    /// Keeping the range dynamic prevents streamed buffer sizes from becoming
+    /// part of the generated module (and consequently the pipeline cache key).
+    fn wordInRange(self: *Builder, address: BufferAddress, delta: u32) Error!?u32 {
+        if (self.storage_array == 0 or self.storage_block_pointer_type == 0) return null;
+        const extent = try self.bufferExtent(address);
         // The last byte this word touches, so a word straddling the end counts
         // as outside rather than half inside.
         const last = try self.addBits(address.byte_offset, try self.constant(.bits32, delta * 4 + 3));
@@ -8789,9 +8813,9 @@ const Builder = struct {
             for (self.scalar_memory_bindings) |binding| {
                 if (binding.instruction_pc != inst.pc or binding.resource_sgpr != pointer_register) continue;
                 const host_binding = StorageBufferBinding{ .resource_sgpr = binding.resource_sgpr, .descriptor_index = binding.descriptor_index };
-                const header = BufferAddress{ .binding = host_binding, .byte_offset = zero };
-                const base_low = try self.loadBufferWord(header, 0);
-                const base_high = try self.loadBufferWord(header, 1);
+                const header = self.scalar_memory_headers.get(binding.descriptor_index).?;
+                const base_low = header.base[0];
+                const base_high = header.base[1];
                 for (addresses[0..inst.data_words], 0..) |address, word| {
                     const relative = self.id();
                     try self.emit(&self.body, 130, &.{ self.bits_type, relative, address[0], base_low }); // OpISub
@@ -8806,10 +8830,12 @@ const Builder = struct {
                     try self.emit(&self.body, 167, &.{ self.bool_type, in_region, high_matches, above_base });
                     const valid = self.id();
                     try self.emit(&self.body, 167, &.{ self.bool_type, valid, in_region, no_wrap });
-                    const loaded = try self.loadBufferWord(.{ .binding = host_binding, .byte_offset = after_header }, 0);
+                    const access = try self.bufferWordAccess(.{ .binding = host_binding, .byte_offset = after_header }, 0);
+                    const loaded = self.id();
+                    try self.emit(&self.body, 61, &.{ self.bits_type, loaded, access.pointer });
                     // A page that does not contain this word must not replace
                     // a value recovered from another page of a split load.
-                    const within = (try self.wordInRange(.{ .binding = host_binding, .byte_offset = after_header }, 0)).?;
+                    const within = access.in_range.?;
                     const selected = self.id();
                     try self.emit(&self.body, 167, &.{ self.bool_type, selected, valid, within });
                     const result = self.id();

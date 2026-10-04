@@ -10419,8 +10419,13 @@ fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
             .{ 11, 12, 13, 20 }, .{ 13, 20, 21, 22 }, .{ 0, 0, 0, 0 },
             .{ 22, 23, 0, 0 },   .{ 0, 0, 0, 0 },     .{ 0, 0, 0, 0 },
         };
-        for (0..2) |pass| {
-            const relocation = @as(u64, @intCast(pass)) << 36;
+        const truncated = [_][4]u32{
+            .{ 11, 0, 0, 20 }, .{ 0, 20, 21, 0 }, .{ 0, 0, 0, 0 },
+            .{ 0, 0, 0, 0 },   .{ 0, 0, 0, 0 },   .{ 0, 0, 0, 0 },
+        };
+        for (0..4) |pass| {
+            const relocation = @as(u64, @intCast(pass / 2)) << 36;
+            const short = pass % 2 != 0;
             for (pointers, 0..) |pointer, index| {
                 const value = pointer + relocation;
                 guest.word(0x10000 + index * 8, @truncate(value));
@@ -10434,12 +10439,12 @@ fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
             }
             _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, pointers.len * 8);
             _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, pointers.len * 16);
-            _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 24);
-            _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, 24);
+            _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, if (short) 16 else 24);
+            _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, if (short) 16 else 24);
             _ = try renderer.dispatchSpirv(module.words, .{ pointers.len, 1, 1 });
             var output: [pointers.len * 16]u8 = undefined;
             try renderer.readbackGuestStorageBuffer(0x11000, &output);
-            for (expected, 0..) |words, index| for (words, 0..) |word, component| {
+            for (if (short) truncated else expected, 0..) |words, index| for (words, 0..) |word, component| {
                 try std.testing.expectEqual(word, std.mem.readInt(u32, output[index * 16 + component * 4 ..][0..4], .little));
             };
         }
@@ -10493,7 +10498,7 @@ fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
     for ([_]u32{ 13, 14, 0, 0 }, 0..) |expected_word, index| {
         try std.testing.expectEqual(expected_word, std.mem.readInt(u32, overlapping_output[index * 4 ..][0..4], .little));
     }
-    std.debug.print("scalar pointer loads passed: runtime pointers, split regions, 32-bit carry, bounds, overlapping SOFFSET and relocated bases\n", .{});
+    std.debug.print("scalar pointer loads passed: runtime pointers, split regions, 32-bit carry, shrinking live bounds, overlapping SOFFSET and relocated bases\n", .{});
 }
 
 fn runIndexedImageProbe(allocator: std.mem.Allocator) !void {
