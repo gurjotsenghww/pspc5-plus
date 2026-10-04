@@ -593,3 +593,40 @@ pixel value. All 26 existing sparse-pointer/sampler cases, the workgroup image
 table and deferred FLAT-fault probes pass with Khronos synchronization
 validation, without VUID or synchronization errors. The game repeat uses
 two compiler workers and `PS5_GPU_COMPUTE_WARMUP=0` from launch.
+
+That repeat presents 38 frames in 30.047 seconds at the tree (1.265 FPS).
+Different cache history prevents attributing the difference from 1.165 FPS
+to this change alone. The transition reaches a close view of the tree and a
+dark cinematic. The former fragment rejection at `0x748` does not recur in
+the observed log, but this does not establish correct character rendering.
+The compute sample at `0xe74` still rejects an implausible texture, and packed
+UNORM blending still rejects draws. A 60.092-second cinematic interval presents
+no new frame while first-use work is pending; it is not a warmed gameplay
+measurement. The owned run is deliberately stopped after 1,493 seconds.
+
+## Sparse material indices and merged memory regions
+
+The pointer-table analysis previously visited every texture index below an
+upper bound. A masked index read from a material buffer can instead select
+only a few of those records. Intermediate records may hold ordinary constants,
+including bit patterns that superficially resemble image descriptors. The
+resolver now rereads and deduplicates the possible masked values, retaining
+zero when the source buffer can be read out of bounds. Invalid selected tuples
+still require an execution-time check. Focused tests cover holes, changed
+payloads, source bounds, invalid selections and unavailable memory.
+
+Adjacent captured SMEM pages now share a checked region. The renderer sorts
+their addresses and copies the already captured bytes; it neither fills gaps
+nor reads extra guest pages. Regions remain separate across 4 GiB boundaries.
+The FLAT snapshots share those merged ranges, so an unaligned word can span
+two captured pages while the same read with the second page absent still
+reports a fault. Scratch storage is reused between preparations.
+
+Twelve native FLAT material cases, all 26 sparse-pointer/sampler cases, the
+workgroup image table and deferred-fault probes pass with Khronos
+synchronization validation. The existing wide-table fragment changes from
+5,272 to 4,071 SPIR-V words (22.8% smaller), with identical expected pixel
+results. The narrow-table case remains 3,493 words. This is a reduction in
+generated code, not a measured game FPS increase. The `16761f86ba35`
+ReleaseFast runner builds successfully and is undergoing an isolated game
+repeat with the same two-worker, warmup-disabled configuration.

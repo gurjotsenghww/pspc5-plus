@@ -12025,7 +12025,7 @@ fn runSparsePointerFragmentProbe(allocator: std.mem.Allocator, flat_reads: bool)
     for ([_]bool{ false, true }) |dynamic_sampler| {
         if (flat_reads and dynamic_sampler) continue;
         for ([_]bool{ false, true }) |wide| {
-            for (0..@as(usize, if (dynamic_sampler) 8 else 5)) |selection| {
+            for (0..@as(usize, if (dynamic_sampler) 8 else if (flat_reads) 6 else 5)) |selection| {
                 var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
                 defer renderer.deinit();
                 var guest = GuestMemory{};
@@ -12054,25 +12054,25 @@ fn runSparsePointerFragmentProbe(allocator: std.mem.Allocator, flat_reads: bool)
                     vop1(1, 30, 16),  vop1(2, 24, 286),
                     0x8718_ff18, records - 1, // bound the material index
                     0x931a_ff18, 32,
-                    0xf40c_0006,                                                                                     26 << 25, // T#s0 from pointer s12:s13 plus s26
+                    0xf40c_0006,                                                                                                                  26 << 25, // T#s0 from pointer s12:s13 plus s26
                     // A two-record S# table, with possible out-of-bounds selectors.
-                    if (dynamic_sampler) vop1(1, 31, 17) else 0xbf80_0000,                                           if (dynamic_sampler) vop1(2, 26, 287) else 0xbf80_0000,
-                    if (dynamic_sampler) sop2(0x0e, 26, 26, 131) else 0xbf80_0000,                                   if (dynamic_sampler) sop2(0x26, 26, 26, 160) else 0xbf80_0000,
-                    if (dynamic_sampler) 0xf428_020a else 0xbf80_0000,                                               if (dynamic_sampler) (26 << 25) | 16 else 0xbf80_0000,
-                    vop1(1, 0, 240),                                                                                 vop1(1, 1, 240),
-                    vop1(1, 2, 240),                                                                                 vop1(1, 4, 128),
-                    vop1(1, 5, 128),                                                                                 vop1(1, 6, 128),
-                    if (inactive) sop1(4, 126, 128) else 0xbf80_0000,                                                0xf09c_0f08,
-                    0x0040_0400,                                                                                     if (inactive) sop1(4, 126, 193) else 0xbf80_0000,
+                    if (dynamic_sampler) vop1(1, 31, 17) else 0xbf80_0000,                                                                        if (dynamic_sampler) vop1(2, 26, 287) else 0xbf80_0000,
+                    if (dynamic_sampler) sop2(0x0e, 26, 26, 131) else 0xbf80_0000,                                                                if (dynamic_sampler) sop2(0x26, 26, 26, 160) else 0xbf80_0000,
+                    if (dynamic_sampler) 0xf428_020a else 0xbf80_0000,                                                                            if (dynamic_sampler) (26 << 25) | 16 else 0xbf80_0000,
+                    vop1(1, 0, 240),                                                                                                              vop1(1, 1, 240),
+                    vop1(1, 2, 240),                                                                                                              vop1(1, 4, 128),
+                    vop1(1, 5, 128),                                                                                                              vop1(1, 6, 128),
+                    if (inactive) sop1(4, 126, 128) else 0xbf80_0000,                                                                             0xf09c_0f08,
+                    0x0040_0400,                                                                                                                  if (inactive) sop1(4, 126, 193) else 0xbf80_0000,
                     // FLAT and pointer-form SMEM use the same captured page.
                     // An unrelated mapped guest address must still fault if
                     // it is absent from that bounded shader snapshot.
-                    if (flat_reads) vop1(1, 8, if (selection == 2 or selection == 3) 255 else 276) else 0xbf80_0000, if (flat_reads and (selection == 2 or selection == 3)) 0x40000 else 0xbf80_0000,
-                    if (flat_reads) vop1(1, 9, 277) else 0xbf80_0000,                                                if (flat_reads and inactive) sop1(4, 126, 128) else 0xbf80_0000,
-                    if (flat_reads) 0xdc30_8000 | @as(u32, if (selection == 4) 0x701 else 0x700) else 0xbf80_0000,   if (flat_reads) 0x047d_0008 else 0xbf80_0000,
-                    if (flat_reads and inactive) sop1(4, 126, 193) else 0xbf80_0000,                                 if (flat_reads) vop1(1, 5, 128) else 0xbf80_0000,
-                    if (flat_reads) vop1(1, 6, 128) else 0xbf80_0000,                                                vop1(1, 7, 242),
-                    0xf800_080f,                                                                                     0x0706_0504,
+                    if (flat_reads) vop1(1, 8, if (selection == 2 or selection == 3 or selection == 5) 255 else 276) else 0xbf80_0000,            if (flat_reads and selection == 5) 0x19000 else if (flat_reads and (selection == 2 or selection == 3)) 0x40000 else 0xbf80_0000,
+                    if (flat_reads) vop1(1, 9, 277) else 0xbf80_0000,                                                                             if (flat_reads and inactive) sop1(4, 126, 128) else 0xbf80_0000,
+                    if (flat_reads) 0xdc30_8000 | @as(u32, if (selection == 5) 0xffd else if (selection == 4) 0x701 else 0x700) else 0xbf80_0000, if (flat_reads) 0x047d_0008 else 0xbf80_0000,
+                    if (flat_reads and inactive) sop1(4, 126, 193) else 0xbf80_0000,                                                              if (flat_reads) vop1(1, 5, 128) else 0xbf80_0000,
+                    if (flat_reads) vop1(1, 6, 128) else 0xbf80_0000,                                                                             vop1(1, 7, 242),
+                    0xf800_080f,                                                                                                                  0x0706_0504,
                     0xbf81_0000,
                 };
                 for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
@@ -12095,6 +12095,13 @@ fn runSparsePointerFragmentProbe(allocator: std.mem.Allocator, flat_reads: bool)
                     // so its remaining words cannot describe a false image.
                     for (0..8) |word| guest.word(0x18700 + word * 4, 0);
                     guest.word(0x18700 + @as(usize, if (selection == 4) 1 else 0), @bitCast(@as(f32, if (selection == 1) 1 else if (selection == 4) 0.25 else 0.5)));
+                    if (selection == 5) {
+                        // An unaligned word spans adjacent captured pages.
+                        // The narrow table captures only the first page, so
+                        // the same access must still report a missing read.
+                        for (0..16) |word| guest.word(0x18fe0 + word * 4, 0);
+                        guest.word(0x18ffd, @bitCast(@as(f32, 0.25)));
+                    }
                 }
                 var state = gpu.State{};
                 for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, address| {
@@ -12118,7 +12125,7 @@ fn runSparsePointerFragmentProbe(allocator: std.mem.Allocator, flat_reads: bool)
                     try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
                 var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
                 _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
-                if (flat_reads and selection == 2) {
+                if (flat_reads and (selection == 2 or (selection == 5 and !wide))) {
                     try std.testing.expectEqual(error.GuestMemoryReadFailed, renderer.last_draw_error.?);
                 } else if (!flat_reads and (selection == 3 or selection == 5 or selection == 7)) {
                     try std.testing.expectEqual(error.UnsupportedSampledImage, renderer.last_draw_error.?);
@@ -12130,7 +12137,7 @@ fn runSparsePointerFragmentProbe(allocator: std.mem.Allocator, flat_reads: bool)
                         0xff00_0000 | @as(u32, switch (selection) {
                             0 => 128,
                             1 => 255,
-                            4 => 64,
+                            4, 5 => 64,
                             else => 0,
                         })
                     else if (selection == 0) 0xff00_00ff else if (selection == 1) 0xffff_0000 else 0xff00_0000;

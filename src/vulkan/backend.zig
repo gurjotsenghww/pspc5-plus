@@ -5186,6 +5186,7 @@ pub const Renderer = struct {
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
     guest_frame_scratch: std.ArrayList(u8) = .empty,
+    scalar_pointer_pages_scratch: ?*[maximum_storage_descriptors][4096]u8 = null,
     packed_clear_staging: PackedClearStaging = .{},
     // A movie converts a new frame every time one is presented, and its three
     // working buffers are large and identically sized from one frame to the
@@ -6325,6 +6326,7 @@ pub const Renderer = struct {
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
         self.completed_frames.deinit(self.allocator);
         self.guest_frame_scratch.deinit(self.allocator);
+        if (self.scalar_pointer_pages_scratch) |scratch| self.allocator.destroy(scratch);
         self.packed_clear_staging.deinit(self.allocator);
         self.movie_luma_scratch.deinit(self.allocator);
         self.movie_chroma_scratch.deinit(self.allocator);
@@ -10973,6 +10975,11 @@ pub const Renderer = struct {
         var pages: [maximum_storage_descriptors]u64 = undefined;
         var slots: [maximum_storage_descriptors]u32 = undefined;
         var page_count: usize = 0;
+        var captured: ?*[maximum_storage_descriptors][4096]u8 = null;
+        defer if (captured) |scratch| {
+            if (self.scalar_pointer_pages_scratch) |nested| self.allocator.destroy(nested);
+            self.scalar_pointer_pages_scratch = scratch;
+        };
         var table_loads: [maximum_storage_mappings]u32 = undefined;
         var table_load_count: usize = 0;
         const instructions = analysis.program.instructions.items;
@@ -11023,27 +11030,55 @@ pub const Renderer = struct {
                     var bytes: [4096]u8 = undefined;
                     if (flat_reads) try self.flushGuestStorageRange(page, bytes.len);
                     reader.read(page, &bytes) catch continue;
-                    const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
                     if (page_count == pages.len) return Error.InvalidStorageDescriptor;
-                    const upload = try self.allocateDrawUpload(bytes.len + 8);
-                    const mapping = try self.mapDrawUpload(upload);
-                    defer mapping.release(self);
-                    const destination = mapping.bytes;
-                    std.mem.writeInt(u64, destination[0..8], page, .little);
-                    @memcpy(destination[8..], &bytes);
-                    self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, upload.size);
-                    self.active_descriptor_set = self.descriptor_set;
-                    result.occupied[slot] = true;
+                    if (captured == null) {
+                        captured = self.scalar_pointer_pages_scratch orelse try self.allocator.create([maximum_storage_descriptors][4096]u8);
+                        self.scalar_pointer_pages_scratch = null;
+                    }
                     pages[page_count] = page;
-                    slots[page_count] = slot;
+                    captured.?[page_count] = bytes;
                     page_count += 1;
-                    self.frame_profile.upload_bytes +%= destination.len;
-                    self.frame_profile.storage_upload_bytes +%= destination.len;
-                    if (flat_reads) try self.stageFlatMaterialPage(result, page, &bytes);
                 }
             }
         }
         if (page_count == 0) return;
+        // Adjacent captured pages share one checked region. This reduces the
+        // generated per-word descriptor branches without expanding the guest
+        // footprint or rereading mutable memory. Gaps and 4 GiB boundaries
+        // remain separate, matching SMEM's high-word comparison.
+        var order: [maximum_storage_descriptors]usize = undefined;
+        for (order[0..page_count], 0..) |*index, i| index.* = i;
+        std.sort.block(usize, order[0..page_count], pages[0..page_count], struct {
+            fn lessThan(addresses: []const u64, a: usize, b: usize) bool {
+                return addresses[a] < addresses[b];
+            }
+        }.lessThan);
+        var first: usize = 0;
+        var region_count: usize = 0;
+        while (first < page_count) {
+            const base = pages[order[first]];
+            var end = first + 1;
+            while (end < page_count and pages[order[end]] == pages[order[end - 1]] + 4096 and
+                pages[order[end]] >> 32 == base >> 32) : (end += 1)
+            {}
+            const size = (end - first) * 4096;
+            const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            const upload = try self.allocateDrawUpload(size + 8);
+            const mapping = try self.mapDrawUpload(upload);
+            defer mapping.release(self);
+            std.mem.writeInt(u64, mapping.bytes[0..8], base, .little);
+            for (order[first..end], 0..) |page_index, index|
+                @memcpy(mapping.bytes[8 + index * 4096 ..][0..4096], &captured.?[page_index]);
+            self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, upload.size);
+            self.active_descriptor_set = self.descriptor_set;
+            result.occupied[slot] = true;
+            slots[region_count] = slot;
+            region_count += 1;
+            self.frame_profile.upload_bytes +%= upload.size;
+            self.frame_profile.storage_upload_bytes +%= upload.size;
+            if (flat_reads) try self.stageFlatMaterialPage(result, base, mapping.bytes[8..]);
+            first = end;
+        }
         // All pointer loads can consult this captured address space, including
         // a dynamic offset into a page discovered by a neighbouring load.
         // The shader checks both address halves and each word's buffer range.
@@ -11058,7 +11093,7 @@ pub const Renderer = struct {
             const registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc);
             if (registers[pointer_register].known and registers[pointer_register + 1].known and
                 std.mem.indexOfScalar(u32, table_loads[0..table_load_count], inst.pc) == null) continue;
-            for (slots[0..page_count]) |slot| {
+            for (slots[0..region_count]) |slot| {
                 if (result.scalar_memory_count == result.scalar_memories.len) return Error.InvalidStorageDescriptor;
                 result.scalar_memories[result.scalar_memory_count] = .{ .resource_sgpr = @intCast(pointer_register), .instruction_pc = inst.pc, .descriptor_index = slot };
                 result.scalar_memory_count += 1;
@@ -11066,7 +11101,7 @@ pub const Renderer = struct {
         }
     }
 
-    fn stageFlatMaterialPage(self: *Renderer, result: *ComputeResources, address: u64, bytes: *const [4096]u8) anyerror!void {
+    fn stageFlatMaterialPage(self: *Renderer, result: *ComputeResources, address: u64, bytes: []const u8) anyerror!void {
         const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
         if (result.flat_memory_count == result.flat_memories.len) return Error.InvalidStorageDescriptor;
         const first = result.flat_memory_count == 0;
@@ -11075,14 +11110,14 @@ pub const Renderer = struct {
         defer mapping.release(self);
         std.mem.writeInt(u64, mapping.bytes[0..8], address, .little);
         std.mem.writeInt(u32, mapping.bytes[8..12], 0, .little);
-        std.mem.writeInt(u32, mapping.bytes[12..16], bytes.len, .little);
+        std.mem.writeInt(u32, mapping.bytes[12..16], @intCast(bytes.len), .little);
         @memcpy(mapping.bytes[16..][0..bytes.len], bytes);
         if (first) @memset(mapping.bytes[16 + bytes.len ..], 0);
         self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, upload.size);
         result.occupied[slot] = true;
         result.flat_memories[result.flat_memory_count] = .{
             .descriptor_index = slot,
-            .fault_record_word = if (first) (16 + bytes.len) / 4 else null,
+            .fault_record_word = if (first) @intCast((16 + bytes.len) / 4) else null,
         };
         result.flat_memory_count += 1;
         if (first) result.flat_memory_fault = .{ .buffer = upload.buffer, .offset = upload.offset + 8, .size = upload.size - 8 };
@@ -35644,7 +35679,14 @@ const BufferDescriptorCandidates = struct {
     }
 };
 
-const ScalarPointerTablePlan = struct { base: u64, first: u64, step: u32, count: u32 };
+const MaskedBufferIndexPlan = struct { table: BufferTablePlan, mask: u32 };
+const ScalarPointerTablePlan = struct {
+    base: u64,
+    first: u64,
+    step: u32,
+    count: u32,
+    indices: ?MaskedBufferIndexPlan = null,
+};
 
 /// A scalar DWORD index buffer may vary by workgroup or loop iteration. Its
 /// complete, small payload still gives a uniform upper bound for every load,
@@ -35683,14 +35725,14 @@ fn loadedScalarIndexUpperBound(
     return std.math.add(u32, maximum, 1) catch null;
 }
 
-fn maskedBufferIndexUpperBound(
+fn maskedBufferIndexPlan(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
     scalar: *const gpu.scalar_provenance.ScalarRegisters,
     before: usize,
     register: u32,
-) anyerror!?u32 {
+) anyerror!?MaskedBufferIndexPlan {
     const instructions = analysis.program.instructions.items;
     const definition = analysis.scalarDefinition(before, register) orelse return null;
     const index = switch (definition) {
@@ -35706,12 +35748,17 @@ fn maskedBufferIndexUpperBound(
     if (literal.kind != .integer_inline_constant and literal.kind != .literal_constant) return null;
     const source = gpu.scalar_provenance.scalarRegisterIndex(if (immediate_first) mask.src1 else mask.src0) orelse return null;
     const plan = (resolveBufferTablePlan(reader, analysis, scalar, @intCast(source), 1, mask.pc, bindings, 16384) catch return null) orelse return null;
+    return .{ .table = plan, .mask = literal.value };
+}
+
+fn maskedBufferIndexUpperBound(reader: gpu.ShaderMemoryReader, indexed: MaskedBufferIndexPlan) ?u32 {
+    const plan = indexed.table;
     var maximum: u32 = 0;
     var offset = plan.first;
     while (offset < plan.limit) : (offset += plan.step) {
         const byte = offset & ~@as(u64, 3);
         const word = if (byte + 4 <= plan.buffer.size_bytes) reader.readU32(plan.buffer.address + byte) catch return null else 0;
-        maximum = @max(maximum, word & literal.value);
+        maximum = @max(maximum, word & indexed.mask);
     }
     return std.math.add(u32, maximum, 1) catch null;
 }
@@ -35781,8 +35828,10 @@ fn scalarPointerTablePlan(
     var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar, .definition_cache = analysis.scalar_definitions };
     var count = analysis.scalarIndexUpperBound(multiply_index, @intCast(source)) orelse
         (try uniformScalarLoopUpperBound(bindings, reader, analysis, scalar, multiply_index, @intCast(source))) orelse return null;
-    if (try maskedBufferIndexUpperBound(bindings, reader, analysis, scalar, multiply_index, @intCast(source))) |bound|
+    const indexed = try maskedBufferIndexPlan(bindings, reader, analysis, scalar, multiply_index, @intCast(source));
+    if (indexed) |indices| if (maskedBufferIndexUpperBound(reader, indices)) |bound| {
         count = @min(count, bound);
+    };
     if (step == 0 or count == 0 or count > 16384) return null;
     const first = @as(u64, @intCast(load.memory_offset)) + displacement;
     const length = @as(u64, count - 1) * step + @as(u64, load.data_words) * 4;
@@ -35793,7 +35842,26 @@ fn scalarPointerTablePlan(
         break :known @as(u64, words[0]) | (@as(u64, words[1]) << 32);
     } else (try resolveUniformVectorBufferPointer(bindings, reader, analysis, scalar, @intCast(pointer_register), load.pc)) orelse return null;
     if (base == 0 or base + first + length > 0x1_0000_0000_0000) return null;
-    return .{ .base = base, .first = first, .step = step, .count = count };
+    return .{ .base = base, .first = first, .step = step, .count = count, .indices = indexed };
+}
+
+/// A bound alone includes holes between material texture indices. Those holes
+/// can hold constants that accidentally decode as descriptors. Keep the exact
+/// masked values, plus zero when the source V# can be read out of bounds.
+fn scalarPointerTableIndices(reader: gpu.ShaderMemoryReader, plan: ScalarPointerTablePlan) !std.StaticBitSet(16384) {
+    var indices = std.StaticBitSet(16384).initEmpty();
+    if (plan.indices) |indexed| {
+        const table = indexed.table;
+        if (!table.fully_in_bounds) indices.set(0);
+        var offset = table.first;
+        while (offset < table.limit) : (offset += table.step) {
+            const byte = offset & ~@as(u64, 3);
+            const value = if (byte + 4 <= table.buffer.size_bytes) try reader.readU32(table.buffer.address + byte) else 0;
+            const index = value & indexed.mask;
+            if (index < plan.count) indices.set(index);
+        }
+    } else indices.setRangeValue(.{ .start = 0, .end = plan.count }, true);
+    return indices;
 }
 
 fn resolveScalarPointerImageCandidates(
@@ -35819,7 +35887,9 @@ fn resolveScalarPointerImageCandidates(
     if (load.dst.kind != .sgpr or sample.src1.reg < load.dst.reg or sample.src1.reg + sample.imageResourceWords() > load.dst.reg + load.data_words) return null;
     const plan = (try scalarPointerTablePlan(bindings, reader, analysis, scalar, load)) orelse return null;
     var result = BufferImageCandidates{};
-    for (0..plan.count) |index| {
+    const indices = try scalarPointerTableIndices(reader, plan);
+    var selected = indices.iterator(.{});
+    while (selected.next()) |index| {
         var words: [8]u32 = @splat(0);
         try reader.readWords(((plan.base + plan.first + index * plan.step) & ~@as(u64, 3)) + (sample.src1.reg - load.dst.reg) * 4, words[0..sample.imageResourceWords()]);
         if (std.mem.allEqual(u32, &words, 0)) continue;
@@ -35841,6 +35911,67 @@ fn resolveScalarPointerImageCandidates(
         result.count += 1;
     }
     return result;
+}
+
+test "masked pointer image indices preserve holes changes and source bounds" {
+    const Memory = struct {
+        bytes: [0x1200]u8 = @splat(0),
+        unavailable: bool = false,
+        fn read(context: ?*anyopaque, address: u64, output: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < 0x1000 or address - 0x1000 + output.len > self.bytes.len or
+                (self.unavailable and address < 0x2000)) return false;
+            @memcpy(output, self.bytes[@intCast(address - 0x1000)..][0..output.len]);
+            return true;
+        }
+        fn word(self: *@This(), offset: usize, value: u32) void {
+            std.mem.writeInt(u32, self.bytes[offset..][0..4], value, .little);
+        }
+    };
+    var memory = Memory{};
+    const reader = gpu.ShaderMemoryReader{ .context = &memory, .read_fn = Memory.read };
+    var instructions = [_]gpu.ShaderInstruction{
+        .{ .pc = 0, .opcode = .s_and_b32, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 9 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 4, .opcode = .s_mul_i32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .integer_inline_constant, .value = 16 } },
+        .{ .pc = 12, .opcode = .s_buffer_load_dword, .dst = .{ .kind = .sgpr, .reg = 20 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .sgpr, .reg = 12 }, .data_words = 1 },
+        .{ .pc = 20, .opcode = .s_and_b32, .dst = .{ .kind = .sgpr, .reg = 24 }, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .literal_constant, .value = 255 } },
+        .{ .pc = 28, .opcode = .s_lshl_b32, .dst = .{ .kind = .sgpr, .reg = 24 }, .src0 = .{ .kind = .sgpr, .reg = 24 }, .src1 = .{ .kind = .integer_inline_constant, .value = 5 } },
+        .{ .pc = 32, .opcode = .s_load_dwordx8, .dst = .{ .kind = .sgpr, .reg = 32 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .sgpr, .reg = 24 }, .data_words = 8 },
+        .{ .pc = 40, .opcode = .image_sample, .src1 = .{ .kind = .sgpr, .reg = 32 } },
+        .{ .pc = 48, .opcode = .s_endpgm },
+    };
+    const program = rdna2.Program{ .code = &.{}, .instructions = .{ .items = &instructions, .capacity = instructions.len } };
+    var graph = try rdna2.buildControlFlow(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    var analysis: gpu.ShaderAnalysis = undefined;
+    analysis.program = program;
+    analysis.graph = graph;
+    analysis.scalar_definitions = null;
+    var bindings = std.mem.zeroes(gpu.ShaderBindings);
+    bindings.user_data_count = 6;
+    @memcpy(bindings.user_data[0..6], &[_]u32{ 0x1000, 16 << 16, 2, 0x5204, 0x2000, 0 });
+    const scalar = gpu.ScalarEvaluation{};
+    // Every hole is deliberately a plausible but unrelated image.
+    for (0..8) |index| {
+        const words = [_]u32{ @intCast(0xa00 + index), 56 << 20, 0, 0x90000924, 0, 0, 0, 0 };
+        for (words, 0..) |word, component| memory.word(0x1000 + index * 32 + component * 4, word);
+    }
+    memory.word(0, 0x103);
+    for (0..4) |variant| {
+        memory.word(16, if (variant == 1) 6 else 7);
+        bindings.user_data[2] = if (variant == 2) 1 else 2;
+        const candidates = (try resolveScalarPointerImageCandidates(&bindings, reader, &analysis, &scalar.registers, instructions[6])).?;
+        try std.testing.expectEqual(@as(usize, 2), candidates.count);
+        try std.testing.expectEqual(@as(u32, if (variant == 2) 0xa00 else 0xa03), candidates.words[0][0]);
+        try std.testing.expectEqual(@as(u32, if (variant == 1) 0xa06 else if (variant == 2) 0xa03 else 0xa07), candidates.words[1][0]);
+    }
+    // An invalid selected tuple remains checked; holes are never substituted.
+    memory.word(0x1000 + 7 * 32 + 12, 0);
+    const invalid = (try resolveScalarPointerImageCandidates(&bindings, reader, &analysis, &scalar.registers, instructions[6])).?;
+    try std.testing.expectEqual(@as(usize, 1), invalid.count);
+    try std.testing.expect(invalid.requires_null_check);
+    memory.unavailable = true;
+    try std.testing.expectError(error.MemoryReadFailed, resolveScalarPointerImageCandidates(&bindings, reader, &analysis, &scalar.registers, instructions[6]));
 }
 
 const TypedIndexRange = struct { positive_limit: u32, negative_magnitude: u32 = 0 };
