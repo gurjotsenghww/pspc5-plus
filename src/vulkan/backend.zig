@@ -11485,7 +11485,13 @@ pub const Renderer = struct {
         mappings: []gpu.ShaderSpirvSampledImageBinding,
     ) anyerror!void {
         const lookup = rdna2.spirv.sampled_lookup;
-        if (mappings.len < 64) return;
+        // Small indirect tables relocate during streaming too. Keep their
+        // exact T# words in runtime data instead of compiling each address.
+        // Direct images do not need a table or scratch-plan allocation.
+        const has_candidates = for (mappings) |binding| {
+            if (binding.candidate_words != null and binding.lookup == null) break true;
+        } else false;
+        if (!has_candidates) return;
         const plan = &resources.lookup_plan;
         try plan.reset(self.allocator, mappings.len);
         for (mappings, 0..) |binding, index| {
@@ -11498,12 +11504,10 @@ pub const Renderer = struct {
             }, index);
         }
         var total_words: usize = 0;
-        for (plan.groups.values()) |group|
-            if (group.count >= 64) {
-                total_words += lookup.capacity(group.count) * lookup.entry_words;
-            };
+        for (plan.groups.values()) |group| total_words += lookup.capacity(group.count) * lookup.entry_words;
         if (total_words == 0) return;
-        const slot = resources.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+        // A saturated descriptor set retains complete literal comparisons.
+        const slot = resources.freeDescriptor() orelse return;
         const upload = try self.allocateDrawUpload(total_words * 4);
         const mapping = try self.mapDrawUpload(upload);
         defer mapping.release(self);
@@ -11515,18 +11519,19 @@ pub const Renderer = struct {
         @memset(table, 0);
         var cursor: usize = 0;
         for (plan.groups.values()) |members| {
-            if (members.count < 64) continue;
             const entries = lookup.capacity(members.count);
             const group = table[cursor..][0 .. entries * lookup.entry_words];
-            var probes: u32 = 0;
             var index = members.first;
             while (index != sampled_lookup_plan.end) : (index = plan.next.items[index]) {
                 const candidate = mappings[index];
-                probes = @max(probes, lookup.insert(group, candidate.candidate_words.?, candidate.descriptor_index));
+                _ = lookup.insert(group, candidate.candidate_words.?, candidate.descriptor_index);
             }
             index = members.first;
             while (index != sampled_lookup_plan.end) : (index = plan.next.items[index]) {
-                mappings[index].lookup = .{ .descriptor_index = slot, .word_offset = @intCast(cursor), .mask = @intCast(entries - 1), .probes = probes };
+                // Stop on the first exact match or empty entry. A capacity
+                // bound remains valid when relocated tuples change collisions
+                // and does not specialize the pipeline on the probe chain.
+                mappings[index].lookup = .{ .descriptor_index = slot, .word_offset = @intCast(cursor), .mask = @intCast(entries - 1), .probes = @intCast(entries) };
             }
             cursor += group.len;
         }

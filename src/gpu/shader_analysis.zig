@@ -13,6 +13,7 @@ pub const SpirvStage = rdna2.spirv.Stage;
 pub const SpirvOptions = rdna2.spirv.Options;
 pub const SpirvStorageBufferBinding = rdna2.spirv.StorageBufferBinding;
 pub const SpirvBufferLookup = rdna2.spirv.buffer_lookup;
+pub const SpirvSampledLookup = rdna2.spirv.sampled_lookup;
 pub const SpirvSampledImageBinding = rdna2.spirv.SampledImageBinding;
 pub const SpirvStorageImageBinding = rdna2.spirv.StorageImageBinding;
 pub const SpirvStorageImageFormat = rdna2.spirv.StorageImageFormat;

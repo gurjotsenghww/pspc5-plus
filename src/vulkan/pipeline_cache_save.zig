@@ -20,6 +20,7 @@ pub const Saver = struct {
     job: ?*Job = null,
     persisted_generation: u64 = 0,
     last_checkpoint_ns: ?u64 = null,
+    last_failure: ?anyerror = null,
 
     /// Loading can spend minutes compiling pipelines without presenting a
     /// frame. Check after each compilation as well as on flips, and bound
@@ -65,7 +66,20 @@ pub const Saver = struct {
         const job = self.job orelse return;
         if (!wait and !job.done.load(.acquire)) return;
         job.thread.?.join();
-        if (job.saved) self.persisted_generation = job.source.generation;
+        if (job.saved) {
+            self.persisted_generation = job.source.generation;
+            self.last_failure = null;
+        } else if (job.failure) |failure| {
+            // Failed snapshots retain the old file and retry later. Make disk
+            // exhaustion and other failures visible without repeating the same
+            // warning at every checkpoint while the condition persists.
+            const repeated = if (self.last_failure) |previous| previous == failure else false;
+            if (!repeated) std.debug.print(
+                "[vulkan cache] snapshot {s} failed: {s}; previous cache retained, will retry\n",
+                .{ @tagName(job.phase), @errorName(failure) },
+            );
+            self.last_failure = failure;
+        }
         std.heap.page_allocator.destroy(job);
         self.job = null;
     }
@@ -76,17 +90,28 @@ const Job = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     saved: bool = false,
+    failure: ?anyerror = null,
+    phase: enum { query, allocate, extract, create, write, replace } = .query,
 
     fn run(self: *Job) void {
         defer self.done.store(true, .release);
+        self.save() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn save(self: *Job) !void {
         const source = self.source;
         var data_size: usize = 0;
-        if (source.get_data(source.device, source.cache, &data_size, null) != vk.success) return;
-        if (data_size == 0 or data_size > source.maximum_bytes) return;
-        const bytes = std.heap.page_allocator.alloc(u8, data_size) catch return;
+        if (source.get_data(source.device, source.cache, &data_size, null) != vk.success) return error.CacheSizeQueryFailed;
+        if (data_size == 0) return;
+        if (data_size > source.maximum_bytes) return error.CacheSizeLimitExceeded;
+        self.phase = .allocate;
+        const bytes = try std.heap.page_allocator.alloc(u8, data_size);
         defer std.heap.page_allocator.free(bytes);
-        if (source.get_data(source.device, source.cache, &data_size, bytes.ptr) != vk.success) return;
-        if (data_size == 0 or data_size > bytes.len) return;
+        self.phase = .extract;
+        if (source.get_data(source.device, source.cache, &data_size, bytes.ptr) != vk.success) return error.CacheExtractionFailed;
+        if (data_size == 0 or data_size > bytes.len) return error.InvalidCacheSize;
         var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer threaded.deinit();
         const io = threaded.io();
@@ -95,14 +120,17 @@ const Job = struct {
         var path_buffer: [1024]u8 = undefined;
         var suffix: u64 = undefined;
         io.random(std.mem.asBytes(&suffix));
-        const temporary = std.fmt.bufPrint(&path_buffer, "{s}.{x}.tmp", .{ source.path, suffix }) catch return;
-        const file = source.directory.createFile(io, temporary, .{ .exclusive = true }) catch return;
+        self.phase = .create;
+        const temporary = try std.fmt.bufPrint(&path_buffer, "{s}.{x}.tmp", .{ source.path, suffix });
+        const file = try source.directory.createFile(io, temporary, .{ .exclusive = true });
         defer source.directory.deleteFile(io, temporary) catch {};
         {
             defer file.close(io);
-            file.writePositionalAll(io, bytes[0..data_size], 0) catch return;
+            self.phase = .write;
+            try file.writePositionalAll(io, bytes[0..data_size], 0);
         }
-        source.directory.rename(temporary, source.directory, source.path, io) catch return;
+        self.phase = .replace;
+        try source.directory.rename(temporary, source.directory, source.path, io);
         self.saved = true;
         if (data_size > 256 * 1024 * 1024)
             std.debug.print("[vulkan cache] persisted {d} MiB driver pipeline cache asynchronously\n", .{data_size / (1024 * 1024)});
@@ -169,15 +197,41 @@ test "failed and oversized pipeline snapshots preserve the previous file and ret
     var source = Source{ .device = @ptrCast(&driver), .cache = 1, .get_data = TestDriver.get, .generation = 1, .maximum_bytes = 128, .directory = temporary.dir, .path = "cache.bin" };
     saver.finish(source);
     try std.testing.expectEqual(@as(u64, 0), saver.persisted_generation);
+    try std.testing.expectEqual(error.CacheExtractionFailed, saver.last_failure.?);
     source.maximum_bytes = 32;
     driver.fail = false;
     saver.finish(source);
     try std.testing.expectEqual(@as(u64, 0), saver.persisted_generation);
+    try std.testing.expectEqual(error.CacheSizeLimitExceeded, saver.last_failure.?);
     const before = try temporary.dir.readFileAlloc(std.testing.io, "cache.bin", std.testing.allocator, .limited(128));
     defer std.testing.allocator.free(before);
     try std.testing.expectEqualSlices(u8, "old cache", before);
     source.maximum_bytes = 128;
     saver.finish(source);
+    try std.testing.expectEqual(@as(u64, 1), saver.persisted_generation);
+    try std.testing.expectEqual(null, saver.last_failure);
+    const after = try temporary.dir.readFileAlloc(std.testing.io, "cache.bin", std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, "complete snapshot", after);
+}
+
+test "pipeline cache reports an unwritable destination and clears failure after retry" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "cache.bin", .data = "old cache" });
+    var driver = TestDriver{ .released = .init(true) };
+    var saver = Saver{};
+    defer saver.join();
+    var source = Source{ .device = @ptrCast(&driver), .cache = 1, .get_data = TestDriver.get, .generation = 1, .maximum_bytes = 128, .directory = temporary.dir, .path = "missing/cache.bin" };
+    saver.finish(source);
+    try std.testing.expect(saver.last_failure != null);
+    try std.testing.expectEqual(@as(u64, 0), saver.persisted_generation);
+    const before = try temporary.dir.readFileAlloc(std.testing.io, "cache.bin", std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(before);
+    try std.testing.expectEqualSlices(u8, "old cache", before);
+    source.path = "cache.bin";
+    saver.finish(source);
+    try std.testing.expectEqual(null, saver.last_failure);
     try std.testing.expectEqual(@as(u64, 1), saver.persisted_generation);
     const after = try temporary.dir.readFileAlloc(std.testing.io, "cache.bin", std.testing.allocator, .limited(128));
     defer std.testing.allocator.free(after);

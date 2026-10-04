@@ -12306,19 +12306,42 @@ fn runWorkgroupImageTableProbe(allocator: std.mem.Allocator) !void {
     for ([_]u32{ 0x1800, 0, 0 }, 0..) |word, index|
         try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
     var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
-    _ = try executor.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 4, 1, 1, 0x41 });
-    if (renderer.last_dispatch_error) |err| return err;
-    try std.testing.expectEqual(@as(u64, 1), renderer.translated_dispatches);
-    var output: [64]u8 = undefined;
-    try renderer.readbackGuestStorageBuffer(0x11000, &output);
-    for (0..4) |group| for (0..4) |channel| {
-        const expected: u32 = if (channel == 3 or channel == (if (group < 2) @as(usize, 0) else 2)) 0x3f80_0000 else 0;
-        if (expected != std.mem.readInt(u32, output[(group * 4 + channel) * 4 ..][0..4], .little))
-            std.debug.print("workgroup table output group={d} channel={d} bytes={x}\n", .{ group, channel, output });
-        try std.testing.expectEqual(expected, std.mem.readInt(u32, output[(group * 4 + channel) * 4 ..][0..4], .little));
-    };
-    try std.testing.expectEqual(@as(u64, 2), renderer.texture_cache_misses);
-    std.debug.print("workgroup image table passed: shifted group IDs, 440-byte records, unreachable descriptor-like fields and per-group colors\n", .{});
+    // Relocation and a different collision chain must change runtime table
+    // data, not the pipeline. Use opposite colors to catch stale image slots.
+    const lookup = gpu.shader_analysis.SpirvSampledLookup;
+    for (0..3) |pass| {
+        var first_hash: u32 = 0;
+        for (0..2) |record| {
+            var address: u32 = @intCast(0x14000 + pass * 0x1000 + record * 256);
+            var words = sampledImageDescriptorWords(address, 1, 1);
+            if (record == 0) {
+                first_hash = lookup.hash(words) & 3;
+            } else {
+                const collide = pass == 1;
+                while ((lookup.hash(words) & 3 == first_hash) != collide) {
+                    address += 256;
+                    try std.testing.expect(address < 0x17000);
+                    words = sampledImageDescriptorWords(address, 1, 1);
+                }
+            }
+            for (words, 0..) |word, index| guest.word(0x2000 + record * 440 + index * 4, word);
+            guest.word(address, if ((record + pass) % 2 == 0) 0xff00_00ff else 0xffff_0000);
+        }
+        _ = try executor.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 4, 1, 1, 0x41 });
+        if (renderer.last_dispatch_error) |err| return err;
+        var output: [64]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x11000, &output);
+        for (0..4) |group| for (0..4) |channel| {
+            const color: usize = if ((group / 2 + pass) % 2 == 0) 0 else 2;
+            const expected: u32 = if (channel == 3 or channel == color) 0x3f80_0000 else 0;
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, output[(group * 4 + channel) * 4 ..][0..4], .little));
+        };
+    }
+    try std.testing.expectEqual(@as(u64, 3), renderer.translated_dispatches);
+    try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_misses);
+    try std.testing.expectEqual(@as(u64, 2), renderer.pipeline_cache_hits);
+    try std.testing.expectEqual(@as(u64, 6), renderer.texture_cache_misses);
+    std.debug.print("workgroup image table passed: shifted group IDs, 440-byte records, unreachable fields, relocated colors and changing collisions reuse one pipeline\n", .{});
 }
 
 fn runHighHalfStoreProbe(allocator: std.mem.Allocator) !void {
