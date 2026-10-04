@@ -673,3 +673,52 @@ cases and workgroup image table also pass with Khronos synchronization
 validation and no VUID or synchronization errors. The wide FLAT-material probe
 shrinks from 4,071 to 3,943 words; the narrow version changes from 3,493 to
 3,365. These code-size results do not establish a game FPS improvement.
+
+The `5f02933e1589` ReleaseFast repeat presents **36 frames in 30.044 seconds
+(1.198 FPS)** at the visible Medium difficulty menu, versus 37 frames in the
+preceding repeat. No FPS gain is demonstrated. The tree still has bright
+vertical streaks. After confirming Standard, a first-use compute pipeline for
+`0x8000173b00` is pending with a 3,711,100-byte SPIR-V module. The captured
+module passes `spirv-val --target-env vulkan1.2`. The diagnostic memory guard
+stops the run after 1,544 seconds: system commit is 58,538,655,744 bytes against
+a 59,294,818,304-byte limit. Character control is not reached.
+
+## Releasing unused diagnostic shader IR
+
+A read-only census of the preceding runner at the tree finds 664 cached
+analyses. Their decoded code and instructions own 244,750,008 bytes, while
+extra IR instruction arrays, backend instruction arrays, nodes and blocks own
+another **904,245,296 bytes**. These figures cover owned array capacities,
+not all process memory; they exclude nested specialization caches, the guest
+and Vulkan driver allocations.
+
+The live renderer now releases those extra arrays after analysis when it uses
+decoded-stream execution. It keeps the decoded program, control-flow graph,
+validation and optimization summaries, resource checkpoints and translation
+key. Uniform-branch specializations inherit the same retention policy.
+Explicit typed-IR execution and standalone diagnostic decoders retain their
+full modules. No guest instruction or GPU dispatch is removed by this change.
+
+Five focused ReleaseSafe tests pass, including byte-identical SPIR-V before
+and after release, preserved external memory effects and diagnostic counts,
+repeated release, explicit typed-IR retention, and changing uniform values
+with specialization-cache reuse. The `8c449212c59d` ReleaseFast runner and
+ReleaseSafe Vulkan probe build successfully. Native image copy/sample tests,
+compressed array fetch/gather with a changing uniform output guard, all 12
+FLAT-material cases and the workgroup image table pass with Khronos
+synchronization validation, without VUID or synchronization errors.
+
+The live repeat uses the same two compiler workers and disabled catalog warmup.
+At the visible Medium difficulty menu it presents **38 frames in 30.044 seconds
+(1.265 FPS)**. A two-frame difference from the preceding sample is not evidence
+of a repeatable speedup. A read-only census at the tree finds 648 analyses with
+**zero bytes retained in every diagnostic IR array**; decoded code and
+instructions own 227,818,028 bytes. The different number of cached programs
+prevents treating the total difference as an exact whole-process memory saving.
+Tree streaks remain, and the post-tree transition is still under test.
+
+The installed `zig-out/bin/game-run.exe` and matching PDB now use
+`8c449212c59d33fe644ab36ed80057ff10c7eec166e6b23b2f008e458e95e517`.
+The preceding `16761f86ba35` executable and PDB are backed up under
+`out/yotei-gameplay-20261004/installed-backup-16761f86ba35/`.
+Public release archives are unchanged.

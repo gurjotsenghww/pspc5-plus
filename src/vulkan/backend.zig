@@ -13652,6 +13652,7 @@ pub const Renderer = struct {
                 },
             );
         errdefer analysis.deinit(self.allocator);
+        analysis.discardDiagnosticIr(self.allocator);
         // Optional memoization belongs to these exact validated code words.
         // A replacement or eviction destroys it with the decoded analysis.
         analysis.enableScalarDefinitionCache(self.allocator) catch {};

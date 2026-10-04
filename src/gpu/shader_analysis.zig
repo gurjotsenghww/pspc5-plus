@@ -39,6 +39,22 @@ pub const Analysis = struct {
     resource_checkpoints: ?CheckpointPlan = null,
     uniform_specializations: ?*UniformSpecializations = null,
     translation_key: ?rdna2.cache_key.ProgramKey = null,
+    diagnostic_ir_discarded: bool = false,
+
+    /// Live decoded-stream execution does not consume the IR's copies of the
+    /// instructions, nodes or backend stream. Keep the validation summaries
+    /// and the original program/CFG while releasing those diagnostic arrays.
+    /// Explicit typed-IR execution and standalone diagnostic decoders retain
+    /// their complete modules.
+    pub fn discardDiagnosticIr(self: *Analysis, allocator: std.mem.Allocator) void {
+        if (self.pipeline_options.enable_typed_ir or self.diagnostic_ir_discarded) return;
+        const validation = self.module.validation;
+        const optimization = self.module.optimization;
+        const stage = self.module.stage;
+        self.module.deinit(allocator);
+        self.module = .{ .validation = validation, .optimization = optimization, .stage = stage };
+        self.diagnostic_ir_discarded = true;
+    }
 
     /// Call only after reconstruction, before retaining an immutable analysis.
     pub fn enableTranslationKey(self: *Analysis, allocator: std.mem.Allocator) !void {
@@ -207,10 +223,13 @@ pub const Analysis = struct {
         var graph = try rdna2.buildControlFlow(allocator, &program);
         errdefer graph.deinit(allocator);
         const module = try rdna2.lowerIrWithOptions(allocator, &program, self.pipeline_options);
-        return .{ .code = code, .program = program, .graph = graph, .module = module, .pipeline_options = self.pipeline_options };
+        var result = Analysis{ .code = code, .program = program, .graph = graph, .module = module, .pipeline_options = self.pipeline_options };
+        if (self.diagnostic_ir_discarded) result.discardDiagnosticIr(allocator);
+        return result;
     }
 
     pub fn opaqueInstructionCount(self: *const Analysis) usize {
+        if (self.diagnostic_ir_discarded) return self.module.validation.opaque_instruction_count;
         var result: usize = 0;
         for (self.module.nodes.items) |node| {
             if (node.operation == .opaque_instruction) result += 1;
@@ -661,6 +680,71 @@ test "analysis identifies a global buffer store as externally visible" {
     try std.testing.expect(analysis.hasExternalEffects());
     try std.testing.expect(analysis.hasBufferExternalEffects());
     try std.testing.expect(analysis.hasNonRasterEffects());
+}
+
+test "discarded diagnostic IR preserves executable words effects and summaries" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |typed| {
+        var memory = TestMemory{};
+        const code = [_]u32{ 0xbe80_0480, 0x7e02_02ff, 0x3f80_0000, 0xe070_0000, 0, 0xbf81_0000 };
+        for (code, 0..) |word, index| memory.word(index * 4, word);
+        var analysis = try decodeWithOptions(a, memory.reader(), 0, 16, .{ .enable_typed_ir = typed, .enable_ssa_optimization = false });
+        defer analysis.deinit(a);
+        try analysis.enableTranslationKey(a);
+        const key = analysis.translation_key.?.bytes;
+        const validation = analysis.module.validation;
+        const optimization = analysis.module.optimization;
+        const opaque_count = analysis.opaqueInstructionCount();
+        try std.testing.expect(opaque_count != 0);
+        var before = try analysis.translateSpirv(a, .{ .stage = .compute });
+        defer before.deinit(a);
+        analysis.discardDiagnosticIr(a);
+        analysis.discardDiagnosticIr(a);
+        try std.testing.expectEqual(!typed, analysis.diagnostic_ir_discarded);
+        try std.testing.expectEqual(typed, analysis.module.nodes.items.len != 0);
+        try std.testing.expectEqualDeep(validation, analysis.module.validation);
+        try std.testing.expectEqualDeep(optimization, analysis.module.optimization);
+        try std.testing.expectEqual(opaque_count, analysis.opaqueInstructionCount());
+        try std.testing.expectEqualSlices(u8, key, analysis.translation_key.?.bytes);
+        try std.testing.expectEqualSlices(u32, &code, analysis.code.items);
+        try std.testing.expect(analysis.hasExternalEffects());
+        try std.testing.expect(analysis.hasNonRasterEffects());
+        try std.testing.expect(analysis.hasBufferExternalEffects());
+        var after = try analysis.translateSpirv(a, .{ .stage = .compute });
+        defer after.deinit(a);
+        try std.testing.expectEqualSlices(u32, before.words, after.words);
+    }
+}
+
+test "discarded diagnostic IR propagates to changing uniform specializations" {
+    const a = std.testing.allocator;
+    var memory = TestMemory{};
+    const code = [_]u32{
+        0xf400_1a80, 125 << 25,   0xbefe_04c1, 0xbf8c_007f,
+        0xbf07_6a80, 0xbf84_0002, 0xf020_0f28, 0x0002_0400,
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| memory.word(index * 4, word);
+    var analysis = try decodeWithOptions(a, memory.reader(), 0, 16, .{ .enable_typed_ir = false, .enable_ssa_optimization = false });
+    defer analysis.deinit(a);
+    analysis.discardDiagnosticIr(a);
+    try analysis.enableUniformSpecializations(a);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.resource_instruction_budget = 4096;
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 48;
+    for ([_]u32{ 0, 1, 0, 1 }, 0..) |flag, iteration| {
+        memory.word(48, flag);
+        var lease = (try analysis.acquireUniformSpecialization(a, memory.reader(), &bindings, true)).?;
+        defer lease.release();
+        try std.testing.expectEqual(iteration >= 2, lease.reused);
+        try std.testing.expect(lease.analysis.diagnostic_ir_discarded);
+        try std.testing.expectEqual(@as(usize, 0), lease.analysis.module.instructions.capacity);
+        try std.testing.expectEqual(@as(usize, 0), lease.analysis.module.nodes.capacity);
+        try std.testing.expectEqual(@as(usize, 0), lease.analysis.module.backend_instructions.capacity);
+        try std.testing.expectEqual(flag != 0, lease.analysis.hasExternalEffects());
+        try std.testing.expect(lease.analysis.resource_checkpoints.?.matches(lease.analysis.program.instructions.items));
+    }
 }
 
 test "floating buffer atomics retain effects and resource checkpoints" {
