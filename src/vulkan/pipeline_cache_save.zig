@@ -4,6 +4,7 @@
 //! One outstanding driver-cache snapshot. The renderer joins before destroying
 //! the cache/device; no driver handles or renderer allocator reach a detached job.
 const std = @import("std");
+const builtin = @import("builtin");
 const vk = @import("api.zig");
 
 pub const Source = struct {
@@ -12,6 +13,9 @@ pub const Source = struct {
     get_data: vk.PfnGetPipelineCacheData,
     generation: u64,
     maximum_bytes: usize,
+    /// Large Windows snapshots use a data-file mapping instead of reserving
+    /// another cache-sized block of system commit beside the driver's cache.
+    mapped_file_threshold: usize = 16 * 1024 * 1024,
     directory: std.Io.Dir,
     path: []const u8,
 };
@@ -91,7 +95,7 @@ const Job = struct {
     done: std.atomic.Value(bool) = .init(false),
     saved: bool = false,
     failure: ?anyerror = null,
-    phase: enum { query, allocate, extract, create, write, replace } = .query,
+    phase: enum { query, allocate, extract, create, resize, map, write, replace } = .query,
 
     fn run(self: *Job) void {
         defer self.done.store(true, .release);
@@ -106,12 +110,6 @@ const Job = struct {
         if (source.get_data(source.device, source.cache, &data_size, null) != vk.success) return error.CacheSizeQueryFailed;
         if (data_size == 0) return;
         if (data_size > source.maximum_bytes) return error.CacheSizeLimitExceeded;
-        self.phase = .allocate;
-        const bytes = try std.heap.page_allocator.alloc(u8, data_size);
-        defer std.heap.page_allocator.free(bytes);
-        self.phase = .extract;
-        if (source.get_data(source.device, source.cache, &data_size, bytes.ptr) != vk.success) return error.CacheExtractionFailed;
-        if (data_size == 0 or data_size > bytes.len) return error.InvalidCacheSize;
         var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer threaded.deinit();
         const io = threaded.io();
@@ -122,18 +120,74 @@ const Job = struct {
         io.random(std.mem.asBytes(&suffix));
         self.phase = .create;
         const temporary = try std.fmt.bufPrint(&path_buffer, "{s}.{x}.tmp", .{ source.path, suffix });
-        const file = try source.directory.createFile(io, temporary, .{ .exclusive = true });
+        const file = try source.directory.createFile(io, temporary, .{ .exclusive = true, .read = true });
         defer source.directory.deleteFile(io, temporary) catch {};
         {
             defer file.close(io);
-            self.phase = .write;
-            try file.writePositionalAll(io, bytes[0..data_size], 0);
+            if (builtin.os.tag == .windows and data_size >= source.mapped_file_threshold) {
+                self.phase = .resize;
+                try file.setLength(io, data_size);
+                {
+                    self.phase = .map;
+                    const mapping = try WindowsFileMapping.init(file, data_size);
+                    defer mapping.deinit();
+                    try self.extract(mapping.bytes, &data_size);
+                    self.phase = .write;
+                    try mapping.flush(data_size);
+                }
+                // The driver may return fewer bytes than its initial query.
+                // Windows requires the view to be unmapped before truncation.
+                self.phase = .resize;
+                try file.setLength(io, data_size);
+            } else {
+                self.phase = .allocate;
+                const bytes = try std.heap.page_allocator.alloc(u8, data_size);
+                defer std.heap.page_allocator.free(bytes);
+                try self.extract(bytes, &data_size);
+                self.phase = .write;
+                try file.writePositionalAll(io, bytes[0..data_size], 0);
+            }
         }
         self.phase = .replace;
         try source.directory.rename(temporary, source.directory, source.path, io);
         self.saved = true;
         if (data_size > 256 * 1024 * 1024)
             std.debug.print("[vulkan cache] persisted {d} MiB driver pipeline cache asynchronously\n", .{data_size / (1024 * 1024)});
+    }
+
+    fn extract(self: *Job, bytes: []u8, size: *usize) !void {
+        self.phase = .extract;
+        const source = self.source;
+        if (source.get_data(source.device, source.cache, size, bytes.ptr) != vk.success) return error.CacheExtractionFailed;
+        if (size.* == 0 or size.* > bytes.len) return error.InvalidCacheSize;
+    }
+};
+
+const WindowsFileMapping = struct {
+    handle: std.os.windows.HANDLE,
+    bytes: []u8,
+
+    extern "kernel32" fn CreateFileMappingW(std.os.windows.HANDLE, ?*const anyopaque, u32, u32, u32, ?[*:0]const u16) callconv(.winapi) ?std.os.windows.HANDLE;
+    extern "kernel32" fn MapViewOfFile(std.os.windows.HANDLE, u32, u32, u32, usize) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn UnmapViewOfFile(*const anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn FlushViewOfFile(*const anyopaque, usize) callconv(.winapi) i32;
+
+    fn init(file: std.Io.File, size: usize) !WindowsFileMapping {
+        // PAGE_READWRITE, FILE_MAP_WRITE. This is a data-file-backed section,
+        // not a page-file section or a copy-on-write mapping.
+        const handle = CreateFileMappingW(file.handle, null, 0x04, 0, 0, null) orelse return error.CacheMappingFailed;
+        errdefer std.os.windows.CloseHandle(handle);
+        const address = MapViewOfFile(handle, 0x0002, 0, 0, size) orelse return error.CacheMappingFailed;
+        return .{ .handle = handle, .bytes = @as([*]u8, @ptrCast(address))[0..size] };
+    }
+
+    fn flush(self: WindowsFileMapping, written: usize) !void {
+        if (FlushViewOfFile(self.bytes.ptr, written) == 0) return error.CacheWriteFailed;
+    }
+
+    fn deinit(self: WindowsFileMapping) void {
+        _ = UnmapViewOfFile(self.bytes.ptr);
+        std.os.windows.CloseHandle(self.handle);
     }
 };
 
@@ -142,6 +196,7 @@ const TestDriver = struct {
     released: std.atomic.Value(bool) = .init(false),
     reads: std.atomic.Value(u32) = .init(0),
     fail: bool = false,
+    invalid_size: bool = false,
 
     fn get(device: vk.Device, _: vk.PipelineCache, size: *usize, data: ?*anyopaque) callconv(vk.call) vk.Result {
         const self: *TestDriver = @ptrCast(@alignCast(device));
@@ -150,6 +205,10 @@ const TestDriver = struct {
         if (data) |destination| {
             _ = self.reads.fetchAdd(1, .monotonic);
             if (self.fail) return vk.error_device_lost;
+            if (self.invalid_size) {
+                size.* += 1;
+                return vk.success;
+            }
             const value = "complete snapshot";
             if (size.* < value.len) return vk.error_device_lost;
             @memcpy(@as([*]u8, @ptrCast(destination))[0..value.len], value);
@@ -159,6 +218,34 @@ const TestDriver = struct {
         return vk.success;
     }
 };
+
+test "mapped pipeline snapshots preserve the old cache on failure and truncate to the written length" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "cache.bin", .data = "previous complete cache" });
+    var driver = TestDriver{ .released = .init(true), .fail = true };
+    var saver = Saver{};
+    defer saver.join();
+    const source = Source{ .device = @ptrCast(&driver), .cache = 1, .get_data = TestDriver.get, .generation = 1, .maximum_bytes = 128, .mapped_file_threshold = 0, .directory = temporary.dir, .path = "cache.bin" };
+    saver.finish(source);
+    try std.testing.expectEqual(error.CacheExtractionFailed, saver.last_failure.?);
+    driver.fail = false;
+    driver.invalid_size = true;
+    saver.finish(source);
+    try std.testing.expectEqual(error.InvalidCacheSize, saver.last_failure.?);
+    try std.testing.expectEqual(@as(u64, 0), saver.persisted_generation);
+    const before = try temporary.dir.readFileAlloc(std.testing.io, "cache.bin", std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(before);
+    try std.testing.expectEqualSlices(u8, "previous complete cache", before);
+    driver.invalid_size = false;
+    saver.finish(source);
+    try std.testing.expectEqual(@as(u64, 1), saver.persisted_generation);
+    try std.testing.expectEqual(null, saver.last_failure);
+    const after = try temporary.dir.readFileAlloc(std.testing.io, "cache.bin", std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, "complete snapshot", after);
+}
 
 test "pipeline cache saving returns while extraction waits and retains sampled generation" {
     var temporary = std.testing.tmpDir(.{});

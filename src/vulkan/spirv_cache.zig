@@ -96,13 +96,29 @@ pub const Lease = struct {
     }
 };
 
+/// A cache-owned canonical program prefix, shared by its specialization keys.
+/// It outlives prepared-key owners and is freed with its last cache entry.
+const ProgramPrefix = struct {
+    bytes: []u8,
+    identity: u64,
+    references: usize = 1,
+
+    fn matches(self: *ProgramPrefix, bytes: []const u8, identity: u64) bool {
+        if (self.bytes.len != bytes.len) return false;
+        if (identity != 0 and self.identity == identity) return true;
+        if (!std.mem.eql(u8, self.bytes, bytes)) return false;
+        if (identity != 0) self.identity = identity;
+        return true;
+    }
+};
+
 const Entry = struct {
+    // Only the specialization suffix is unique to this entry.
     key: []u8,
+    prefix: *ProgramPrefix,
     hash: u64,
     shared: *SharedModule,
     sequence: u64,
-    program_identity: u64 = 0,
-    program_prefix_length: usize = 0,
 };
 
 pub const Cache = struct {
@@ -118,11 +134,33 @@ pub const Cache = struct {
     pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
         for (self.entries.items) |*entry| {
             allocator.free(entry.key);
+            self.releasePrefix(allocator, entry.prefix);
             entry.shared.release();
         }
         self.entries.deinit(allocator);
         self.key.deinit(allocator);
         self.* = .{};
+    }
+
+    fn retainPrefix(self: *Cache, allocator: std.mem.Allocator, bytes: []const u8, identity: u64) !*ProgramPrefix {
+        for (self.entries.items) |entry| {
+            if (!entry.prefix.matches(bytes, identity)) continue;
+            entry.prefix.references += 1;
+            return entry.prefix;
+        }
+        const prefix = try allocator.create(ProgramPrefix);
+        errdefer allocator.destroy(prefix);
+        prefix.* = .{ .bytes = try allocator.dupe(u8, bytes), .identity = identity };
+        self.bytes += bytes.len;
+        return prefix;
+    }
+
+    fn releasePrefix(self: *Cache, allocator: std.mem.Allocator, prefix: *ProgramPrefix) void {
+        prefix.references -= 1;
+        if (prefix.references != 0) return;
+        self.bytes -= prefix.bytes.len;
+        allocator.free(prefix.bytes);
+        allocator.destroy(prefix);
     }
 
     pub fn translate(
@@ -148,7 +186,7 @@ pub const Cache = struct {
     }
 
     /// The optional prefix belongs to this exact immutable program and pipeline.
-    /// Cache entries still own and compare the complete canonical key bytes.
+    /// Cache entries share owned program bytes and compare the complete key.
     pub fn acquirePrepared(
         self: *Cache,
         allocator: std.mem.Allocator,
@@ -185,6 +223,7 @@ pub const Cache = struct {
                 try appendValue(&self.key, allocator, pipeline);
             }
         }
+        const serialized_prefix_length = self.key.items.len;
         var key_options = options;
         key_options.scalar_registers = &.{};
         key_options.storage_buffers = &.{};
@@ -219,28 +258,17 @@ pub const Cache = struct {
             try appendValue(&self.key, allocator, keyed);
         }
         self.sequence +%= 1;
-        const prefix_length = if (borrowed) |prefix| prefix.bytes.len else 0;
-        const key_length = prefix_length + self.key.items.len;
+        const prefix_bytes = if (borrowed) |prefix| prefix.bytes else self.key.items[0..serialized_prefix_length];
+        const prefix_identity = if (borrowed) |prefix| prefix.identity else 0;
+        const suffix = self.key.items[serialized_prefix_length..];
         const hash = if (borrowed) |prefix| hash: {
             var state = prefix.hash_state;
             state.update(self.key.items);
             break :hash state.final();
         } else std.hash.Wyhash.hash(0, self.key.items);
         for (self.entries.items) |*entry| {
-            if (entry.hash != hash or entry.key.len != key_length or
-                !std.mem.eql(u8, entry.key[prefix_length..], self.key.items)) continue;
-            if (borrowed) |prefix| {
-                // Entries own the full canonical bytes. A lifetime-unique ID
-                // proves an already checked immutable prefix without retaining
-                // its pointer. Independent owners still compare their content.
-                if (prefix.identity == 0 or entry.program_identity != prefix.identity or
-                    entry.program_prefix_length != prefix_length)
-                {
-                    if (!std.mem.eql(u8, entry.key[0..prefix_length], prefix.bytes)) continue;
-                    entry.program_identity = prefix.identity;
-                    entry.program_prefix_length = prefix_length;
-                }
-            }
+            if (entry.hash != hash or !std.mem.eql(u8, entry.key, suffix) or
+                !entry.prefix.matches(prefix_bytes, prefix_identity)) continue;
             entry.sequence = self.sequence;
             self.hits += 1;
             entry.shared.references += 1;
@@ -254,8 +282,12 @@ pub const Cache = struct {
             .module = try rdna2.translateProgramSpirvWithPipelineOptions(allocator, program, options, pipeline),
         };
         errdefer shared.module.deinit(allocator);
-        const size = key_length + shared.module.words.len * @sizeOf(u32);
-        if (size > self.maximum_bytes or self.maximum_entries == 0) return .{ .shared = shared };
+        const size = suffix.len + shared.module.words.len * @sizeOf(u32);
+        if (size + prefix_bytes.len > self.maximum_bytes or self.maximum_entries == 0) return .{ .shared = shared };
+        // Retain before eviction: replacing the last old specialization must
+        // not free the prefix that the new entry will use.
+        const prefix = try self.retainPrefix(allocator, prefix_bytes, prefix_identity);
+        errdefer self.releasePrefix(allocator, prefix);
         while (self.entries.items.len != 0 and
             (self.bytes + size > self.maximum_bytes or self.entries.items.len >= self.maximum_entries))
         {
@@ -266,19 +298,17 @@ pub const Cache = struct {
             const victim = self.entries.swapRemove(oldest);
             self.bytes -= victim.key.len + victim.shared.module.words.len * @sizeOf(u32);
             allocator.free(victim.key);
+            self.releasePrefix(allocator, victim.prefix);
             victim.shared.release();
         }
-        const key = try allocator.alloc(u8, key_length);
+        const key = try allocator.dupe(u8, suffix);
         errdefer allocator.free(key);
-        if (borrowed) |prefix| @memcpy(key[0..prefix_length], prefix.bytes);
-        @memcpy(key[prefix_length..], self.key.items);
         try self.entries.append(allocator, .{
             .key = key,
+            .prefix = prefix,
             .hash = hash,
             .shared = shared,
             .sequence = self.sequence,
-            .program_identity = if (borrowed) |prefix| prefix.identity else 0,
-            .program_prefix_length = prefix_length,
         });
         shared.references += 1; // The cache and the returned lease each own a reference.
         self.bytes += size;
@@ -596,6 +626,73 @@ test "prepared key reuse survives owner destruction and verifies hash collisions
     defer again.release();
     try std.testing.expect(again.view().words.ptr == changed_lease.view().words.ptr);
     try std.testing.expect(again.view().words.ptr != collision.view().words.ptr);
+}
+
+test "specializations share owned program bytes across eviction and independent owners" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{ 0xbf800000, 0xbf810000 });
+    defer program.deinit(a);
+    var prefix_size: usize = 0;
+    {
+        const prepared = try rdna2.cache_key.ProgramKey.init(a, &program, .{});
+        defer prepared.deinit(a);
+        prefix_size = prepared.bytes.len;
+        for (1..4) |width| {
+            const lease = try cache.acquirePrepared(a, &program, .{ .stage = .compute, .local_size = .{ @intCast(width), 1, 1 } }, .{}, prepared);
+            lease.release();
+        }
+    }
+    const owned = cache.entries.items[0].prefix;
+    try std.testing.expectEqual(@as(usize, 3), owned.references);
+    var expected_bytes = prefix_size;
+    for (cache.entries.items) |entry| {
+        try std.testing.expect(entry.prefix == owned);
+        expected_bytes += entry.key.len + entry.shared.module.words.len * @sizeOf(u32);
+    }
+    try std.testing.expectEqual(expected_bytes, cache.bytes);
+    const equal = try rdna2.cache_key.ProgramKey.init(a, &program, .{});
+    defer equal.deinit(a);
+    cache.maximum_entries = 1;
+    cache.maximum_bytes = expected_bytes;
+    const options = rdna2.spirv.Options{ .stage = .compute, .local_size = .{ 4, 1, 1 } };
+    const replacement = try cache.acquirePrepared(a, &program, options, .{}, equal);
+    defer replacement.release();
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expect(cache.entries.items[0].prefix == owned);
+    try std.testing.expectEqual(@as(usize, 1), owned.references);
+    try std.testing.expectEqual(prefix_size + cache.entries.items[0].key.len + replacement.view().words.len * @sizeOf(u32), cache.bytes);
+    const unprepared = try cache.acquire(a, &program, options, .{});
+    defer unprepared.release();
+    try std.testing.expect(unprepared.sameModule(replacement));
+    var fresh = try rdna2.translateProgramSpirv(a, &program, options);
+    defer fresh.deinit(a);
+    cache.deinit(a);
+    try std.testing.expectEqualSlices(u32, fresh.words, replacement.view().words);
+}
+
+test "shared program prefixes release all allocations when insertion fails" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var cache = Cache{ .maximum_entries = 1 };
+            defer cache.deinit(a);
+            var program = try rdna2.decodeProgram(a, &.{0xbf810000});
+            defer program.deinit(a);
+            const prepared = try rdna2.cache_key.ProgramKey.init(a, &program, .{});
+            defer prepared.deinit(a);
+            for (1..3) |width| {
+                const lease = try cache.acquirePrepared(a, &program, .{ .stage = .compute, .local_size = .{ @intCast(width), 1, 1 } }, .{}, prepared);
+                lease.release();
+            }
+            const pipeline = rdna2.ir.PipelineOptions{ .enable_typed_ir = false };
+            const independent = try rdna2.cache_key.ProgramKey.init(a, &program, pipeline);
+            defer independent.deinit(a);
+            const changed = try cache.acquirePrepared(a, &program, .{ .stage = .compute }, pipeline, independent);
+            changed.release();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "prepared program keys match fresh translations across reconstructed instructions and pipeline changes" {

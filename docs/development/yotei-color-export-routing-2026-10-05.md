@@ -67,7 +67,23 @@ fixtures, not exact live dispatches or gameplay FPS measurements.
 
 ## Live validation
 
-The preceding runtime-table build measured 37 presented frames in 30.049 seconds
-(1.231 FPS) at the tree. Its later repeat was deliberately stopped by the memory
-guard with about 374 MiB of system commit headroom. Character control was not
-confirmed. A separate live repeat is required for the color-routing change.
+The color-routing runner (`eace085bdf93`) presents 37 frames in 30.046 seconds
+at the visible Medium difficulty menu: **1.231 FPS**, matching the preceding
+build. Bright vertical streaks remain on the tree. This repeat does not
+demonstrate a frame-rate improvement.
+
+It passes brightness and experience selection and reaches the subsequent 3D
+cinematic. The pause overlay responds, but character control is not confirmed.
+Lighting and character surfaces remain incomplete. After resuming the cinematic,
+a separate 30.045-second interval presents two frames (**0.0666 FPS**); this is
+a cinematic interval with first-use work, not warmed gameplay performance.
+
+The captured rejected draw has `CB_TARGET_MASK=0x333733`,
+`CB_SHADER_MASK=0x3ffffff`, and export formats `0x4449944`. Slot 2 is an active
+3328 x 1872 packed 11/11/10 UNORM surface with source-alpha blending. Respecting
+the shader mask does not remove this unsupported operation. Its pixel program
+and state are retained privately for investigation.
+
+The owned repeat ends after 2,452 seconds following a deliberate stop for
+isolated cache checks. The [cache-memory follow-up](yotei-cache-memory-2026-10-05.md)
+records the timing breakdown and subsequent memory changes.
