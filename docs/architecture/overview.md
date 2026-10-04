@@ -195,6 +195,8 @@ startup log prints effective values so a captured report is self-describing.
 Pipeline compilation uses two workers by default; set
 `PS5_GPU_COMPILER_WORKERS=1..4` to change the bound or
 `PS5_GPU_ASYNC_PIPELINES=0` for synchronous compilation without compute warmup.
+`PS5_GPU_COMPUTE_WARMUP=0` disables optional catalog warmup while retaining
+the compiler pool and normal compilation of every pipeline the game requests.
 
 | Variable | Experimental path |
 |---|---|

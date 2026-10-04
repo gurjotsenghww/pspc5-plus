@@ -34,6 +34,7 @@ pub const Cache = struct {
     pending_save_bytes: std.atomic.Value(usize) = .init(0),
     warmed: std.atomic.Value(u32) = .init(0),
     failed: std.atomic.Value(u32) = .init(0),
+    cancelled: std.atomic.Value(u32) = .init(0),
     finished: std.atomic.Value(u32) = .init(0),
     warmup_count: u32 = 0,
 
@@ -217,8 +218,8 @@ const Work = struct {
         const self: *@This() = @fieldParentPtr("job", base);
         defer if (!self.save) {
             if (self.owner.finished.fetchAdd(1, .acq_rel) + 1 == self.owner.warmup_count) {
-                std.debug.print("[vulkan compiler] warmup complete: compiled={d} failed={d} total={d}\n", .{
-                    self.owner.warmed.load(.acquire), self.owner.failed.load(.acquire), self.owner.warmup_count,
+                std.debug.print("[vulkan compiler] warmup complete: compiled={d} failed={d} cancelled={d} total={d}\n", .{
+                    self.owner.warmed.load(.acquire), self.owner.failed.load(.acquire), self.owner.cancelled.load(.acquire), self.owner.warmup_count,
                 });
             }
         };
@@ -247,7 +248,10 @@ const Work = struct {
             self.validated = true;
             return;
         }
-        if (self.owner.stopping.load(.acquire)) return;
+        if (self.owner.stopping.load(.acquire)) {
+            _ = self.owner.cancelled.fetchAdd(1, .monotonic);
+            return;
+        }
         const bytes = self.owner.directory.readFileAllocOptions(io, name, allocator, .limited(maximum_module_bytes), .of(u32), null) catch return;
         defer allocator.free(bytes);
         if (!validModule(bytes, self.hash)) {
@@ -385,6 +389,8 @@ test "catalog bounds pending saves and cancels unstarted warmups at shutdown" {
     queue.waitIdle();
     try std.testing.expectEqual(@as(usize, 1), replay.jobs.items.len);
     try std.testing.expectEqual(@as(u32, 0), replay.warmed.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), replay.cancelled.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), replay.finished.load(.acquire));
 }
 
 test "catalog replaces cold completed modules at both bounds and replays recent modules" {

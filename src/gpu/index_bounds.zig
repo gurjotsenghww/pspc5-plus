@@ -795,6 +795,79 @@ pub const LaneDefinitions = struct {
     count: usize = 0,
 };
 
+// A complete waterfall writes each selected partition, removes exactly that
+// partition, repeats until EXEC is empty, then restores its entry mask. A
+// consumer under that restored mask sees the loop's write in every active
+// lane, not a mixture with the value from before the loop.
+fn completeWaterfallCoversWrite(instructions: []const Instruction, graph: *const Graph, before: usize, mask_register: u32, vector_write: usize) bool {
+    const scalarRegister = @import("scalar_provenance.zig").scalarRegisterIndex;
+    const block = graph.blocks.items[blockAt(graph, vector_write) orelse return false];
+    const start: usize = block.first_instruction;
+    const end: usize = start + block.instruction_count;
+    if (block.instruction_count < 4 or end >= instructions.len or before <= end) return false;
+    const branch = instructions[end - 1];
+    const remove = instructions[end - 2];
+    const restore = instructions[end];
+    if (branch.opcode != .s_cbranch_execnz or branch.branch_target != instructions[start].pc or
+        remove.opcode != .s_andn2_b64 or scalarRegister(remove.dst) != 126 or
+        restore.opcode != .s_mov_b64 or scalarRegister(restore.dst) != 126) return false;
+    const entry_mask = scalarRegister(restore.src0) orelse return false;
+    const saved_mask = scalarRegister(remove.src0) orelse return false;
+    const selected_mask = scalarRegister(remove.src1) orelse return false;
+    if (entry_mask >= 126 or saved_mask >= 126 or selected_mask >= 126) return false;
+    if (saved_mask < selected_mask + 2 and selected_mask < saved_mask + 2) return false;
+
+    // The loop has one fallthrough entry, one back edge and one exit. Reject
+    // joins which can reach the restoration without executing the waterfall.
+    var predecessor: ?u32 = null;
+    var back_edge = false;
+    const exit_block = blockAt(graph, end) orelse return false;
+    for (graph.edges.items) |edge| {
+        if (edge.to == block.index) {
+            if (edge.from == block.index) {
+                if (edge.kind != .branch or back_edge) return false;
+                back_edge = true;
+            } else {
+                if (edge.kind != .fallthrough or predecessor != null) return false;
+                predecessor = edge.from;
+            }
+        }
+        if (edge.to == exit_block and (edge.from != block.index or edge.kind != .fallthrough)) return false;
+        if (edge.from == block.index and edge.to != block.index and edge.to != exit_block) return false;
+    }
+    if (!back_edge) return false;
+    const preheader = graph.blocks.items[predecessor orelse return false];
+    if (preheader.first_instruction + preheader.instruction_count != start) return false;
+    var entry_copy: ?usize = null;
+    var cursor = start;
+    while (cursor > preheader.first_instruction) {
+        cursor -= 1;
+        if (!writes(instructions[cursor], .{ .register = 126 }) and !writes(instructions[cursor], .{ .register = 127 })) continue;
+        const copy = instructions[cursor];
+        if (copy.opcode != .s_mov_b64 or scalarRegister(copy.dst) != 126 or scalarRegister(copy.src0) != entry_mask) return false;
+        entry_copy = cursor;
+        break;
+    }
+    const copied = entry_copy orelse return false;
+    for (instructions[copied + 1 .. end]) |inst| {
+        if (writes(inst, .{ .register = @intCast(entry_mask) }) or writes(inst, .{ .register = @intCast(entry_mask + 1) })) return false;
+    }
+    var partition: ?usize = null;
+    for (instructions[start .. end - 2], start..) |inst, index| {
+        if (!writes(inst, .{ .register = 126 }) and !writes(inst, .{ .register = 127 })) continue;
+        if (partition != null or index >= vector_write or inst.opcode != .s_and_saveexec_b64 or
+            scalarRegister(inst.dst) != saved_mask or scalarRegister(inst.src0) != selected_mask) return false;
+        partition = index;
+    }
+    const narrowed = partition orelse return false;
+    for (instructions[narrowed + 1 .. end - 2]) |inst| {
+        for ([_]usize{ saved_mask, saved_mask + 1, selected_mask, selected_mask + 1 }) |register|
+            if (writes(inst, .{ .register = @intCast(register) })) return false;
+    }
+    var proof = MaskProof{};
+    return maskIsSubsetOfVectorWrite(instructions, graph, before, mask_register, end, &proof) and proof.has_origin;
+}
+
 /// A masked vector replacement retains the previous value in inactive lanes.
 /// Keep both producers until an earlier write covers the consumer's mask.
 /// An entry value or an incomplete proof must retain the unbounded fallback.
@@ -818,6 +891,7 @@ fn possibleLaneDefinitions(instructions: []const Instruction, graph: *const Grap
             result.count += 1;
             var proof = MaskProof{};
             if (maskIsSubsetOfVectorWrite(instructions, graph, mask_before, mask_register, index, &proof) and proof.has_origin) continue;
+            if (completeWaterfallCoversWrite(instructions, graph, mask_before, mask_register, index)) continue;
             if (count == pending.len) return null;
             pending[count] = index;
             count += 1;
@@ -828,6 +902,58 @@ fn possibleLaneDefinitions(instructions: []const Instruction, graph: *const Grap
 
 pub fn vectorLaneDefinitions(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32) ?LaneDefinitions {
     return possibleLaneDefinitions(instructions, graph, before, register, before, 126);
+}
+
+test "completed waterfalls replace every restored lane and reject incomplete partitions" {
+    const exec = rdna2.Operand{ .kind = .exec_lo };
+    const entry = rdna2.Operand{ .kind = .sgpr, .reg = 70 };
+    const saved = rdna2.Operand{ .kind = .sgpr, .reg = 4 };
+    const selected = rdna2.Operand{ .kind = .sgpr, .reg = 2 };
+    const vector = rdna2.Operand{ .kind = .vgpr, .reg = 2 };
+    const original = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = entry, .src0 = exec },
+        .{ .pc = 4, .opcode = .s_mov_b64, .dst = exec, .src0 = entry },
+        .{ .pc = 8, .opcode = .v_floor_f32, .dst = vector },
+        .{ .pc = 12, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .vgpr, .reg = 28 } },
+        .{ .pc = 16, .opcode = .v_cmp_eq_u32, .dst = selected, .src0 = .{ .kind = .vcc_lo }, .src1 = .{ .kind = .vgpr, .reg = 28 } },
+        .{ .pc = 20, .opcode = .s_and_saveexec_b64, .dst = saved, .src0 = selected },
+        .{ .pc = 24, .opcode = .s_nop },
+        .{ .pc = 28, .opcode = .image_gather4, .dst = vector, .data_words = 4 },
+        .{ .pc = 32, .opcode = .s_nop },
+        .{ .pc = 36, .opcode = .s_andn2_b64, .dst = exec, .src0 = saved, .src1 = selected },
+        .{ .pc = 40, .opcode = .s_cbranch_execnz, .branch_target = 12 },
+        .{ .pc = 44, .opcode = .s_mov_b64, .dst = exec, .src0 = entry },
+        .{ .pc = 48, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 20 }, .src0 = vector },
+        .{ .pc = 52, .opcode = .s_endpgm },
+    };
+    for (0..9) |variant| {
+        var instructions = original;
+        switch (variant) {
+            1 => instructions[10].opcode = .s_cbranch_scc1,
+            2 => instructions[9].src1.reg = 8,
+            3 => instructions[8] = .{ .pc = 32, .opcode = .s_mov_b64, .dst = selected, .src0 = .{ .kind = .integer_inline_constant } },
+            4 => instructions[6] = .{ .pc = 24, .opcode = .s_mov_b64, .dst = exec, .src0 = .{ .kind = .integer_inline_constant } },
+            5 => instructions[8] = .{ .pc = 32, .opcode = .s_mov_b64, .dst = entry, .src0 = exec },
+            6 => instructions[11].src0.reg = 72,
+            7 => instructions[1] = .{ .pc = 4, .opcode = .s_cbranch_scc1, .branch_target = 44 },
+            8 => {
+                instructions[5].dst = selected;
+                instructions[9].src0 = selected;
+            },
+            else => {},
+        }
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        try std.testing.expectEqual(variant == 0, completeWaterfallCoversWrite(&instructions, &graph, 12, 126, 7));
+        if (variant == 0) {
+            const definitions = scalarLaneDefinitions(&instructions, &graph, 13, 20, 0).?;
+            try std.testing.expectEqual(@as(usize, 1), definitions.count);
+            try std.testing.expectEqual(@as(usize, 7), definitions.items[0].instruction);
+            var cache = ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+            defer cache.deinit();
+            try expectSameLaneDefinitions(definitions, cache.indexLaneDefinitions(13, 20, true));
+        }
+    }
 }
 
 test "masked index replacements retain the initialized and replacement producers" {

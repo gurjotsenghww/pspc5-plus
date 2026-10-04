@@ -31,6 +31,9 @@ vertex fetch programs and changed lowering options rebuild the complete key.
 `game-run` enables [`vulkan.pipeline_compiler`](../../src/vulkan/pipeline_compiler.zig)
 by default with two workers. `PS5_GPU_COMPILER_WORKERS=1..4` sets the bound;
 `PS5_GPU_ASYNC_PIPELINES=0` restores synchronous compilation and disables warmup.
+`PS5_GPU_COMPUTE_WARMUP=0` disables only optional catalog warmup, retaining
+foreground compilation on the worker pool. This is useful when concurrent
+driver compilations exhaust host memory; it does not skip guest pipelines.
 Workers sleep when idle, prioritize current-frame jobs over queued background
 work, and are joined before device destruction. A failed worker start preserves
 the job using an existing worker or inline execution. Vulkan's ordinary driver

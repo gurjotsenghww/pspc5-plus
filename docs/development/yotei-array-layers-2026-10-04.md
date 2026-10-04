@@ -515,3 +515,81 @@ Local KytyPS5 source review finds texture garbage-collection thresholds derived
 from its reported memory budget (`textureCache.cpp`). This is a useful direction
 for a coordinated renderer budget, not a measured optimization copied into this
 candidate. Repeated texture uploads and fence waits remain major costs.
+
+## Integer material indices after a complete waterfall
+
+A new read-only capture taken immediately after the `0x22f0` diagnostic includes
+both material headers and the 96-record texture table. The headers select R8
+UINT index textures. The previous analysis nevertheless retained a floating-point
+value from before the gather loop, because it could not prove that the loop
+eventually wrote every restored lane. Its unbounded 32-bit multiplication then
+enumerated eight-byte offsets, including ordinary material constants which
+happened to decode as 1D-array descriptors.
+
+The analysis now recognizes a complete partition-and-remove waterfall, with
+one entry and one exit, unchanged saved masks, and restoration of the exact
+entry mask. It rejects bypasses, altered predicates, overlapping mask registers
+and intervening EXEC changes. Integer gather bounds also follow small indirect
+descriptor tables, rereading their current formats with a shared recursion
+budget. Null and out-of-bounds reads retain zero; negative selectors and
+unsupported or unavailable formats retain conservative behavior.
+
+The captured replay resolves both `0x22f0` and `0x22f8` with the intended
+136-byte record step and 84 distinct 2D textures, instead of 229 candidates
+containing false 1D-array images. This is a resource-preparation result, not
+proof that the complete scene renders correctly or runs faster. Ten focused
+analysis tests and six staging tests pass. The capture process was deliberately
+stopped before rebuilding; character control was not reached in that run.
+
+The `9041bab00fe5` ReleaseFast runner builds successfully. Workgroup image
+tables, graphics descriptor reuse and all 26 sparse-pointer fragment cases
+pass with Khronos synchronization validation, without VUID or synchronization
+errors. It is tested separately from the installed runner.
+
+The two-worker repeat presents 35 frames in 30.049 seconds at the tree
+(1.165 FPS); this does not demonstrate an improvement over 1.231 FPS.
+Optional background warmups were cancelled after 435 of 848 jobs, before
+this interval, while required foreground compilation remained enabled.
+The first four-worker run and this repeat both reach the diagnostic host-memory
+guard: three samples below 768 MiB of remaining system commit. These are
+deliberate test stops, not evidence of a guest crash. The second run lasts
+2,648 seconds and stops before character control.
+
+The transition includes a 468.554-second frame. A captured required collision
+shader, `0x800014e300`, has 3,957,304 bytes of SPIR-V and an 880-case dispatcher;
+it passes `spirv-val --target-env vulkan1.2`. A later loading frame spends
+321.849 seconds creating graphics pipelines and 164.232 seconds creating
+compute pipelines. These first-use stalls are separate from warmed frame
+costs. A typical preceding tree frame still uploads 324 MiB and reads back
+369 MiB. No post-tree gameplay FPS is established by this repeat.
+
+The live material now passes resource preparation at `0x22f0` and `0x22f8`.
+Translation next rejects its absolute memory read at `0x748`, before the
+shader can render. Packed-color blending is also still rejected. Thus the
+resource-discovery fix alone does not repair the character surfaces.
+
+## Checked FLAT reads from material pages
+
+Fragment shaders can now read absolute FLAT/GLOBAL addresses from the pages
+already discovered for pointer-form scalar loads. Each snapshot retains the
+guest base address and byte length; the shader checks the actual address and
+records an active missing read through the existing deferred fault path.
+Inactive reads do not raise a fault. This requires fragment storage and atomics;
+it does not substitute zero for an unsupported active address or enable writes
+to those snapshots. GPU storage overlapping a page is flushed before capture.
+
+Compute image candidates also reuse their instruction's resolved sampler
+instead of repeating identical analysis for each candidate. Uncompressed
+image loads retain their previous path. `PS5_GPU_COMPUTE_WARMUP=0` provides a
+diagnostic switch for the optional disk catalog while retaining foreground
+pipeline compilation. Cancelled warmup jobs are counted separately from
+successful and failed compiles. Six catalog tests pass.
+
+The `75ff79529607` ReleaseFast runner builds successfully. Ten native FLAT
+material cases cover narrow and wide tables, changed payloads, unaligned reads,
+active missing pages and inactive accesses. The zero-selection cases also
+change the payload between draws in the same renderer and verify the new
+pixel value. All 26 existing sparse-pointer/sampler cases, the workgroup image
+table and deferred FLAT-fault probes pass with Khronos synchronization
+validation, without VUID or synchronization errors. The game repeat uses
+two compiler workers and `PS5_GPU_COMPUTE_WARMUP=0` from launch.

@@ -690,7 +690,11 @@ fn run(init: std.process.Init) !bool {
         for (title_identifier[4..]) |character| {
             if (!std.ascii.isDigit(character)) break false;
         } else true;
-    const compute_warmup_directory = if (enable_async_pipelines and safe_shader_title)
+    const enable_compute_warmup = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMPUTE_WARMUP")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| true;
+    const compute_warmup_directory = if (enable_async_pipelines and enable_compute_warmup and safe_shader_title)
         try std.fmt.allocPrint(startup_arena, "out/shader-cache/{s}/compute-v1", .{title_identifier})
     else
         null;
