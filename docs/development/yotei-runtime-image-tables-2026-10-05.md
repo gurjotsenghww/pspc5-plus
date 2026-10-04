@@ -91,3 +91,12 @@ The preceding `8cc8cf3c3c7a` pair is backed up locally. Public release archives
 are unchanged. A new separate run uses the existing driver cache, 1080p output,
 Speed, the Performance game preference, two compiler workers and disabled
 background compute warmup. No build or other GPU probe runs alongside it.
+
+At the visible Medium difficulty menu, the new runner presents **37 frames in
+30.049 seconds (1.231 FPS)**. The only background diagnostic is the existing
+memory guard; no input, capture, profiler, build or other GPU test occurs during
+the interval. This matches the preceding 1.231 FPS sample and does not demonstrate
+a frame-rate gain. Bright vertical tree streaks remain. The subsequent transition
+is being investigated separately from this steady menu measurement.
+
+![Medium difficulty menu with runtime texture lookups; bright tree streaks remain](../images/yotei-runtime-texture-tree-2026-10-05.png)
