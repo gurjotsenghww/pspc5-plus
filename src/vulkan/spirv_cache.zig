@@ -163,6 +163,15 @@ pub const Cache = struct {
             try rdna2.spirv.validateStorageBufferBindings(options.storage_buffers, options.descriptor_array_length);
             break;
         };
+        for (options.sampled_images) |binding| if (binding.lookup != null) {
+            // Payload normalization must not let invalid candidate tuples hit
+            // an earlier valid entry and bypass the translator's validation.
+            try rdna2.spirv.validateSampledImageBindings(allocator, options.sampled_images, options.sampled_image_array_length orelse options.descriptor_array_length);
+            for (options.sampled_images) |candidate| {
+                if (candidate.lookup != null and candidate.candidate_words == null) return error.InvalidStorageBinding;
+            }
+            break;
+        };
         self.key.clearRetainingCapacity();
         const borrowed = if (reuse_program_hash_state.load(.monotonic)) prepared else null;
         // Include decoded instructions as well as code: NGG reconstruction and
@@ -179,7 +188,17 @@ pub const Cache = struct {
         var key_options = options;
         key_options.scalar_registers = &.{};
         key_options.storage_buffers = &.{};
+        key_options.sampled_images = &.{};
         try appendValue(&self.key, allocator, key_options);
+        try appendValue(&self.key, allocator, options.sampled_images.len);
+        for (options.sampled_images) |binding| {
+            var keyed = binding;
+            // Hashed lookups read exact descriptor words from the live SSBO.
+            // View kinds, slots, lookup bounds and fault checks still affect
+            // code generation and remain part of the key.
+            if (keyed.lookup != null) keyed.candidate_words = @splat(0);
+            try appendValue(&self.key, allocator, keyed);
+        }
         try appendValue(&self.key, allocator, options.storage_buffers.len);
         for (options.storage_buffers) |binding| {
             var keyed = binding;
@@ -473,6 +492,56 @@ test "dynamic buffer extents share translations while address and format rules r
 // Serialize fields, never padding or slice pointers. Hash matches require the
 // canonical content; immutable lifetime IDs only reuse a checked prefix.
 const appendValue = rdna2.cache_key.appendValue;
+
+test "sampled lookup payloads reuse translations while code and validation stay exact" {
+    const allocator = std.testing.allocator;
+    var program = try rdna2.decodeProgram(allocator, &.{
+        0x7e00_02f0, 0x7e02_02f0, 0xf09c_0f08, 0x0040_0400,
+        0x7e00_0280, 0xe078_0000, 0x8003_0400, 0xbf81_0000,
+    });
+    defer program.deinit(allocator);
+    var bindings = [_]rdna2.spirv.SampledImageBinding{
+        .{ .resource_sgpr = 0, .sampler_sgpr = 8, .descriptor_index = 0, .candidate_words = .{ 1, 2, 3, 4, 5, 6, 7, 8 }, .lookup = .{ .descriptor_index = 2, .word_offset = 0, .mask = 7, .probes = 3 } },
+        .{ .resource_sgpr = 0, .sampler_sgpr = 8, .descriptor_index = 1, .candidate_words = .{ 9, 2, 3, 4, 5, 6, 7, 8 }, .lookup = .{ .descriptor_index = 2, .word_offset = 0, .mask = 7, .probes = 3 } },
+    };
+    const options = rdna2.spirv.Options{
+        .stage = .compute,
+        .descriptor_array_length = 4,
+        .sampled_images = &bindings,
+        .storage_buffers = &.{.{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 64 }},
+    };
+    var cache = Cache{};
+    defer cache.deinit(allocator);
+    const original = try cache.acquire(allocator, &program, options, .{});
+    defer original.release();
+    bindings[0].candidate_words.?[0] = 100;
+    bindings[1].candidate_words.?[0] = 200;
+    const saved = bindings[0].candidate_words;
+    bindings[0].candidate_words = null;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(allocator, &program, options, .{}));
+    bindings[0].candidate_words = saved;
+    const relocated = try cache.acquire(allocator, &program, options, .{});
+    defer relocated.release();
+    try std.testing.expect(original.sameModule(relocated));
+    var fresh = try rdna2.translateProgramSpirv(allocator, &program, options);
+    defer fresh.deinit(allocator);
+    try std.testing.expectEqualSlices(u32, fresh.words, relocated.view().words);
+    // Neither a validation failure nor a real code change may alias that hit.
+    bindings[1].candidate_words = bindings[0].candidate_words;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(allocator, &program, options, .{}));
+    bindings[1].candidate_words.?[0] = 200;
+    for (&bindings) |*binding| binding.lookup.?.probes += 1;
+    const changed = try cache.acquire(allocator, &program, options, .{});
+    defer changed.release();
+    try std.testing.expect(!original.sameModule(changed));
+    for (&bindings) |*binding| binding.lookup = null;
+    const linear = try cache.acquire(allocator, &program, options, .{});
+    defer linear.release();
+    bindings[0].candidate_words.?[0] += 1;
+    const linear_changed = try cache.acquire(allocator, &program, options, .{});
+    defer linear_changed.release();
+    try std.testing.expect(!linear.sameModule(linear_changed));
+}
 
 test "prepared key reuse survives owner destruction and verifies hash collisions" {
     const a = std.testing.allocator;

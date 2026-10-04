@@ -9,6 +9,83 @@ const scalar = @import("scalar_provenance.zig");
 const maximum_blocks = 1024;
 pub const Tuple = [8]usize;
 
+pub const BufferPointer = struct { instruction: usize, high_word16: bool };
+
+/// Recover a correlated address pair selected from the same active lane.
+/// The upper word may discard a packed tag through WORD_0 sign extension.
+/// Keep the actual vector/scalar instructions; this only bounds host staging.
+pub fn bufferPointer(
+    instructions: []const rdna2.Instruction,
+    graph: *const rdna2.control_flow.Graph,
+    before: usize,
+    register: u32,
+) ?BufferPointer {
+    if (register >= 127 or before > instructions.len) return null;
+    var reads: [2]usize = undefined;
+    for (&reads, 0..) |*read, component| {
+        const definition = definitions.scalarDefinition(instructions, graph, before, register + @as(u32, @intCast(component))) orelse return null;
+        read.* = switch (definition) {
+            .entry => return null,
+            .instruction => |index| index,
+        };
+        const inst = instructions[read.*];
+        if (inst.opcode != .v_readfirstlane_b32 or !plain(inst.src0) or !plain(inst.dst)) return null;
+    }
+    if (reads[0] >= reads[1]) return null;
+    for (instructions[reads[0]..reads[1]]) |inst| if (writesExec(inst) or inst.opcode.isBranch()) return null;
+    const low = definitions.scalarLaneDefinition(instructions, graph, before, register, 0) orelse return null;
+    var high = definitions.scalarLaneDefinition(instructions, graph, before, register + 1, 0) orelse return null;
+    var high_word16 = false;
+    const move = instructions[high.instruction];
+    if (high.component == 0 and move.opcode == .v_mov_b32 and move.src0.kind == .vgpr and
+        move.src0.sdwa_sel == 4 and move.src0.sdwa_sext and plain(move.dst))
+    {
+        var source = move.src0;
+        source.sdwa_sel = 6;
+        source.sdwa_sext = false;
+        if (!plain(source)) return null;
+        high = definitions.vectorLaneDefinition(instructions, graph, high.instruction, move.src0.reg) orelse return null;
+        high_word16 = true;
+    }
+    if (low.component != 0 or high.component != 1 or low.instruction != high.instruction) return null;
+    const load = instructions[low.instruction];
+    if (load.opcode != .buffer_load_dwordx2 or load.data_words != 2 or !plain(load.dst)) return null;
+    return .{ .instruction = low.instruction, .high_word16 = high_word16 };
+}
+
+test "buffer pointer tuples retain the fetch and common active lane" {
+    var code = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .exec_lo } },
+        .{ .pc = 4, .opcode = .buffer_load_dwordx2, .dst = .{ .kind = .vgpr, .reg = 20 }, .data_words = 2 },
+        .{ .pc = 12, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 49 }, .src0 = .{ .kind = .vgpr, .reg = 21, .sdwa_sel = 4, .sdwa_sext = true } },
+        .{ .pc = 20, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 90 }, .src0 = .{ .kind = .vgpr, .reg = 20 } },
+        .{ .pc = 24, .opcode = .s_nop },
+        .{ .pc = 28, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 91 }, .src0 = .{ .kind = .vgpr, .reg = 49 } },
+        .{ .pc = 32, .opcode = .s_endpgm },
+    };
+    const original = code;
+    for (0..6) |variant| {
+        code = original;
+        switch (variant) {
+            1 => code[5].src0.reg = 21, // Untagged pair from the same fetch.
+            2 => code[2].src0.reg = 22, // Unrelated high word.
+            3 => code[4] = .{ .pc = 24, .opcode = .s_mov_b64, .dst = .{ .kind = .exec_lo }, .src0 = .{ .kind = .sgpr, .reg = 8 } },
+            4 => code[2].src0.negate = true,
+            5 => code[1].dst.sdwa_sel = 4,
+            else => {},
+        }
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &code);
+        defer graph.deinit(std.testing.allocator);
+        const pointer = bufferPointer(&code, &graph, 6, 90);
+        if (variant >= 2) {
+            try std.testing.expect(pointer == null);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), pointer.?.instruction);
+            try std.testing.expectEqual(variant == 0, pointer.?.high_word16);
+        }
+    }
+}
+
 fn plain(op: rdna2.Operand) bool {
     return std.meta.eql(op, rdna2.Operand{ .kind = op.kind, .reg = op.reg, .value = op.value, .signed_val = op.signed_val, .float_val = op.float_val });
 }

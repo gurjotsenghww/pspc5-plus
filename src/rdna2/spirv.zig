@@ -106,9 +106,15 @@ pub const SampledImageBinding = struct {
     lookup: ?sampled_lookup.Binding = null,
     /// Proven all-zero T# source. No physical image or sampler is required.
     unbound: bool = false,
-    /// A bounded table has no supported T#. Permit inactive image operations,
-    /// but report any active nonzero tuple instead of substituting an image.
+    /// Fault record for an active nonzero T# without a supported mapping.
+    /// Null and inactive accesses do not report a fault.
     unbound_fault_descriptor: ?u32 = null,
+    /// The host omitted unsupported records from a bounded candidate table.
+    /// Translation requires a fault buffer and checks the actual selected T#.
+    check_unmatched: bool = false,
+    /// Shared sampler recovered from a bounded table that may be indexed OOB.
+    /// Its actual runtime words must agree whenever a non-null T# is sampled.
+    expected_sampler_words: ?[4]u32 = null,
     /// Gather comparisons operate on each texel before any filtering.
     depth_compare: u8 = 7,
     /// The sampled image is read through a Vulkan comparison sampler.  This
@@ -1030,6 +1036,7 @@ const Builder = struct {
     uses_nonuniform_sampled_images: bool = false,
     uses_nonuniform_storage_buffers: bool = false,
     sampled_result_predicate: ?u32 = null,
+    sampled_check_match: ?u32 = null,
     sampled_dimension_override: ?SampledImageDimension = null,
     dpp_write_predicate: ?u32 = null,
     /// SPIR-V splits arbitrary-lane and relative-lane subgroup shuffles into
@@ -1436,11 +1443,17 @@ const Builder = struct {
             has_sampled_lookup = true;
         };
         var has_sampled_fault = false;
-        for (options.sampled_images) |binding| if (binding.unbound_fault_descriptor) |slot| {
-            if (!binding.unbound or options.stage != .compute or binding.resource_sgpr + 8 > 128 or slot >= options.descriptor_array_length)
-                return Error.InvalidStorageBinding;
-            has_sampled_fault = true;
-        };
+        for (options.sampled_images) |binding| {
+            if (binding.expected_sampler_words != null and (!binding.check_unmatched or binding.sampler_sgpr > 124)) return Error.InvalidStorageBinding;
+            if (binding.check_unmatched and binding.unbound_fault_descriptor == null) return Error.InvalidStorageBinding;
+            if (binding.unbound_fault_descriptor) |slot| {
+                if ((!binding.unbound and (!binding.check_unmatched or binding.candidate_words == null)) or
+                    (options.stage != .compute and options.stage != .fragment) or
+                    binding.resource_sgpr + 8 > 128 or slot >= options.descriptor_array_length)
+                    return Error.InvalidStorageBinding;
+                has_sampled_fault = true;
+            }
+        }
         if (options.storage_buffers.len != 0 or options.scalar_memories.len != 0 or options.flat_memories.len != 0 or has_sampled_lookup or has_sampled_fault or options.workgroup_memory_storage_slot != null) {
             // Storage buffers are used by compute and by graphics attribute
             // fetch / constant buffer MUBUF paths.
@@ -6052,6 +6065,16 @@ const Builder = struct {
                 // host descriptor, even for invocations whose T# does not match.
                 self.sampled_result_predicate = any_match;
             }
+            if (binding.check_unmatched) {
+                const fault_slot = binding.unbound_fault_descriptor orelse return Error.InvalidStorageBinding;
+                const matched = self.sampled_result_predicate.?;
+                if (self.sampled_dimension_override != null) {
+                    self.sampled_check_match = if (self.sampled_check_match) |previous|
+                        try self.bvhBinary(166, self.bool_type, previous, matched)
+                    else
+                        matched;
+                } else try self.checkUnboundImage(inst, fault_slot, matched, binding.expected_sampler_words);
+            }
             try self.emit(&self.annotations, 71, &.{ slot, 5300 }); // NonUniform
         }
         const pointer = self.id();
@@ -9424,8 +9447,8 @@ const Builder = struct {
             try self.destination(try consecutiveRegister(inst.dst, @intCast(component)), .{ .id = value, .value_type = .bits32 });
     }
 
-    fn checkUnboundImage(self: *Builder, inst: instruction.Instruction, slot: u32) Error!void {
-        if (self.stage != .compute) return Error.InvalidStorageBinding;
+    fn checkUnboundImage(self: *Builder, inst: instruction.Instruction, slot: u32, matched: ?u32, expected_sampler: ?[4]u32) Error!void {
+        if (self.stage != .compute and self.stage != .fragment) return Error.InvalidStorageBinding;
         const zero = try self.constant(.bits32, 0);
         var nonzero = try self.constantBool(false);
         var first_words: [2]u32 = undefined;
@@ -9435,6 +9458,20 @@ const Builder = struct {
             const either = self.id();
             try self.emit(&self.body, 166, &.{ self.bool_type, either, nonzero, try self.isNonZero(value) });
             nonzero = either;
+        }
+        var supported = matched;
+        if (expected_sampler) |words| {
+            var equal = try self.constantBool(true);
+            for (words, 0..) |word, index| {
+                const actual = try self.source(.{ .kind = .sgpr, .reg = inst.src2.reg + @as(u32, @intCast(index)) }, .bits32);
+                equal = try self.logicalAndValue(equal, try self.bvhBinary(170, self.bool_type, actual, try self.constant(.bits32, word)));
+            }
+            supported = try self.logicalAndValue(supported orelse try self.constantBool(false), equal);
+        }
+        if (supported) |known| {
+            const missing = self.id();
+            try self.emit(&self.body, 168, &.{ self.bool_type, missing, known });
+            nonzero = try self.logicalAndValue(nonzero, missing);
         }
         const predicate = (try self.writePredicate(nonzero)).?;
         const taken = self.id();
@@ -10170,6 +10207,8 @@ const Builder = struct {
         for (0..count) |component|
             original[component] = try self.source(try consecutiveRegister(inst.dst, @intCast(component)), .bits32);
         defer self.sampled_dimension_override = null;
+        self.sampled_check_match = null;
+        defer self.sampled_check_match = null;
         for (dimensions) |maybe_dimension| {
             const dimension = maybe_dimension orelse continue;
             // MIMG destinations may overlap its coordinate VGPRs. Restore
@@ -10189,6 +10228,7 @@ const Builder = struct {
             }
         }
         self.sampled_result_predicate = null;
+        if (first.check_unmatched) try self.checkUnboundImage(inst, first.unbound_fault_descriptor orelse return Error.InvalidStorageBinding, self.sampled_check_match orelse return Error.InvalidStorageBinding, first.expected_sampler_words);
         for (0..count) |component| try self.destination(
             try consecutiveRegister(inst.dst, @intCast(component)),
             .{ .id = combined[component], .value_type = .bits32 },
@@ -10228,7 +10268,8 @@ const Builder = struct {
                 if (inst.src1.kind == .sgpr and inst.src2.kind == .sgpr) {
                     if (self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc)) |binding| {
                         if (binding.unbound) {
-                            if (binding.unbound_fault_descriptor) |slot| try self.checkUnboundImage(inst, slot);
+                            if (binding.check_unmatched and binding.unbound_fault_descriptor == null) return Error.InvalidStorageBinding;
+                            if (binding.unbound_fault_descriptor) |slot| try self.checkUnboundImage(inst, slot, null, binding.expected_sampler_words);
                             const count: u32 = if (inst.opcode == .image_gather4) 4 else @popCount(inst.data_mask);
                             for (0..count) |component| try self.destination(
                                 try consecutiveRegister(inst.dst, @intCast(component)),

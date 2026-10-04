@@ -4024,6 +4024,7 @@ const ComputeResources = struct {
     flat_memory_count: usize = 0,
     flat_memory_fault: ?DrawUploadSlice = null,
     sampled_image_fault: ?DrawUploadSlice = null,
+    sampled_image_fault_slot: ?u32 = null,
     storage_images: [maximum_storage_images]PreparedStorageImage = undefined,
     /// Parallel to `storage_images`. Equal keys still confirm every field;
     /// the key only skips the ones that cannot match.
@@ -4076,6 +4077,7 @@ const ComputeResources = struct {
         result.flat_memory_count = 0;
         result.flat_memory_fault = null;
         result.sampled_image_fault = null;
+        result.sampled_image_fault_slot = null;
         result.storage_image_count = 0;
         result.storage_image_mapping_count = 0;
         result.sampled_image_count = 0;
@@ -5162,6 +5164,7 @@ pub const Renderer = struct {
     trace_buffer_reports: usize = 0,
     sampled_image_nonuniform_indexing: bool,
     storage_buffer_nonuniform_indexing: bool,
+    fragment_stores_and_atomics: bool = false,
     capture_extended_progress_frames: bool,
     shader_ir_enabled: bool,
     shader_ssa_optimization_enabled: bool,
@@ -6142,6 +6145,7 @@ pub const Renderer = struct {
             .trace_buffer_size = options.trace_buffer_size,
             .sampled_image_nonuniform_indexing = sampled_image_nonuniform_indexing,
             .storage_buffer_nonuniform_indexing = storage_buffer_nonuniform_indexing,
+            .fragment_stores_and_atomics = enabled_features.values[vk.feature_fragment_stores_and_atomics] != 0,
             .capture_extended_progress_frames = options.capture_extended_progress_frames,
             .shader_ir_enabled = options.enable_shader_ir,
             .shader_ssa_optimization_enabled = options.enable_shader_ssa_optimization,
@@ -11505,9 +11509,7 @@ pub const Renderer = struct {
     }
 
     fn prepareUnboundImageFault(self: *Renderer, result: *ComputeResources) anyerror!u32 {
-        for (result.sampled_image_mappings[0..result.sampled_image_mapping_count]) |mapping| {
-            if (mapping.unbound_fault_descriptor) |slot| return slot;
-        }
+        if (result.sampled_image_fault_slot) |slot| return slot;
         const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
         const upload = try self.allocateDrawUpload(16);
         const mapping = try self.mapDrawUpload(upload);
@@ -11516,6 +11518,7 @@ pub const Renderer = struct {
         self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, 16);
         result.occupied[slot] = true;
         result.sampled_image_fault = upload;
+        result.sampled_image_fault_slot = slot;
         self.active_descriptor_set = self.descriptor_set;
         self.frame_profile.upload_bytes +%= 16;
         self.frame_profile.storage_upload_bytes +%= 16;
@@ -12356,6 +12359,8 @@ pub const Renderer = struct {
                     .dimension = sampled_dimension,
                     .instruction_pc = inst.pc,
                     .candidate_words = candidate_words,
+                    .check_unmatched = if (candidate_table) |table| table.requires_null_check else false,
+                    .unbound_fault_descriptor = if (candidate_table != null and candidate_table.?.requires_null_check) try self.prepareUnboundImageFault(result) else null,
                     .depth_compare = sampler_descriptor.depth_compare,
                     .comparison = sampler_descriptor.compare_sample,
                     .minimum_lod = sampler_descriptor.minimum_lod,
@@ -21356,6 +21361,9 @@ pub const Renderer = struct {
             @memcpy(fragment_scalar_regs[0..fragment_scalar_count], fragment_storage.scalar_registers[0..fragment_scalar_count]);
         }
         try self.prepareSampledImageLookups(fragment_storage, graphics_resources.mappings[0..fragment_mapping_count]);
+        for (graphics_resources.mappings[0..fragment_mapping_count]) |*mapping| {
+            if (mapping.check_unmatched) mapping.unbound_fault_descriptor = try self.prepareUnboundImageFault(fragment_storage);
+        }
         if (tessellation) |tess| {
             const slot = fragment_storage.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
             _ = try self.stageGuestStorageBufferAt(slot, tess.factors.address, @intCast(tess.factors.size_bytes));
@@ -21927,6 +21935,7 @@ pub const Renderer = struct {
                     .{ .vertex = vertex_lease, .fragment = fragment_lease },
                 );
                 try self.checkFlatMemoryFault(fragment_storage, fragment_address, vk.pipeline_stage_fragment_shader_bit);
+                try self.checkSampledImageFault(fragment_storage, fragment_address, vk.pipeline_stage_fragment_shader_bit);
                 try self.commitStorageImages(memory, fragment_storage);
                 if (unity_ui_fallback) {
                     // The deferred HDR composite fallback presents its intact
@@ -22100,6 +22109,7 @@ pub const Renderer = struct {
             .{ .vertex_count = 3, .instance_count = 1 },
         );
         try self.checkFlatMemoryFault(fragment_storage, fragment_address, vk.pipeline_stage_fragment_shader_bit);
+        try self.checkSampledImageFault(fragment_storage, fragment_address, vk.pipeline_stage_fragment_shader_bit);
         try self.commitStorageImages(memory, fragment_storage);
     }
 
@@ -23035,9 +23045,9 @@ pub const Renderer = struct {
         const candidate_scratch = if (uniform_null) null else (try self.borrowBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
         defer if (candidate_scratch) |scratch| self.releaseBufferImageCandidates(scratch);
         const candidates: *const BufferImageCandidates = if (uniform_null) &empty_buffer_image_candidates else candidate_scratch.?;
-        // Graphics has no dispatch fault readback; keep its previous strict
-        // behavior until an equivalent draw-completion check is available.
-        if (candidates.requires_null_check) return false;
+        // Fragment faults are checked after the draw's exact completion tick.
+        // Vertex stages still require a completely supported candidate set.
+        if (candidates.requires_null_check and (bindings.stage != .pixel or !self.fragment_stores_and_atomics)) return false;
         if (candidates.count == 0) {
             if (result.mapping_count == result.mappings.len) return Error.UnsupportedSampledImage;
             result.mappings[result.mapping_count] = .{
@@ -23046,11 +23056,18 @@ pub const Renderer = struct {
                 .descriptor_index = 0,
                 .instruction_pc = inst.pc,
                 .unbound = true,
+                .check_unmatched = candidates.requires_null_check,
             };
             result.mapping_count += 1;
             return true;
         }
-        var sampler = candidates.sampler orelse (try resolveComputeSamplerDescriptor(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc, sampler_slot)) orelse return false;
+        var expected_sampler: ?[4]u32 = null;
+        var sampler = candidates.sampler orelse (try resolveComputeSamplerDescriptor(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc, sampler_slot)) orelse checked: {
+            if (bindings.stage != .pixel or !self.fragment_stores_and_atomics) return false;
+            const shared = (try resolveSharedBufferSampler(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc)) orelse return false;
+            expected_sampler = shared.words;
+            break :checked gpu.resources.decodeSamplerDescriptor(&shared.words) catch return false;
+        };
         if (inst.opcode == .image_gather4) sampler = pointGatherSampler(sampler);
         sampler.compare_sample = comparesThroughSampler(inst);
         for (candidates.words[0..candidates.count]) |words| {
@@ -23083,6 +23100,8 @@ pub const Renderer = struct {
                 .dimension = dimension,
                 .instruction_pc = inst.pc,
                 .candidate_words = words,
+                .check_unmatched = candidates.requires_null_check or expected_sampler != null,
+                .expected_sampler_words = expected_sampler,
                 .depth_compare = sampler.depth_compare,
                 .comparison = sampler.compare_sample,
                 .minimum_lod = sampler.minimum_lod,
@@ -35728,8 +35747,10 @@ fn scalarPointerTablePlan(
     const length = @as(u64, count - 1) * step + @as(u64, load.data_words) * 4;
     if (length > 1024 * 1024 or first + length > std.math.maxInt(u32)) return null;
     var words: [2]u32 = undefined;
-    if (!try resolver.words(@intCast(pointer_register), load.pc, &words) or words[1] > 0xffff) return null;
-    const base = @as(u64, words[0]) | (@as(u64, words[1]) << 32);
+    const base = if (try resolver.words(@intCast(pointer_register), load.pc, &words)) known: {
+        if (words[1] > 0xffff) return null;
+        break :known @as(u64, words[0]) | (@as(u64, words[1]) << 32);
+    } else (try resolveUniformVectorBufferPointer(bindings, reader, analysis, scalar, @intCast(pointer_register), load.pc)) orelse return null;
     if (base == 0 or base + first + length > 0x1_0000_0000_0000) return null;
     return .{ .base = base, .first = first, .step = step, .count = count };
 }
@@ -35761,7 +35782,13 @@ fn resolveScalarPointerImageCandidates(
         var words: [8]u32 = @splat(0);
         try reader.readWords(((plan.base + plan.first + index * plan.step) & ~@as(u64, 3)) + (sample.src1.reg - load.dst.reg) * 4, words[0..sample.imageResourceWords()]);
         if (std.mem.allEqual(u32, &words, 0)) continue;
-        _ = gpu.resources.decodeImageDescriptor(words[0..sample.imageResourceWords()]) catch return null;
+        _ = gpu.resources.decodeImageDescriptor(words[0..sample.imageResourceWords()]) catch {
+            // A conservative index bound includes unused material records.
+            // Keep their actual tuples in guest memory and diagnose selection
+            // at execution time; do not replace an active unsupported image.
+            result.requires_null_check = true;
+            continue;
+        };
         var duplicate = false;
         for (result.words[0..result.count]) |previous| if (std.mem.eql(u32, &previous, &words)) {
             duplicate = true;
@@ -35818,6 +35845,8 @@ fn typedIndexOperandRange(
 ) ?TypedIndexRange {
     if (op.negate or op.absolute or op.dpp or op.sdwa_sel != 6 or op.sdwa_sext) return null;
     if (op.kind == .integer_inline_constant or op.kind == .literal_constant) {
+        const signed: i32 = @bitCast(op.value);
+        if (signed < 0) return .{ .positive_limit = 0, .negative_magnitude = @intCast(-@as(i64, signed)) };
         return if (op.value < 65536) .{ .positive_limit = op.value + 1 } else null;
     }
     if (op.kind != .vgpr) return null;
@@ -35968,6 +35997,7 @@ fn resolveBufferTablePlan(
     // other in-bounds offsets reachable after wrap. Its residue class has
     // step gcd(stride, 2^32), a power of two.
     const displacement = @as(u64, @intCast(load.memory_offset)) + (wanted_sgpr - gpu.scalar_provenance.scalarRegisterIndex(load.dst).?) * 4;
+    var negative_selectors = false;
     if (index_bound == null and index_register != null) if (bindings) |inputs| {
         if (typedImageIndexRange(inputs, reader, analysis, scalar, index, index_register.?)) |range| {
             // Signed texels also produce negative indices. They may be
@@ -35977,7 +36007,10 @@ fn resolveBufferTablePlan(
             const negative_outside = range.negative_magnitude == 0 or
                 (displacement < multiplier and negative_bytes < (@as(u64, 1) << 32) and
                     (@as(u64, 1) << 32) - negative_bytes + displacement >= buffer.size_bytes);
-            if (negative_outside) index_bound = range.positive_limit;
+            if (negative_outside) {
+                index_bound = range.positive_limit;
+                negative_selectors = range.negative_magnitude != 0;
+            }
         }
     };
     const bounded = if (index_bound) |bound| displacement + @as(u64, bound) * multiplier <= std.math.maxInt(u32) else false;
@@ -35990,7 +36023,7 @@ fn resolveBufferTablePlan(
         .first = residue,
         .step = step,
         .limit = limit,
-        .fully_in_bounds = bounded and index_bound.? != 0 and
+        .fully_in_bounds = bounded and !negative_selectors and index_bound.? != 0 and
             displacement + @as(u64, index_bound.? - 1) * multiplier + wanted_words * 4 <= buffer.size_bytes,
     };
 }
@@ -36144,6 +36177,107 @@ const PointerCandidates = struct {
     addresses: [128]u64 = undefined,
     count: usize = 0,
 };
+
+/// A lane-varying buffer index can still select one non-null material table.
+/// Read every bounded record, retaining the guest's actual pointer calculation
+/// in SPIR-V. This supplies staging addresses, never a replacement SGPR value.
+fn resolveUniformVectorBufferPointer(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
+    register: u32,
+    before_pc: u32,
+) anyerror!?u64 {
+    const instructions = analysis.program.instructions.items;
+    const origin = gpu.vector_resources.bufferPointer(instructions, &analysis.graph, analysis.instructionBefore(before_pc), register) orelse return null;
+    const load = instructions[origin.instruction];
+    if (!load.index_enable or load.offset_enable or load.memory_offset < 0 or
+        load.src1.kind != .sgpr or !inlineIntegerOperand(load.src2, 0)) return null;
+    const buffer = (try resolveProducedBufferDescriptor(bindings, reader, analysis, scalar, load.src1.reg, load.pc, 0)) orelse return null;
+    if (buffer.swizzle_enabled or buffer.add_thread_id or buffer.stride < 8 or
+        buffer.record_count == 0 or buffer.record_count > 128 or buffer.size_bytes > 64 * 1024) return null;
+    const offset: u64 = @intCast(load.memory_offset);
+    if (offset + 8 > buffer.stride) return null;
+    var unique: ?u64 = null;
+    for (0..buffer.record_count) |index| {
+        const raw = reader.readU64(buffer.address + index * buffer.stride + offset) catch return null;
+        const high: u32 = @truncate(raw >> 32);
+        // WORD_0 sign extension is positive only below bit 15. Negative
+        // canonical addresses and other tag transforms need separate support.
+        if (if (origin.high_word16) high & 0x8000 != 0 else high > 0xffff) return null;
+        const pointer = if (origin.high_word16) raw & 0xffff_ffff_ffff else raw;
+        if (pointer == 0) continue;
+        if (unique) |previous| {
+            if (previous != pointer) return null;
+        } else unique = pointer;
+    }
+    return unique;
+}
+
+test "uniform vector buffer pointers reread records and reject ambiguity" {
+    const Memory = struct {
+        bytes: [32]u8 = @splat(0),
+        unavailable: bool = false,
+        fn read(context: ?*anyopaque, address: u64, output: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.unavailable or address < 0x1000 or address - 0x1000 + output.len > self.bytes.len) return false;
+            @memcpy(output, self.bytes[@intCast(address - 0x1000)..][0..output.len]);
+            return true;
+        }
+        fn seed(self: *@This(), index: usize, pointer: u64) void {
+            std.mem.writeInt(u64, self.bytes[index * 16 ..][0..8], pointer, .little);
+        }
+    };
+    var memory = Memory{};
+    const reader = gpu.ShaderMemoryReader{ .context = &memory, .read_fn = Memory.read };
+    var instructions = [_]gpu.ShaderInstruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .exec_lo } },
+        .{ .pc = 4, .opcode = .buffer_load_dwordx2, .dst = .{ .kind = .vgpr, .reg = 20 }, .src0 = .{ .kind = .vgpr, .reg = 28 }, .src1 = .{ .kind = .sgpr, .reg = 0 }, .src2 = .{ .kind = .integer_inline_constant }, .index_enable = true, .data_words = 2 },
+        .{ .pc = 12, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 49 }, .src0 = .{ .kind = .vgpr, .reg = 21, .sdwa_sel = 4, .sdwa_sext = true } },
+        .{ .pc = 20, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 90 }, .src0 = .{ .kind = .vgpr, .reg = 20 } },
+        .{ .pc = 24, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 91 }, .src0 = .{ .kind = .vgpr, .reg = 49 } },
+        .{ .pc = 28, .opcode = .s_and_b32, .dst = .{ .kind = .sgpr, .reg = 13 }, .src0 = .{ .kind = .sgpr, .reg = 14 }, .src1 = .{ .kind = .literal_constant, .value = 3 } },
+        .{ .pc = 36, .opcode = .s_mul_i32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .sgpr, .reg = 13 }, .src1 = .{ .kind = .literal_constant, .value = 368 } },
+        .{ .pc = 44, .opcode = .s_load_dwordx8, .dst = .{ .kind = .sgpr, .reg = 28 }, .src0 = .{ .kind = .sgpr, .reg = 90 }, .src1 = .{ .kind = .sgpr, .reg = 12 }, .data_words = 8, .memory_offset = 64 },
+        .{ .pc = 52, .opcode = .s_endpgm },
+    };
+    const program = rdna2.Program{ .code = &.{}, .instructions = .{ .items = &instructions, .capacity = instructions.len } };
+    var graph = try rdna2.buildControlFlow(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    var analysis: gpu.ShaderAnalysis = undefined;
+    analysis.program = program;
+    analysis.graph = graph;
+    analysis.scalar_definitions = null;
+    var bindings = std.mem.zeroes(gpu.ShaderBindings);
+    bindings.user_data_count = 4;
+    @memcpy(bindings.user_data[0..4], &[_]u32{ 0x1000, 16 << 16, 2, 0x5204 });
+    const scalar = gpu.ScalarEvaluation{};
+    memory.seed(0, 0x0170_0020_1234_5600);
+    memory.seed(1, 0x0170_0020_1234_5600);
+    try std.testing.expectEqual(@as(?u64, 0x20_1234_5600), try resolveUniformVectorBufferPointer(&bindings, reader, &analysis, &scalar.registers, 90, 44));
+    const plan = (try scalarPointerTablePlan(&bindings, reader, &analysis, &scalar.registers, &instructions[7])).?;
+    try std.testing.expectEqual(@as(u64, 0x20_1234_5600), plan.base);
+    try std.testing.expectEqual(@as(u32, 4), plan.count);
+    try std.testing.expectEqual(@as(u64, 64), plan.first);
+    memory.seed(1, 0x0170_0020_5678_0000);
+    try std.testing.expectEqual(@as(?u64, null), try resolveUniformVectorBufferPointer(&bindings, reader, &analysis, &scalar.registers, 90, 44));
+    memory.seed(0, 0x0170_0020_5678_0000);
+    try std.testing.expectEqual(@as(?u64, 0x20_5678_0000), try resolveUniformVectorBufferPointer(&bindings, reader, &analysis, &scalar.registers, 90, 44));
+    memory.seed(0, 0);
+    try std.testing.expectEqual(@as(?u64, 0x20_5678_0000), try resolveUniformVectorBufferPointer(&bindings, reader, &analysis, &scalar.registers, 90, 44));
+    memory.seed(1, 0x0170_8020_5678_0000);
+    try std.testing.expectEqual(@as(?u64, null), try resolveUniformVectorBufferPointer(&bindings, reader, &analysis, &scalar.registers, 90, 44));
+    memory.seed(1, 0x0170_0020_5678_0000);
+    memory.unavailable = true;
+    try std.testing.expectEqual(@as(?u64, null), try resolveUniformVectorBufferPointer(&bindings, reader, &analysis, &scalar.registers, 90, 44));
+    memory.unavailable = false;
+    bindings.user_data[1] = 4 << 16;
+    try std.testing.expectEqual(@as(?u64, null), try resolveUniformVectorBufferPointer(&bindings, reader, &analysis, &scalar.registers, 90, 44));
+    bindings.user_data[1] = 16 << 16;
+    bindings.user_data[2] = 129;
+    try std.testing.expectEqual(@as(?u64, null), try resolveUniformVectorBufferPointer(&bindings, reader, &analysis, &scalar.registers, 90, 44));
+}
 
 fn resolveBufferPointerCandidates(
     bindings: *const gpu.ShaderBindings,
@@ -36399,24 +36533,42 @@ fn resolveProducedSamplerDescriptor(
     };
     var words: [4]u32 = undefined;
     if (!try resolver.words(sampler_sgpr, before_pc, &words)) {
-        const plan = (resolveBufferTablePlan(reader, analysis, scalar, sampler_sgpr, 4, before_pc, bindings, 16384) catch return null) orelse return null;
         // A sampler can be shared by dynamically chosen material records only
         // when every possible load is in bounds and all four words agree.
         // Otherwise even an OOB zero sampler could select different filtering.
-        if (!plan.fully_in_bounds or plan.buffer.address & 3 != 0) return null;
-        var first = true;
-        var offset = plan.first;
-        while (offset < plan.limit) : (offset += plan.step) {
-            var candidate: [4]u32 = undefined;
-            reader.readWords(plan.buffer.address + (offset & ~@as(u64, 3)), &candidate) catch return null;
-            if (first) {
-                words = candidate;
-                first = false;
-            } else if (!std.mem.eql(u32, &words, &candidate)) return null;
-        }
-        if (first) return null;
+        const shared = (try resolveSharedBufferSampler(bindings, reader, analysis, scalar, sampler_sgpr, before_pc)) orelse return null;
+        if (!shared.fully_in_bounds) return null;
+        words = shared.words;
     }
     return gpu.resources.decodeSamplerDescriptor(&words) catch null;
+}
+
+const SharedBufferSampler = struct { words: [4]u32, fully_in_bounds: bool };
+
+/// Out-of-bounds selectors may return a different (zero or partial) sampler.
+/// Such a result is usable only together with a GPU check of all actual words.
+fn resolveSharedBufferSampler(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.scalar_provenance.ScalarRegisters,
+    sampler_sgpr: u32,
+    before_pc: u32,
+) anyerror!?SharedBufferSampler {
+    const plan = (resolveBufferTablePlan(reader, analysis, scalar, sampler_sgpr, 4, before_pc, bindings, 16384) catch return null) orelse return null;
+    if (plan.buffer.address & 3 != 0) return null;
+    var words: ?[4]u32 = null;
+    var offset = plan.first;
+    while (offset < plan.limit) : (offset += plan.step) {
+        const byte = offset & ~@as(u64, 3);
+        if (byte + 16 > plan.buffer.size_bytes) return null;
+        var candidate: [4]u32 = undefined;
+        reader.readWords(plan.buffer.address + byte, &candidate) catch return null;
+        if (words) |previous| {
+            if (!std.mem.eql(u32, &previous, &candidate)) return null;
+        } else words = candidate;
+    }
+    return .{ .words = words orelse return null, .fully_in_bounds = plan.fully_in_bounds };
 }
 
 fn resolveComputeSampledImageDescriptor(
@@ -40125,6 +40277,66 @@ test "buffer table plans follow reaching loads and offsets across sibling branch
             try std.testing.expectEqual(@as(u64, 384), plan.?.limit);
         }
     }
+}
+
+test "shared sampler tables retain signed selectors and reject ambiguous records" {
+    const Memory = struct {
+        bytes: [272]u8 = @splat(0xaa),
+        unavailable: bool = false,
+        fn read(context: ?*anyopaque, address: u64, output: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.unavailable or address < 0x1000 or address - 0x1000 + output.len > self.bytes.len) return false;
+            @memcpy(output, self.bytes[@intCast(address - 0x1000)..][0..output.len]);
+            return true;
+        }
+    };
+    var memory = Memory{};
+    const words = [_]u32{ 0x600, 0xfff000, 0xaf00000, 0 };
+    for (0..2) |record| for (words, 0..) |word, component|
+        std.mem.writeInt(u32, memory.bytes[record * 136 + 80 + component * 4 ..][0..4], word, .little);
+    const reader = gpu.ShaderMemoryReader{ .context = &memory, .read_fn = Memory.read };
+    var instructions = [_]gpu.ShaderInstruction{
+        .{ .pc = 0, .opcode = .v_cndmask_b32, .dst = .{ .kind = .vgpr, .reg = 28 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0xffffffff }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 4, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .vgpr, .reg = 28 } },
+        .{ .pc = 8, .opcode = .s_mul_i32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .literal_constant, .value = 136 } },
+        .{ .pc = 16, .opcode = .s_buffer_load_dwordx4, .dst = .{ .kind = .sgpr, .reg = 32 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .sgpr, .reg = 12 }, .memory_offset = 80, .data_words = 4 },
+        .{ .pc = 24, .opcode = .s_endpgm },
+    };
+    const program = rdna2.Program{ .code = &.{}, .instructions = .{ .items = &instructions, .capacity = instructions.len } };
+    var graph = try rdna2.buildControlFlow(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    var analysis: gpu.ShaderAnalysis = undefined;
+    analysis.program = program;
+    analysis.graph = graph;
+    analysis.scalar_definitions = null;
+    var bindings = std.mem.zeroes(gpu.ShaderBindings);
+    bindings.user_data_count = 4;
+    @memcpy(bindings.user_data[0..4], &[_]u32{ 0x1000, 136 << 16, 2, 0x5204 });
+    const scalar = gpu.ScalarEvaluation{};
+    for (0..4) |variant| {
+        instructions[0].src0.value = switch (variant) {
+            2 => 0,
+            3 => 0x80000000,
+            else => 0xffffffff,
+        };
+        instructions[0].src1.value = if (variant == 1) 3 else 1;
+        const shared = try resolveSharedBufferSampler(&bindings, reader, &analysis, &scalar.registers, 32, 24);
+        if (variant == 3) {
+            // Large negative products can wrap back into unrelated fields.
+            try std.testing.expect(shared == null);
+        } else {
+            try std.testing.expectEqual(words, shared.?.words);
+            try std.testing.expectEqual(variant == 2, shared.?.fully_in_bounds);
+            const unchecked = try resolveProducedSamplerDescriptor(&bindings, reader, &analysis, &scalar.registers, 32, 24);
+            try std.testing.expectEqual(variant == 2, unchecked != null);
+        }
+    }
+    instructions[0].src0.value = 0;
+    memory.bytes[216] ^= 1;
+    try std.testing.expectEqual(@as(?SharedBufferSampler, null), try resolveSharedBufferSampler(&bindings, reader, &analysis, &scalar.registers, 32, 24));
+    memory.bytes[216] ^= 1;
+    memory.unavailable = true;
+    try std.testing.expectEqual(@as(?SharedBufferSampler, null), try resolveSharedBufferSampler(&bindings, reader, &analysis, &scalar.registers, 32, 24));
 }
 
 test "loaded scalar index bounds reread payloads and reject unavailable proof" {

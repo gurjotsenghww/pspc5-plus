@@ -678,7 +678,7 @@ fn maskIsSubsetOfVectorWrite(instructions: []const Instruction, graph: *const Gr
             proof.visited[proof.count] = visit;
             proof.count += 1;
             const inst = instructions[index];
-            if (register == 126 and (inst.opcode == .s_and_saveexec_b64 or
+            if (register == 126 and (inst.opcode == .s_and_saveexec_b64 or inst.opcode == .s_andn1_saveexec_b64 or
                 (std.mem.startsWith(u8, @tagName(inst.opcode), "v_cmpx_") and inst.dst.kind == .exec_lo)))
             {
                 if (!maskIsSubsetOfVectorWrite(instructions, graph, index, 126, vector_write, proof)) return false;
@@ -746,6 +746,23 @@ test "vector index sources reject lanes restored outside the fetch mask" {
     try std.testing.expectEqual(@as(?Definition, .{ .instruction = 2, .component = 3 }), vectorLaneDefinition(&instructions, &graph, 4, 18));
     instructions[2].dst.sdwa_sel = 4;
     try std.testing.expect(vectorLaneDefinition(&instructions, &graph, 4, 18) == null);
+}
+
+test "inverted predicate saveexec still narrows initialized vector lanes" {
+    const exec = rdna2.Operand{ .kind = .exec_lo };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = exec },
+        .{ .pc = 4, .opcode = .buffer_load_dwordx2, .dst = .{ .kind = .vgpr, .reg = 20 }, .data_words = 2 },
+        .{ .pc = 12, .opcode = .s_andn1_saveexec_b64, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .sgpr, .reg = 12 } },
+        .{ .pc = 16, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 24 }, .src0 = .{ .kind = .vgpr, .reg = 20 } },
+        .{ .pc = 20, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?Definition, .{ .instruction = 1, .component = 0 }), scalarLaneDefinition(&instructions, &graph, 4, 24, 0));
+    // ORN2 can enable lanes outside the fetch mask and is not a valid proof.
+    instructions[2].opcode = .s_orn2_saveexec_b64;
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 4, 24, 0) == null);
 }
 
 /// The vector definition shared by every lane a waterfall can select.

@@ -12021,6 +12021,103 @@ fn runGraphicsDescriptorReuseProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("graphics descriptor reuse passed: 2D/array sample followed by 2D gather, distinct images, repeated physical binding, query-only LOD masks and uniform null sample/gather without nonuniform indexing\n", .{});
 }
 
+fn runSparsePointerFragmentProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |dynamic_sampler| {
+        for ([_]bool{ false, true }) |wide| {
+            for (0..@as(usize, if (dynamic_sampler) 8 else 5)) |selection| {
+                var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
+                defer renderer.deinit();
+                var guest = GuestMemory{};
+                const vertex = [_]u32{
+                    vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+                    vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+                    vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+                    0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+                    0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+                };
+                const pointer_load = mubuf(0x0d, 0, 20, 0, 20);
+                const records: u32 = if (wide) 256 else 4;
+                const valid_records: u32 = if (wide) 128 else 2;
+                const selected: u32 = switch (selection) {
+                    0 => 0,
+                    1 => 1,
+                    2 => records - 2,
+                    3, 4 => records - 1,
+                    7 => 1,
+                    else => 0,
+                };
+                const inactive = selection == 4 or selection == 6;
+                const fragment = [_]u32{
+                    vop1(1, 0, 128), pointer_load[0], pointer_load[1],
+                    vop1(2, 12, 276), vop1(2, 13, 277), // correlated pointer words from one vector fetch
+                    vop1(1, 30, 16),  vop1(2, 24, 286),
+                    0x8718_ff18, records - 1, // bound the material index
+                    0x931a_ff18, 32,
+                    0xf40c_0006,                                                   26 << 25, // T#s0 from pointer s12:s13 plus s26
+                    // A two-record S# table, with possible out-of-bounds selectors.
+                    if (dynamic_sampler) vop1(1, 31, 17) else 0xbf80_0000,         if (dynamic_sampler) vop1(2, 26, 287) else 0xbf80_0000,
+                    if (dynamic_sampler) sop2(0x0e, 26, 26, 131) else 0xbf80_0000, if (dynamic_sampler) sop2(0x26, 26, 26, 160) else 0xbf80_0000,
+                    if (dynamic_sampler) 0xf428_020a else 0xbf80_0000,             if (dynamic_sampler) (26 << 25) | 16 else 0xbf80_0000,
+                    vop1(1, 0, 240),                                               vop1(1, 1, 240),
+                    vop1(1, 2, 240),                                               vop1(1, 4, 128),
+                    vop1(1, 5, 128),                                               vop1(1, 6, 128),
+                    if (inactive) sop1(4, 126, 128) else 0xbf80_0000,              0xf09c_0f08,
+                    0x0040_0400,                                                   if (inactive) sop1(4, 126, 193) else 0xbf80_0000,
+                    vop1(1, 7, 242),                                               0xf800_080f,
+                    0x0706_0504,                                                   0xbf81_0000,
+                };
+                for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
+                for (fragment, 0..) |word, index| guest.word(0x900 + index * 4, word);
+                for (0..2) |record| {
+                    guest.word(0x6000 + record * 32, 0x18000);
+                    for ([_]u32{ 0x600, 0xfff000, 0xaf00000, 0 }, 0..) |word, component|
+                        guest.word(0x6010 + record * 32 + component * 4, word);
+                }
+                for (0..valid_records) |index| {
+                    const address: u32 = 0x8000 + @as(u32, @intCast(index)) * 256;
+                    var image = sampledImageDescriptorWords(address, 1, 1);
+                    if (index == 1) image[3] = (image[3] & 0x0fff_ffff) | 0xa000_0000; // a second view bank
+                    for (image, 0..) |word, component| guest.word(0x18000 + index * 32 + component * 4, word);
+                    guest.word(address, if (index == 1) 0xffff_0000 else 0xff00_00ff);
+                }
+                guest.word(0x18000 + (records - 1) * 32, 0xdead_beef); // unused unless selected explicitly
+                var state = gpu.State{};
+                for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, address| {
+                    try state.writeRegister(.shader, stage.programRegisterBase(), address);
+                    try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+                }
+                const pixel = gpu.resources.ShaderStage.pixel;
+                try state.writeRegister(.shader, pixel.userDataBase() - 1, 24 << 1);
+                try state.writeRegister(.shader, pixel.userDataBase() + 16, selected);
+                try state.writeRegister(.shader, pixel.userDataBase() + 17, if (selection == 2 or selection >= 5) 2 else 1);
+                for ([_]u32{ 0x6000, 32 << 16, 2, 0 }, 0..) |word, index|
+                    try state.writeRegister(.shader, pixel.userDataBase() + 20 + @as(u32, @intCast(index)), word);
+                const context = [_][2]u32{
+                    .{ 0x318, 0x20 },                    .{ 0x319, 7 },               .{ 0x31b, 0 },               .{ 0x31c, 10 << 2 }, .{ 0x31d, 0 },
+                    .{ 0x390, 0 },                       .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },         .{ 0x08e, 0xf },     .{ 0x00c, 0 },
+                    .{ 0x00d, 64 | (64 << 16) },         .{ 0x094, 1 << 31 },         .{ 0x095, 64 | (64 << 16) }, .{ 0x1e0, 0 },       .{ 0x200, 0 },
+                    .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },               .{ 0x205, 0 },
+                };
+                for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+                for ([_]f32{ 32, 32, 32, 32, 1, 0 }, 0..) |value, index|
+                    try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+                var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+                if (selection == 3 or selection == 5 or selection == 7) {
+                    try std.testing.expectEqual(error.UnsupportedSampledImage, renderer.last_draw_error.?);
+                } else {
+                    if (renderer.last_draw_error) |err| return err;
+                    try renderer.flushPendingGuestWrites();
+                    const center = 0x2000 + (32 * 64 + 32) * 4;
+                    const expected: u32 = if (selection == 0) 0xff00_00ff else if (selection == 1) 0xffff_0000 else 0xff00_0000;
+                    try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[center..][0..4], .little));
+                }
+                std.debug.print("sparse pointer fragment: dynamic_sampler={} wide={} selection={d} verified\n", .{ dynamic_sampler, wide, selection });
+            }
+        }
+    }
+}
+
 fn runUnsupportedTextureContinuationProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -12312,6 +12409,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--unsupported-texture-continuation")) {
         try runUnsupportedTextureContinuationProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sparse-pointer-fragment")) {
+        try runSparsePointerFragmentProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--graphics-descriptor-reuse")) {

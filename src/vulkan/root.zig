@@ -40,4 +40,5 @@ test {
     _ = @import("pipeline_warmup.zig");
     _ = @import("buffer_write_history.zig");
     _ = @import("buffer_write_ranges.zig");
+    _ = @import("spirv_cache.zig");
 }
