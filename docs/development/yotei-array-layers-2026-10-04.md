@@ -406,3 +406,112 @@ and generations for a masked MRT attachment while another attachment is drawn.
 Five filtered kernel tests pass, including native protection/unmapping,
 invalid sub-page entries and partial batch progress. Runtime performance of
 these changes remains to be measured in the rebuilt runner.
+
+
+## Color-generation repeat and correlated material pointers
+
+The isolated `65d5fa9609ec` runner presents 39 frames in 30.047 seconds on the
+wolf screen (1.298 FPS) and 39 in 30.044 seconds at the tree (1.298 FPS). The
+post-tree interval presents only 4 frames in 60.092 seconds (0.0666 FPS).
+Measurements count presented frames without input, screenshots, sampling or
+compilation during each interval. The two-frame tree difference from the
+packed-color repeat is too small, and cache history differs too much, to
+attribute a performance improvement to the content-generation change.
+
+The dark cinematic advances, but bodies and lighting remain incomplete. This
+run is deliberately stopped for rebuilding; character control is not reached.
+A live allocation census finds approximately 1,014 MiB of color attachments,
+320 MiB of depth attachments, 1,763 MiB of storage images and 2,045 MiB of
+sampled images. Process private memory is approximately 22 GiB. Individual
+frames still upload several GiB and spend many seconds waiting for GPU work;
+these counters do not establish a single cause for the stalls.
+
+![Incomplete characters in the color-generation repeat](../images/yotei-color-epoch-post-tree-2026-10-04.png)
+
+A local replay of the failing pixel shader identifies a lost material-table
+address: two `v_readfirstlane_b32` operations select a pointer produced by the
+same vector buffer fetch, with WORD_0 sign extension removing the upper tag.
+The proof now follows the common active lane through `s_andn1_saveexec_b64`
+and accepts only bounded records with one non-null pointer. Distinct pointers,
+unknown memory, changed execution masks and unsupported transforms retain
+the unsupported path. Payloads are reread rather than cached as constants.
+
+A conservative material-index bound also includes unused non-descriptor
+records. The candidate collector retains decodable textures and marks this
+case for a GPU check of the actual selected tuple. Both linear and hashed
+lookups retain exact descriptor matching, including mixed 2D/3D banks. An
+active unsupported tuple produces an explicit error; an unused malformed
+record does not reject the entire draw. The captured material-table replay
+now finds 60 distinct image descriptors; this is resource-discovery evidence,
+not proof that the complete game shader renders correctly.
+
+Eight focused GPU analysis tests and the pointer-staging tests pass. Native
+Vulkan checks cover known pixel colors, empty descriptors and active malformed
+descriptors with small and hashed mixed-view tables. Existing indirect-image,
+graphics-descriptor-reuse and deferred sampled-fault probes pass with Khronos
+synchronization validation. The `60cfcb943c44` game repeat measures 38 frames in 30.046 seconds on the
+wolf screen (1.265 FPS), 37 in 30.045 seconds at the tree (1.232 FPS), and
+3 in 60.099 seconds after the tree (0.0499 FPS). Incomplete character surfaces
+remain. This candidate still rejects the material draw because its sampler
+cannot be recovered. It is deliberately stopped for rebuilding. The installed
+runner and release archives are unchanged.
+
+![Material-pointer repeat with incomplete character surfaces](../images/yotei-material-pointer-post-tree-2026-10-04.png)
+
+## Checked material samplers and sampled-lookup translation reuse
+
+The captured material shader obtains its sampler from two 136-byte records.
+A possible `-1` selector previously made the analysis enumerate unrelated
+fields at eight-byte intervals. Signed constant bounds now retain the negative
+range and exclude wrapped offsets only when they cannot land inside the table.
+Negative or oversized selectors still prevent an unconditional sampler proof.
+
+When all in-bounds sampler records agree, the fragment path can use that
+sampler with a GPU comparison of all four actual sampler words. A non-null
+image with an unexpected sampler reports an explicit resource fault; null
+images and inactive invocations retain their existing behavior. This requires
+fragment storage and atomics support. Ambiguous records and inaccessible
+memory still fail preparation. The captured replay now recovers both the
+material pointer and the shared sampler, without changing guest registers.
+
+Five focused staging tests pass. The native sparse-pointer probe verifies 26
+cases across linear/hashed lookups and mixed 2D/3D images, including in-bounds,
+out-of-bounds and inactive sampler selections. Large 4,352-texture tables,
+deferred sampled faults and graphics descriptor reuse also pass with Khronos
+synchronization validation and no VUID or synchronization errors.
+
+Sampled-image lookup payloads no longer produce a different SPIR-V cache key
+when the shader reads those payloads from its runtime lookup buffer. Exact
+runtime descriptor matching remains. Lookup layout, bindings, image dimensions,
+fault checks and all other code-generating options still enter the key; linear
+lookups retain their literal words. Original bindings are validated before a
+cache hit. The focused cache tests compare a reused module against a fresh
+translation and reject invalid candidate tuples.
+
+The combined `ea19ad75fc5f` runner repeats the tree at 37 presented frames in
+30.046 seconds (1.231 FPS), unchanged from the material-pointer candidate.
+A post-tree interval presents 5 frames in 60.094 seconds (0.0832 FPS). It
+covers a different moment of the cinematic than the previous three-frame
+interval, so this is not evidence of a sustained speedup.
+
+The previous pixel-resource rejection at `0x8b4` is passed. Preparation of the
+same `0x800026ed00` shader now reaches `0x22f0`, where it reports a 1D-array
+image incompatible with the 2D operation. That instruction loads its texture
+from an indexed 136-byte table. Its descriptor provenance and metadata fallback
+still need investigation; adding a guessed image-type conversion would not
+establish correctness. The `0x800027c200` compute sampler and source-alpha
+blending on the packed UNORM attachment remain unsupported.
+
+A genuine post-tree capture remains dark and incomplete. Tree streaks persist,
+and character control is not reached. The pause overlay responds after a held
+Options input but offers no visible skip action. System available physical
+memory falls below 1 GiB during this run; Windows raises its commit limit
+automatically. No pagefile setting or cache budget was changed. The diagnostic
+is deliberately stopped for further work, not terminated by a guest fault.
+The installed `zig-out/bin/game-run.exe` and public release archives remain
+unchanged; this candidate is isolated under `out/yotei-gameplay-20261004`.
+
+Local KytyPS5 source review finds texture garbage-collection thresholds derived
+from its reported memory budget (`textureCache.cpp`). This is a useful direction
+for a coordinated renderer budget, not a measured optimization copied into this
+candidate. Repeated texture uploads and fence waits remain major costs.
