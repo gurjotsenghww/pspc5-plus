@@ -661,6 +661,8 @@ pub fn build(b: *std.Build) void {
     vulkan_smoke.stack_size = 64 * 1024 * 1024;
     const install_vulkan_smoke = b.addInstallArtifact(vulkan_smoke, .{});
     b.getInstallStep().dependOn(&install_vulkan_smoke.step);
+    const build_vulkan_smoke_step = b.step("build-vulkan-smoke", "Build the Vulkan probe without running it");
+    build_vulkan_smoke_step.dependOn(&install_vulkan_smoke.step);
 
     const vulkan_smoke_cmd = b.addRunArtifact(vulkan_smoke);
     vulkan_smoke_cmd.step.dependOn(&install_vulkan_smoke.step);

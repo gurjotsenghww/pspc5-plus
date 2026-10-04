@@ -5548,6 +5548,8 @@ fn runStorageImageReuseCase(allocator: std.mem.Allocator, count: usize, byte_bud
     // Earlier dirty views must remain on the GPU until a CPU consumer asks.
     try std.testing.expectEqual(@min(@as(usize, 1024), count, byte_budget / 4), renderer.storage_image_cache.items.len);
     try std.testing.expect(renderer.storage_image_cache_bytes <= byte_budget);
+    if (count == 320 and count * 4 <= byte_budget)
+        try std.testing.expect(renderer.storage_image_transfer == null);
     if (count == 320 and count * 4 <= byte_budget) try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x4000 .. 0x4000 + count * 256], 0));
     if (count == 320 and count * 4 <= byte_budget) {
         // Device-memory recovery cannot discard GPU-only contents. Complete
@@ -5572,6 +5574,8 @@ fn runStorageImageReuseCase(allocator: std.mem.Allocator, count: usize, byte_bud
         try std.testing.expectEqualSlices(u8, &.{ @intCast(42 + (i / 2) % 200), 0, 0, 0 }, &pixel);
     }
     for (renderer.storage_image_cache.items) |cached| try std.testing.expectEqual(@as(usize, 0), cached.pin_count);
+    // Hundreds of independently dirty images use only one readback buffer.
+    try std.testing.expectEqual(@as(u64, 4), renderer.storage_image_transfer.?.size);
 }
 
 fn runFragmentCoverageProbe(allocator: std.mem.Allocator) !void {
@@ -12183,6 +12187,22 @@ pub fn main(init: std.process.Init) !void {
             defer renderer.deinit();
             try renderer.probeDynamicViewportScissor();
             std.debug.print("dynamic viewport/scissor passed: persistent_depth={any}, clipping, translation, flipped Y, extent reuse, depth ranges and static-state separation\n", .{persistent});
+        }
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-array-refresh")) {
+        for ([_]bool{ false, true }) |timeline| {
+            var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = timeline });
+            defer renderer.deinit();
+            var guest = GuestMemory{};
+            guest.watch_generation = 1;
+            var memory = guest.interface();
+            memory.track_gpu_read = GuestMemory.track;
+            memory.gpu_generation = GuestMemory.generation;
+            memory.fingerprint = GuestMemory.fingerprint;
+            _ = renderer.dcbBackend(memory);
+            try renderer.probeSampledArrayRefresh();
+            std.debug.print("sampled array refresh passed: timeline={any}, preserved layers, queued revisions, CPU-write and prepared-binding rejection, no texture upload/readback\n", .{timeline});
         }
         return;
     }

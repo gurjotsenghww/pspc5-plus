@@ -3023,6 +3023,8 @@ const FrameProfile = struct {
     sampled_page_calls: u64 = 0,
     sampled_exact_hits: u64 = 0,
     sampled_view_hits: u64 = 0,
+    sampled_array_refreshes: u64 = 0,
+    sampled_array_layers: u64 = 0,
     sampled_slow_paths: u64 = 0,
     flush_alias_ns: u64 = 0,
     flush_storage_image_ns: u64 = 0,
@@ -3164,7 +3166,13 @@ const ColorBackingRange = struct { offset: usize, size: usize };
 
 fn colorTargetBackingRange(target: GuestColorTarget) ColorBackingRange {
     const fallback = ColorBackingRange{ .offset = 0, .size = @intCast(target.layout.required_source_bytes) };
-    const view = target.layout.subresource orelse return fallback;
+    const view = target.layout.subresource orelse {
+        const layout = target.layout;
+        const start = layout.source_base_offset + layout.source_slice_bytes * layout.first_slice;
+        const size = layout.source_slice_bytes * layout.layers;
+        if (start > fallback.size or size > fallback.size - start) return fallback;
+        return .{ .offset = @intCast(start), .size = @intCast(size) };
+    };
     if (view.kind != .array_2d or view.depth_or_layers != 1 or view.samples() != 1) return fallback;
     if (!view.in_tail) {
         const start: usize = @intCast(view.level_offset + view.source_layer_bytes * view.first_slice);
@@ -3677,7 +3685,6 @@ const PreparedStorageImage = struct {
     subresource: gpu.TextureSubresourceLayout,
     image: OwnedImage,
     view: vk.ImageView,
-    transfer: OwnedBuffer,
     allocation_bytes: usize,
     staging_bytes: usize,
     writable: bool,
@@ -3691,7 +3698,6 @@ const CachedStorageImage = struct {
     subresource: gpu.TextureSubresourceLayout,
     image: OwnedImage,
     view: vk.ImageView,
-    transfer: OwnedBuffer,
     allocation_bytes: usize,
     staging_bytes: usize,
     last_used_sequence: u64,
@@ -3736,7 +3742,6 @@ test "cold storage collection preserves dirty, pinned, depth-derived and recent 
         .subresource = undefined,
         .image = undefined,
         .view = 0,
-        .transfer = undefined,
         .allocation_bytes = 0,
         .staging_bytes = 0,
         .last_used_sequence = 1,
@@ -4857,6 +4862,8 @@ const CachedSampledImage = struct {
     image_state_hash: u64,
     upload_state_hash: u64,
     source_generation: u64,
+    // Separate CPU-write proof for refreshing individual resident array layers.
+    guest_page_generation: u64 = 0,
     content_hash: u64,
     image: OwnedImage,
     view: vk.ImageView,
@@ -5245,6 +5252,10 @@ pub const Renderer = struct {
     resident_image_views: std.ArrayList(CachedResidentImageView) = .empty,
     resident_samplers: std.ArrayList(CachedResidentSampler) = .empty,
     storage_image_cache: std.ArrayList(CachedStorageImage) = .empty,
+    // Storage uploads normally use the draw ring. Readback and depth bridges
+    // are ordered transfer operations, so they share one high-water buffer
+    // instead of retaining a host mirror for every cached image.
+    storage_image_transfer: ?OwnedBuffer = null,
     storage_image_address_index: @import("sampled_image_index.zig").Index(maximum_cached_storage_images) = .{},
     storage_image_cache_bytes: usize = 0,
     storage_image_cache_limit: usize = 1280 * 1024 * 1024,
@@ -6281,9 +6292,9 @@ pub const Renderer = struct {
             if (!image.valid) continue;
             self.device_functions.destroy_image_view(self.device, image.view, null);
             self.destroyImage(image.image);
-            self.destroyBuffer(image.transfer);
         }
         self.storage_image_cache.deinit(self.allocator);
+        if (self.storage_image_transfer) |buffer| self.destroyBuffer(buffer);
         self.image_aliases.deinit(self.allocator);
         self.image_states.deinit(self.allocator);
         for (self.compute_pipelines.items) |entry| {
@@ -9884,7 +9895,7 @@ pub const Renderer = struct {
             resident.pin_count += 1;
             defer self.releaseStorageImage(index);
             resident.last_used_sequence = self.storage_image_sequence;
-            try self.uploadCachedStorageImage(index, linear, false);
+            try self.uploadCachedStorageImage(index, linear);
             resident.gpu_dirty = true;
             resident.guest_content_hash_valid = false;
             resident.guest_texel_hash = guest_texel_hash;
@@ -9894,12 +9905,6 @@ pub const Renderer = struct {
         }
 
         var cache_owns_resources = false;
-        const transfer = try self.createBuffer(
-            staging_bytes,
-            vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
-            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-        );
-        errdefer if (!cache_owns_resources) self.destroyBuffer(transfer);
         const image = try self.createImageWithExtent(
             subresource.width,
             subresource.height,
@@ -9955,7 +9960,6 @@ pub const Renderer = struct {
             .subresource = subresource,
             .image = image,
             .view = view,
-            .transfer = transfer,
             .allocation_bytes = allocation_bytes,
             .staging_bytes = staging_bytes,
             .last_used_sequence = self.storage_image_sequence,
@@ -9967,7 +9971,7 @@ pub const Renderer = struct {
         self.storage_image_cache_bytes +|= staging_bytes;
         cache_owns_resources = true;
         errdefer self.destroyCachedStorageImage(cache_index);
-        try self.uploadCachedStorageImage(cache_index, linear, true);
+        try self.uploadCachedStorageImage(cache_index, linear);
         self.releaseStorageImage(cache_index);
     }
 
@@ -18325,22 +18329,24 @@ pub const Renderer = struct {
                 image.last_level = @intCast(level);
                 const staged = try self.stageStorageImageRaw(image, 0, false);
                 defer self.releaseStorageImage(staged.cache_index.?);
+                const transfer = try self.storageImageTransfer(staged.staging_bytes);
                 const commands = try self.beginOneShot();
                 defer self.releaseOneShot(commands);
+                self.orderStorageTransferWrite(commands, transfer);
                 const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 6 };
                 try self.transitionTrackedImage(commands, staged.image.handle, range, image_state.transfer_source_usage);
                 const copy = vk.BufferImageCopy{
                     .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 6 },
                     .image_extent = .{ .width = staged.subresource.width, .height = staged.subresource.height, .depth = 1 },
                 };
-                self.device_functions.cmd_copy_image_to_buffer(commands, staged.image.handle, vk.image_layout_transfer_src_optimal, staged.transfer.handle, 1, @ptrCast(&copy));
-                const barrier = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = staged.transfer.handle, .offset = 0, .size = staged.staging_bytes };
+                self.device_functions.cmd_copy_image_to_buffer(commands, staged.image.handle, vk.image_layout_transfer_src_optimal, transfer.handle, 1, @ptrCast(&copy));
+                const barrier = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = transfer.handle, .offset = 0, .size = staged.staging_bytes };
                 self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
                 try self.transitionTrackedImage(commands, staged.image.handle, range, image_state.storage_usage);
                 try self.submitOneShot(commands);
                 const output = try self.allocator.alloc(u8, staged.staging_bytes);
                 defer self.allocator.free(output);
-                try self.readMapped(staged.transfer, output);
+                try self.readMapped(transfer, output);
                 const pixels = @as(usize, staged.subresource.width) * staged.subresource.height;
                 for (0..6) |face| {
                     const expected = [_]f16{ @as(f16, @floatFromInt(face + 1)) / 8, @as(f16, @floatFromInt(level + 1)) / 8, @as(f16, @floatFromInt(revision + 1)) / 4, 1 };
@@ -18496,6 +18502,115 @@ pub const Renderer = struct {
         self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host), 0, null);
         try self.submitOneShot(commands);
         try self.readMapped(readback, output);
+    }
+
+    pub fn probeSampledArrayRefresh(self: *Renderer) anyerror!void {
+        const descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{
+            .address = @as(u64, 0x1000),
+            .width = @as(u32, 8),
+            .height = @as(u32, 8),
+            .pitch = @as(u32, 64),
+            .depth_or_layers = @as(u32, 3),
+            .image_type = .color_2d_array,
+            .tile_mode = .linear,
+            .unified_format = @as(u16, 56),
+            .dst_select = [4]u8{ 4, 5, 6, 7 },
+        });
+        const sampler = std.mem.zeroes(gpu.resources.SamplerDescriptor);
+        const seed = [_]u8{0x3a} ** (3 * 2048);
+        const memory = self.guest_memory.?;
+        if (!memory.write(memory.context, descriptor.address, &seed)) return Error.GuestMemoryWriteFailed;
+        try self.beginDescriptorBatch(true);
+        const original = try self.stageSampledImage(descriptor, sampler, 0, .two_d_array, null);
+        const sampled_index = self.sampled_image_cache.items.len - 1;
+        const page_generation = self.sampled_image_cache.items[sampled_index].guest_page_generation;
+        try std.testing.expect(page_generation != 0);
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = descriptor.address;
+        color.width = 8;
+        color.height = 8;
+        color.pitch = descriptor.pitch;
+        color.depth = 3;
+        color.base_array_slice = 1;
+        color.last_array_slice = 1;
+        color.format = 10;
+        color.write_mask = 15;
+        color.tile_mode = .linear;
+        const target = try guestColorTarget(color);
+        const index = try self.acquireRenderTarget(target);
+        self.render_targets.items[index].pin_count += 1;
+        defer self.releaseRenderTarget(index);
+        const output_bytes = 8 * 8 * 4 * 3;
+        const readback = try self.createBuffer(2 * output_bytes, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        const before_upload = self.frame_profile.texture_upload_bytes;
+        const before_readback = self.frame_profile.readback_bytes;
+        for (0..2) |pass| {
+            try self.beginDescriptorBatch(true);
+            const image = self.render_targets.items[index].image.handle;
+            const one = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+            const clear_commands = try self.beginOneShot();
+            defer self.releaseOneShot(clear_commands);
+            try self.transitionTrackedImage(clear_commands, image, one, image_state.transfer_destination_usage);
+            const clear = vk.ClearColorValue{ .float32 = if (pass == 0) .{ 1, 0, 0, 1 } else .{ 0, 0, 1, 1 } };
+            self.device_functions.cmd_clear_color_image(clear_commands, image, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&one));
+            try self.transitionTrackedImage(clear_commands, image, one, image_state.color_attachment_usage);
+            try self.submitOneShot(clear_commands);
+            self.render_target_sequence += 1;
+            self.render_targets.items[index].initialized = true;
+            self.render_targets.items[index].gpu_generation += 1;
+            self.render_targets.items[index].last_used_sequence = self.render_target_sequence;
+            // Missing CPU tracking and a changed CPU generation both reject.
+            try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, 0, 1));
+            try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, page_generation + 1, 1));
+            {
+                // An overlapping cached representation is ambiguous, even
+                // when that representation has already been published.
+                var duplicate = self.render_targets.items[index];
+                duplicate.host_generation = duplicate.gpu_generation;
+                try self.render_targets.append(self.allocator, duplicate);
+                defer self.render_targets.items.len -= 1;
+                try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, page_generation, 1));
+            }
+            const sampled = try self.stageSampledImage(descriptor, sampler, 0, .two_d_array, null);
+            try std.testing.expectEqual(original.image.handle, sampled.image.handle);
+            // A prepared binding cannot be overwritten before its draw.
+            try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, page_generation, 1));
+            const commands = try self.beginOneShot();
+            defer self.releaseOneShot(commands);
+            const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 3 };
+            try self.transitionTrackedImage(commands, sampled.image.handle, range, image_state.transfer_source_usage);
+            const copy = vk.BufferImageCopy{
+                .buffer_offset = pass * output_bytes,
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 3 },
+                .image_extent = .{ .width = 8, .height = 8, .depth = 1 },
+            };
+            self.device_functions.cmd_copy_image_to_buffer(commands, sampled.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+            try self.transitionTrackedImage(commands, sampled.image.handle, range, image_state.shader_read_usage);
+            const host = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = readback.handle, .offset = pass * output_bytes, .size = output_bytes };
+            self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host), 0, null);
+            try self.submitOneShot(commands);
+        }
+        try self.waitForSubmittedWork();
+        var observed: [2 * output_bytes]u8 = undefined;
+        try self.readMapped(readback, &observed);
+        for (0..2) |pass| {
+            for (0..3) |layer| {
+                const expected = if (layer != 1) [4]u8{ 0x3a, 0x3a, 0x3a, 0x3a } else if (pass == 0) [4]u8{ 255, 0, 0, 255 } else [4]u8{ 0, 0, 255, 255 };
+                for (0..64) |pixel| {
+                    const offset = pass * output_bytes + (layer * 64 + pixel) * 4;
+                    try std.testing.expectEqualSlices(u8, &expected, observed[offset..][0..4]);
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(u64, 2), self.frame_profile.sampled_array_refreshes);
+        try std.testing.expectEqual(before_upload, self.frame_profile.texture_upload_bytes);
+        try std.testing.expectEqual(before_readback, self.frame_profile.readback_bytes);
+        // A CPU write to another slice must not discard this GPU producer.
+        if (!memory.write(memory.context, descriptor.address, &.{ 0x11, 0x22, 0x33, 0x44 })) return Error.GuestMemoryWriteFailed;
+        try std.testing.expect(!self.render_targets.items[index].backing_snapshot.changed(memory, target));
+        if (!memory.write(memory.context, descriptor.address + target.layout.source_slice_bytes, &.{ 0x11, 0x22, 0x33, 0x44 })) return Error.GuestMemoryWriteFailed;
+        try std.testing.expect(self.render_targets.items[index].backing_snapshot.changed(memory, target));
     }
 
     pub fn probeFeedbackSnapshots(self: *Renderer) anyerror!void {
@@ -23418,7 +23533,6 @@ pub const Renderer = struct {
         self.invalidateResidentImageViews(cached.image.handle);
         self.destroyImageView(cached.view);
         self.destroyImage(cached.image);
-        self.destroyBuffer(cached.transfer);
         self.storage_image_cache_bytes -|= cached.staging_bytes;
         cached.valid = false;
         cached.pin_count = 0;
@@ -23581,8 +23695,10 @@ pub const Renderer = struct {
         const is_2d_array = snapshot.descriptor.image_type == .color_2d_array;
         const array_layers = if (is_2d_array) snapshot.subresource.depth_or_layers else 1;
 
+        const transfer = try self.storageImageTransfer(snapshot.staging_bytes);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
+        self.orderStorageTransferWrite(command_buffer, transfer);
         try self.transitionTrackedImage(
             command_buffer,
             snapshot.image.handle,
@@ -23604,16 +23720,16 @@ pub const Renderer = struct {
             command_buffer,
             snapshot.image.handle,
             vk.image_layout_transfer_src_optimal,
-            snapshot.transfer.handle,
+            transfer.handle,
             1,
             @ptrCast(&copy),
         );
         const host_barrier = vk.BufferMemoryBarrier{
             .source_access_mask = vk.access_transfer_write_bit,
             .destination_access_mask = vk.access_host_read_bit,
-            .buffer = snapshot.transfer.handle,
+            .buffer = transfer.handle,
             .offset = 0,
-            .size = snapshot.transfer.size,
+            .size = transfer.size,
         };
         self.device_functions.cmd_pipeline_barrier(
             command_buffer,
@@ -23655,7 +23771,7 @@ pub const Renderer = struct {
         }
         var published_texel_hash: u64 = undefined;
         {
-            const mapping = try self.mapBufferRange(snapshot.transfer, 0, snapshot.staging_bytes);
+            const mapping = try self.mapBufferRange(transfer, 0, snapshot.staging_bytes);
             defer mapping.release(self);
             const linear = mapping.bytes;
             if (self.traceCurrentGraphicsFrame()) {
@@ -23769,29 +23885,53 @@ pub const Renderer = struct {
         self.storage_image_cache.items[cache_index].content_generation = self.storage_content_sequence;
     }
 
+    fn storageImageTransfer(self: *Renderer, bytes: usize) (Error || std.mem.Allocator.Error)!OwnedBuffer {
+        if (self.storage_image_transfer) |buffer| if (buffer.size >= bytes) return buffer;
+        const replacement = try self.createBuffer(
+            bytes,
+            vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        // Already recorded bridges retain their old buffer until retirement.
+        if (self.storage_image_transfer) |buffer| self.destroyBuffer(buffer);
+        self.storage_image_transfer = replacement;
+        return replacement;
+    }
+
+    fn orderStorageTransferWrite(self: *Renderer, commands: vk.CommandBuffer, buffer: OwnedBuffer) void {
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_read_bit | vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .buffer = buffer.handle,
+            .offset = 0,
+            .size = buffer.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+    }
+
     fn uploadCachedStorageImage(
         self: *Renderer,
         cache_index: usize,
         linear: []const u8,
-        initial: bool,
     ) (Error || std.mem.Allocator.Error)!void {
         const snapshot = self.storage_image_cache.items[cache_index];
         if (!snapshot.valid or linear.len != snapshot.staging_bytes) return Error.UnsupportedStorageImage;
-        // Reusing the fixed transfer buffer needs a host wait: it can still be
-        // an upload source or a depth/readback bridge for earlier commands.
+        // Reusing the shared transfer buffer needs a host wait, including
+        // the first upload to an image: other images may still use it.
         // A fresh ring slice preserves those bytes, while the image barrier
         // orders the new copy after its previous readers and writers on GPU.
         const upload: ?DrawUploadSlice = if (self.current_descriptor_slot != null and self.draw_batch_active)
             try self.allocateDrawUpload(linear.len)
         else
             null;
+        const transfer: ?OwnedBuffer = if (upload == null) try self.storageImageTransfer(linear.len) else null;
         if (upload) |slice| {
             const mapping = try self.mapDrawUpload(slice);
             defer mapping.release(self);
             @memcpy(mapping.bytes, linear);
         } else {
-            if (!initial) try self.waitForSubmittedWork();
-            try self.writeMapped(snapshot.transfer, linear);
+            try self.waitForSubmittedWork();
+            try self.writeMapped(transfer.?, linear);
         }
         const is_3d = snapshot.descriptor.image_type == .color_3d;
         const is_2d_array = snapshot.descriptor.image_type == .color_2d_array;
@@ -23819,7 +23959,7 @@ pub const Renderer = struct {
         };
         self.device_functions.cmd_copy_buffer_to_image(
             command_buffer,
-            if (upload) |slice| slice.buffer else snapshot.transfer.handle,
+            if (upload) |slice| slice.buffer else transfer.?.handle,
             snapshot.image.handle,
             vk.image_layout_transfer_dst_optimal,
             1,
@@ -23847,6 +23987,7 @@ pub const Renderer = struct {
         const index = prepared.cache_index orelse return error.ExpectedCachedStorageImage;
         defer self.releaseStorageImage(index);
         try std.testing.expectEqual(@as(usize, 4), prepared.staging_bytes);
+        try std.testing.expect(self.storage_image_transfer == null);
         const count = 64;
         const output = try self.createBuffer(count * 4, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
         defer self.destroyBuffer(output);
@@ -23860,7 +24001,7 @@ pub const Renderer = struct {
             }
             var value: [4]u8 = undefined;
             std.mem.writeInt(u32, &value, 0x1234_0000 + @as(u32, @intCast(i)), .little);
-            try self.uploadCachedStorageImage(index, &value, false);
+            try self.uploadCachedStorageImage(index, &value);
             const commands = try self.beginOneShot();
             defer self.releaseOneShot(commands);
             try self.transitionTrackedImage(commands, prepared.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.transfer_source_usage);
@@ -23891,6 +24032,46 @@ pub const Renderer = struct {
         try std.testing.expect(self.frame_profile.draw_upload_spills != 0);
         try std.testing.expect(self.frame_profile.draw_upload_wraps != 0);
         try self.finishDrawBatch();
+
+        // Exercise reuse and growth while earlier transfers are still queued.
+        // A later CPU upload must also wait before overwriting the shared buffer.
+        for ([_]usize{ 4, 16, 4 }, 0..) |bytes, revision| {
+            const transfer = try self.storageImageTransfer(bytes);
+            const copy_commands = try self.beginOneShot();
+            defer self.releaseOneShot(copy_commands);
+            self.orderStorageTransferWrite(copy_commands, transfer);
+            const value: u32 = 0x4567_0000 + @as(u32, @intCast(revision));
+            self.device_functions.cmd_fill_buffer(copy_commands, transfer.handle, 0, bytes, value);
+            const readable = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_transfer_read_bit,
+                .buffer = transfer.handle,
+                .offset = 0,
+                .size = bytes,
+            };
+            self.device_functions.cmd_pipeline_barrier(copy_commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&readable), 0, null);
+            const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = revision * 4, .size = 4 };
+            self.device_functions.cmd_copy_buffer(copy_commands, transfer.handle, output.handle, 1, @ptrCast(&copy));
+            const host_readable = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_host_read_bit,
+                .buffer = output.handle,
+                .offset = revision * 4,
+                .size = 4,
+            };
+            self.device_functions.cmd_pipeline_barrier(copy_commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host_readable), 0, null);
+            try self.submitOneShot(copy_commands);
+        }
+        try self.uploadCachedStorageImage(index, &.{ 1, 2, 3, 4 });
+        var copied: [12]u8 = undefined;
+        try self.readMapped(output, &copied);
+        for (0..3) |revision| try std.testing.expectEqual(0x4567_0000 + @as(u32, @intCast(revision)), std.mem.readInt(u32, copied[revision * 4 ..][0..4], .little));
+        try std.testing.expectEqual(@as(u64, 16), self.storage_image_transfer.?.size);
+        self.storage_image_cache.items[index].gpu_dirty = true;
+        try self.flushCachedStorageImage(self.guest_memory.?, index);
+        var guest_pixel: [4]u8 = undefined;
+        try std.testing.expect(self.guest_memory.?.read(self.guest_memory.?.context, descriptor.address, &guest_pixel));
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &guest_pixel);
     }
 
     fn latestStorageRenderTarget(self: *Renderer, descriptor: gpu.ImageDescriptor, format: StorageImageFormat) !?usize {
@@ -23957,6 +24138,7 @@ pub const Renderer = struct {
     fn transferStorageDepth(self: *Renderer, index: usize, source: StorageDepthSource, to_depth: bool) anyerror!void {
         const storage = self.storage_image_cache.items[index];
         const depth = self.depth_targets.items[source.index];
+        const transfer = try self.storageImageTransfer(storage.staging_bytes);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         try self.transitionTrackedImage(command_buffer, depth.image.handle, .{ .aspect_mask = depth.target.aspectMask() }, if (to_depth) image_state.transfer_destination_usage else image_state.transfer_source_usage);
@@ -23964,21 +24146,21 @@ pub const Renderer = struct {
         var barrier = vk.BufferMemoryBarrier{
             .source_access_mask = vk.access_transfer_read_bit | vk.access_transfer_write_bit,
             .destination_access_mask = vk.access_transfer_write_bit,
-            .buffer = storage.transfer.handle,
+            .buffer = transfer.handle,
             .offset = 0,
-            .size = storage.transfer.size,
+            .size = transfer.size,
         };
         self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
         var copy = vk.BufferImageCopy{
             .image_subresource = .{ .aspect_mask = if (to_depth) vk.image_aspect_color_bit else source.aspect },
             .image_extent = .{ .width = depth.target.width, .height = depth.target.height, .depth = 1 },
         };
-        self.device_functions.cmd_copy_image_to_buffer(command_buffer, if (to_depth) storage.image.handle else depth.image.handle, vk.image_layout_transfer_src_optimal, storage.transfer.handle, 1, @ptrCast(&copy));
+        self.device_functions.cmd_copy_image_to_buffer(command_buffer, if (to_depth) storage.image.handle else depth.image.handle, vk.image_layout_transfer_src_optimal, transfer.handle, 1, @ptrCast(&copy));
         barrier.source_access_mask = vk.access_transfer_write_bit;
         barrier.destination_access_mask = vk.access_transfer_read_bit;
         self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
         copy.image_subresource.aspect_mask = if (to_depth) source.aspect else vk.image_aspect_color_bit;
-        self.device_functions.cmd_copy_buffer_to_image(command_buffer, storage.transfer.handle, if (to_depth) depth.image.handle else storage.image.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
+        self.device_functions.cmd_copy_buffer_to_image(command_buffer, transfer.handle, if (to_depth) depth.image.handle else storage.image.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
         try self.transitionTrackedImage(command_buffer, depth.image.handle, .{ .aspect_mask = depth.target.aspectMask() }, image_state.depth_attachment_usage);
         try self.transitionTrackedImage(command_buffer, storage.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.storage_usage);
         try self.submitOneShot(command_buffer);
@@ -24138,7 +24320,6 @@ pub const Renderer = struct {
                     .subresource = subresource,
                     .image = cached.image,
                     .view = view,
-                    .transfer = undefined,
                     .allocation_bytes = allocation_bytes,
                     .staging_bytes = staging_bytes,
                     .writable = writable,
@@ -24204,7 +24385,6 @@ pub const Renderer = struct {
                     .subresource = resident.subresource,
                     .image = resident.image,
                     .view = resident.view,
-                    .transfer = resident.transfer,
                     .allocation_bytes = resident.allocation_bytes,
                     .staging_bytes = resident.staging_bytes,
                     .writable = writable,
@@ -24242,7 +24422,6 @@ pub const Renderer = struct {
                     .subresource = cached.subresource,
                     .image = cached.image,
                     .view = cached.view,
-                    .transfer = cached.transfer,
                     .allocation_bytes = cached.allocation_bytes,
                     .staging_bytes = cached.staging_bytes,
                     .writable = writable,
@@ -24275,7 +24454,6 @@ pub const Renderer = struct {
                     .subresource = cached.subresource,
                     .image = cached.image,
                     .view = cached.view,
-                    .transfer = cached.transfer,
                     .allocation_bytes = cached.allocation_bytes,
                     .staging_bytes = cached.staging_bytes,
                     .writable = writable,
@@ -24298,7 +24476,7 @@ pub const Renderer = struct {
             // changes do not change this view's texels or require uploading it.
             // Invalidated/replaced contents have no texel hash and still upload.
             if (cached.guest_texel_hash == null or cached.guest_texel_hash.? != guest_texel_hash)
-                try self.uploadCachedStorageImage(index, linear, false);
+                try self.uploadCachedStorageImage(index, linear);
             _ = self.image_aliases.markSynchronized(cached.alias_token);
             cached.depth_snapshot = null;
             cached.guest_content_hash = guest_content_hash;
@@ -24312,7 +24490,6 @@ pub const Renderer = struct {
                 .subresource = cached.subresource,
                 .image = cached.image,
                 .view = cached.view,
-                .transfer = cached.transfer,
                 .allocation_bytes = cached.allocation_bytes,
                 .staging_bytes = cached.staging_bytes,
                 .writable = writable,
@@ -24321,12 +24498,6 @@ pub const Renderer = struct {
         }
 
         var cache_owns_resources = false;
-        const transfer = try self.createBuffer(
-            staging_bytes,
-            vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
-            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-        );
-        errdefer if (!cache_owns_resources) self.destroyBuffer(transfer);
         const image = try self.createImageWithExtent(
             subresource.width,
             subresource.height,
@@ -24387,7 +24558,6 @@ pub const Renderer = struct {
             .subresource = subresource,
             .image = image,
             .view = view,
-            .transfer = transfer,
             .allocation_bytes = allocation_bytes,
             .staging_bytes = staging_bytes,
             .last_used_sequence = self.storage_image_sequence,
@@ -24403,14 +24573,13 @@ pub const Renderer = struct {
         // Ownership has moved into the cache. If the upload fails, tear down
         // that cache slot exactly once instead of running the local errdefers.
         errdefer self.destroyCachedStorageImage(cache_index);
-        try self.uploadCachedStorageImage(cache_index, linear, true);
+        try self.uploadCachedStorageImage(cache_index, linear);
         self.updateStorageImageDescriptor(descriptor_index, view);
         return .{
             .descriptor = descriptor,
             .subresource = subresource,
             .image = image,
             .view = view,
-            .transfer = transfer,
             .allocation_bytes = allocation_bytes,
             .staging_bytes = staging_bytes,
             .writable = writable,
@@ -25632,6 +25801,121 @@ pub const Renderer = struct {
         return .{ .image = snapshot, .view = view, .sampler = sampler, .owns_view = true, .owns_image = true };
     }
 
+    /// Refresh a fully initialized array from independently rendered slices.
+    /// Untouched layers remain in the original snapshot. CPU changes or any
+    /// producer we cannot copy still take the publication/upload path.
+    fn refreshSampledColorArray(
+        self: *Renderer,
+        index: usize,
+        descriptor: gpu.ImageDescriptor,
+        page_generation: u64,
+        source_generation: u64,
+    ) anyerror!bool {
+        const snapshot = self.sampled_image_cache.items[index];
+        const key = snapshot.backing_key orelse return false;
+        const max_layers = 32;
+        if (self.canonical_image_aliases_enabled or descriptor.image_type != .color_2d_array or
+            descriptor.viewBaseLevel() != 0 or descriptor.viewMipLevels() != 1 or
+            descriptor.base_array != 0 or descriptor.depth_or_layers < 2 or descriptor.depth_or_layers > max_layers or
+            descriptor.dcc_enabled or descriptor.metadata_address != 0 or
+            page_generation == 0 or page_generation != snapshot.guest_page_generation or
+            snapshot.last_used_batch == self.sampled_image_batch or key.array_layers != descriptor.depth_or_layers)
+            return false;
+
+        // Ordered copies can update a snapshot used by recorded commands, but
+        // must not mutate one already handed to this descriptor batch.
+        const address = descriptor.address;
+        const span = snapshot.guest_bytes;
+        for (self.guest_buffers.items) |buffer| {
+            if (buffer.gpu_dirty and byteRangesOverlap(address, span, buffer.guest_address, buffer.size)) return false;
+        }
+        for (self.storage_image_cache.items) |storage| {
+            if (storage.valid and storage.gpu_dirty and byteRangesOverlap(address, span, storage.descriptor.address, storage.allocation_bytes)) return false;
+        }
+        for (self.depth_targets.items) |depth| {
+            if (depth.initialized and depth.gpu_generation != depth.host_generation and
+                (byteRangesOverlap(address, span, depth.target.address, depth.target.allocation_bytes) or
+                    byteRangesOverlap(address, span, depth.target.stencil_address, depth.target.stencil_allocation_bytes))) return false;
+        }
+        for (self.completed_frames.items) |frame| {
+            if (frame.needs_writeback) if (frame.target) |target| {
+                if (byteRangesOverlap(address, span, frame.guest_address, target.layout.required_source_bytes)) return false;
+            };
+        }
+        // Legacy descriptors with only mip zero selected use the surface
+        // uploader's single-level stride, even when their implicit resource
+        // pyramid would contain more levels. Match that exact upload layout.
+        var upload_descriptor = descriptor;
+        if (SampledViewPlan.fromDescriptor(descriptor, .two_d_array) == null) {
+            upload_descriptor.extended = true;
+            upload_descriptor.max_mip = 0;
+        }
+        const texture = gpu.TextureLayout.fromImage(upload_descriptor) catch return false;
+        var sources: [max_layers]?usize = @splat(null);
+        var seen: [max_layers]bool = @splat(false);
+        var count: usize = 0;
+        for (self.render_targets.items, 0..) |target, target_index| {
+            if (!target.initialized or
+                !byteRangesOverlap(address, span, target.target.descriptor.address, target.target.layout.required_source_bytes)) continue;
+            const color = target.target.descriptor;
+            const layer = color.base_array_slice;
+            if (color.address != address or color.mip_level != 0 or color.dcc_enabled or
+                color.samples_log2 != 0 or color.fragments_log2 != 0 or
+                layer >= descriptor.depth_or_layers or target.target.layout.layers != 1 or
+                target.target.format.vulkan != key.format or seen[layer]) return false;
+            seen[layer] = true;
+            const subresource = texture.subresource(0, layer, 1) catch return false;
+            if (target.target.layout.subresource) |resident| {
+                if (!std.meta.eql(subresource, resident)) return false;
+            } else {
+                const layout = target.target.layout;
+                if (color.tile_mode != descriptor.tile_mode or layout.block.bytes_per_element != subresource.block.bytes_per_element or
+                    layout.block.width != subresource.block.width or layout.block.height != subresource.block.height or
+                    layout.source_base_offset != 0 or subresource.level_offset != 0 or subresource.in_tail or
+                    layout.width != subresource.width or layout.height != subresource.height or
+                    layout.first_slice != subresource.first_slice or layout.row_pitch_elements != subresource.padded_width or
+                    layout.source_slice_bytes != subresource.source_layer_bytes or
+                    layout.required_source_bytes != subresource.required_source_bytes) return false;
+            }
+            if (target.gpu_generation == target.host_generation) continue;
+            if (self.image_states.current(target.image.handle, vk.image_aspect_color_bit, 0, 0) == null) return false;
+            sources[layer] = target_index;
+            count += 1;
+        }
+        if (count == 0) return false;
+        for (sources) |source| if (source) |target_index| {
+            self.render_targets.items[target_index].pin_count += 1;
+        };
+        defer for (sources) |source| if (source) |target_index| {
+            self.releaseRenderTarget(target_index);
+        };
+        const commands = try self.beginOneShot();
+        defer self.releaseOneShot(commands);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = key.array_layers };
+        try self.transitionTrackedImage(commands, snapshot.image.handle, range, image_state.transfer_destination_usage);
+        for (sources, 0..) |source, layer| {
+            const target_index = source orelse continue;
+            const target = self.render_targets.items[target_index];
+            const source_range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+            const previous = self.image_states.current(target.image.handle, vk.image_aspect_color_bit, 0, 0).?;
+            try self.transitionTrackedImage(commands, target.image.handle, source_range, image_state.transfer_source_usage);
+            const copy = vk.ImageCopy{
+                .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .base_array_layer = @intCast(layer) },
+                .extent = .{ .width = descriptor.width, .height = descriptor.height, .depth = 1 },
+            };
+            self.device_functions.cmd_copy_image(commands, target.image.handle, vk.image_layout_transfer_src_optimal, snapshot.image.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
+            try self.transitionTrackedImage(commands, target.image.handle, source_range, previous);
+        }
+        try self.transitionTrackedImage(commands, snapshot.image.handle, range, image_state.shader_read_usage);
+        try self.submitOneShot(commands);
+        self.sampled_image_cache.items[index].source_generation = source_generation;
+        _ = self.image_aliases.markSynchronized(snapshot.alias_token);
+        self.frame_profile.sampled_array_refreshes +|= 1;
+        self.frame_profile.sampled_array_layers +|= count;
+        return true;
+    }
+
     fn stageSampledImage(
         self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
@@ -25921,11 +26205,12 @@ pub const Renderer = struct {
                 item.last_level != descriptor.last_level or
                 item.mip_levels != (if (mip_plan) |plan| plan.level_count else 1) or
                 item.upload_state_hash != upload_state_hash or
-                item.source_generation != early_source_generation or
                 item.content_hash != early_content_hash)
             {
                 continue;
             }
+            if (item.source_generation != early_source_generation and
+                (aliases_active_render_target or !try self.refreshSampledColorArray(index, descriptor, early_page_generation, early_source_generation))) continue;
             item.last_used_frame = self.frame_sequence;
             item.last_used_batch = self.sampled_image_batch;
             self.frame_profile.sampled_view_hits +|= 1;
@@ -26520,6 +26805,7 @@ pub const Renderer = struct {
             .image_state_hash = image_state_hash,
             .upload_state_hash = upload_state_hash,
             .source_generation = source_generation,
+            .guest_page_generation = page_generation,
             .content_hash = content_hash,
             .image = image,
             .view = view,
@@ -29910,6 +30196,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu sampled inner] flip={d} gen={d}ms/{d} prefix={d}ms resident={d}ms probe={d}ms/{d} page={d}ms/{d} paths(exact/view/slow)={d}/{d}/{d} flush(alias/simg/buf/tgt/htile)={d}/{d}/{d}/{d}/{d}ms materialize={d}/{d} readbacks={d}/{d}KiB\n",
                 .{ self.flip_callbacks, profile.sampled_generation_scan_ns / std.time.ns_per_ms, profile.sampled_generation_calls, profile.sampled_prefix_ns / std.time.ns_per_ms, profile.sampled_resident_ns / std.time.ns_per_ms, profile.sampled_probe2_ns / std.time.ns_per_ms, profile.sampled_probe2_calls, profile.sampled_page_ns / std.time.ns_per_ms, profile.sampled_page_calls, profile.sampled_exact_hits, profile.sampled_view_hits, profile.sampled_slow_paths, profile.flush_alias_ns / std.time.ns_per_ms, profile.flush_storage_image_ns / std.time.ns_per_ms, profile.flush_storage_ns / std.time.ns_per_ms, profile.flush_target_ns / std.time.ns_per_ms, profile.flush_htile_ns / std.time.ns_per_ms, profile.materialize_target_hits, profile.materialize_target_calls, profile.target_readbacks, profile.target_readback_bytes / 1024 },
+            );
+            if (profile.sampled_array_refreshes != 0) std.debug.print(
+                "[gpu sampled arrays] flip={d} refreshes={d} layers={d}\n",
+                .{ self.flip_callbacks, profile.sampled_array_refreshes, profile.sampled_array_layers },
             );
             std.debug.print(
                 "[gpu graphics res] flip={d} fragment_ms={d} sampled_scan_ms={d} append_ms={d} descriptors_ms={d} total_ms={d}\n",
@@ -38964,6 +39254,52 @@ test "packed colour mip observations exclude preceding cube faces" {
                 try std.testing.expect(offset >= range.offset and offset + 8 <= range.offset + range.size);
             };
         };
+    }
+}
+
+test "unmipped colour array observations exclude other slices" {
+    const Fixture = struct {
+        bytes: []u8,
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+        fn fingerprint(raw: ?*anyopaque, address: u64, size: usize) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return gpu.parallel_copy.fingerprint(self.bytes[@intCast(address - 0x1000)..][0..size]);
+        }
+    };
+    for ([_]gpu.resources.TileMode{ .linear, .standard_4kb, .render_target }) |mode| {
+        var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+        descriptor.address = 0x1000;
+        descriptor.width = 64;
+        descriptor.height = 64;
+        descriptor.format = 3;
+        descriptor.tile_mode = mode;
+        descriptor.base_array_slice = 4;
+        descriptor.last_array_slice = 4;
+        const target = try guestColorTarget(descriptor);
+        try std.testing.expect(target.layout.subresource == null);
+        const range = colorTargetBackingRange(target);
+        const stride = target.layout.source_slice_bytes;
+        try std.testing.expectEqual(4 * stride, range.offset);
+        try std.testing.expectEqual(stride, range.size);
+        const bytes = try std.testing.allocator.alloc(u8, @intCast(target.layout.required_source_bytes));
+        defer std.testing.allocator.free(bytes);
+        @memset(bytes, 0x3a);
+        var fixture = Fixture{ .bytes = bytes };
+        const memory = GuestMemory{ .context = &fixture, .read = Fixture.read, .write = Fixture.write, .fingerprint = Fixture.fingerprint };
+        var snapshot = ColorBackingSnapshot.capture(memory, target);
+        @memset(bytes[0..range.offset], 0x65);
+        try std.testing.expect(!snapshot.changed(memory, target));
+        const linear = try std.testing.allocator.alloc(u8, @intCast(target.layout.staging_bytes));
+        defer std.testing.allocator.free(linear);
+        @memset(linear, 0xac);
+        try target.layout.tile(linear, bytes);
+        for (bytes[0..range.offset]) |value| try std.testing.expectEqual(@as(u8, 0x65), value);
+        try std.testing.expect(snapshot.changed(memory, target));
     }
 }
 
