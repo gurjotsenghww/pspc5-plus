@@ -1195,19 +1195,34 @@ const BatchOperation = enum(i32) {
 /// The ABI is intentionally non-transactional: callers use the processed count
 /// to retain successful prefix operations when a later entry fails.
 /// Length of the maximal run starting at `entries[0]` whose members are
-/// adjacent in both guest address and physical offset and agree on operation,
-/// protection and memory type. Such a run describes exactly the same guest
-/// state as one entry spanning all of it.
+/// adjacent in guest address and agree on operation, protection and memory
+/// type. Only direct mappings consume the physical offset; unmap and protect
+/// entries commonly leave that unused field zero on every slice.
 fn contiguousRun(entries: []const BatchMapEntry) usize {
+    if (entries.len == 0) return 0;
+    const first = entries[0];
+    if (first.length == 0 or first.operation < @intFromEnum(BatchOperation.map_direct) or
+        first.operation > @intFromEnum(BatchOperation.type_protect)) return 1;
+    const needs_offset = first.operation == @intFromEnum(BatchOperation.map_direct);
+    const needs_page_alignment = needs_offset or first.operation == @intFromEnum(BatchOperation.unmap);
+    if (needs_page_alignment and (first.start % page_size != 0 or first.length % page_size != 0 or
+        (needs_offset and first.offset % page_size != 0))) return 1;
     var length: usize = 1;
     while (length < entries.len) : (length += 1) {
         const last = entries[length - 1];
         const next = entries[length];
         if (last.operation != next.operation or last.protection != next.protection or
             last.memory_type != next.memory_type or next.length == 0) break;
+        // Combining invalid slices must not turn an invalid individual entry
+        // into a valid page-aligned operation or hide its processed count.
+        if (needs_page_alignment and (next.start % page_size != 0 or next.length % page_size != 0 or
+            (needs_offset and next.offset % page_size != 0))) break;
         const start_end = std.math.add(u64, last.start, last.length) catch break;
-        const offset_end = std.math.add(u64, last.offset, last.length) catch break;
-        if (start_end != next.start or offset_end != next.offset) break;
+        if (start_end != next.start) break;
+        if (needs_offset) {
+            const offset_end = std.math.add(u64, last.offset, last.length) catch break;
+            if (offset_end != next.offset) break;
+        }
     }
     return length;
 }
@@ -1306,146 +1321,143 @@ fn batchMapCore(
         }
         const entry = &entries[index];
         {
-        mapped_bytes +|= entry.length;
-        // How few host calls the batch could need if adjacent entries were
-        // issued together: a run is a maximal group that is contiguous in
-        // guest address and physical offset and agrees on everything else.
-        if (previous) |last| {
-            if (last.start + last.length != entry.start or last.offset + last.length != entry.offset or
-                last.operation != entry.operation or last.protection != entry.protection or
-                last.memory_type != entry.memory_type) runs += 1;
-        } else runs += 1;
-        previous = entry.*;
-        if (trace.announces("sceKernelBatchMap")) {
-            std.debug.print(
-                "[batch map {d}] op={d} start=0x{x} offset=0x{x} length=0x{x} prot=0x{x} type=0x{x} flags=0x{x}\n",
-                .{
-                    index,
-                    entry.operation,
-                    entry.start,
-                    entry.offset,
-                    entry.length,
-                    entry.protection,
-                    entry.memory_type,
-                    flags,
-                },
-            );
-        }
-        if (entry.length == 0) {
-            if (processed_pointer) |output| output.* = processed;
-            return KernelError.einval.raw();
-        }
-        if (entry.operation < @intFromEnum(BatchOperation.map_direct) or
-            entry.operation > @intFromEnum(BatchOperation.type_protect))
-        {
-            if (processed_pointer) |output| output.* = processed;
-            return KernelError.einval.raw();
-        }
-        const operation: BatchOperation = @enumFromInt(entry.operation);
-        const protection_bits: i32 = entry.protection;
-        const requested_start = entry.start;
-        var result = switch (operation) {
-            .map_direct => sceKernelMapDirectMemory(
-                &entry.start,
-                entry.length,
-                protection_bits,
-                flags,
-                entry.offset,
-                0,
-            ),
-            .unmap => sceKernelMunmap(entry.start, entry.length),
-            .protect, .type_protect => sceKernelMprotect(
-                entry.start,
-                entry.length,
-                protection_bits,
-            ),
-            .map_flexible => mapFlexibleMemory(
-                &entry.start,
-                entry.length,
-                protection_bits,
-                flags,
-                "batch",
-            ),
-        };
-        // The graphics driver owns some physical ranges through its main
-        // direct-memory arena even after the fine-grained allocation tracker
-        // has released or split their bookkeeping nodes. BatchMap is the
-        // driver's commit boundary, so accept an otherwise-valid in-pool
-        // direct mapping and retain the entry's hardware memory type.
-        if (result == KernelError.einval.raw() and operation == .map_direct) {
-            result = mapDirectMemory(
-                &entry.start,
-                entry.length,
-                protection_bits,
-                flags,
-                entry.offset,
-                0,
-                entry.memory_type,
-            );
-            if (result == errno.ok) {
+            mapped_bytes +|= entry.length;
+            // Count possible runs with the same operation-specific rules used
+            // by the coalescing path, including ignored physical offsets.
+            if (previous) |last| {
+                if (contiguousRun(&.{ last, entry.* }) != 2) runs += 1;
+            } else runs += 1;
+            previous = entry.*;
+            if (trace.announces("sceKernelBatchMap")) {
                 std.debug.print(
-                    "[batch map {d}] accepted in-pool direct range absent from allocation tracker: offset=0x{x}+0x{x}\n",
-                    .{ index, entry.offset, entry.length },
+                    "[batch map {d}] op={d} start=0x{x} offset=0x{x} length=0x{x} prot=0x{x} type=0x{x} flags=0x{x}\n",
+                    .{
+                        index,
+                        entry.operation,
+                        entry.start,
+                        entry.offset,
+                        entry.length,
+                        entry.protection,
+                        entry.memory_type,
+                        flags,
+                    },
                 );
             }
-        }
-        // A zero start cannot name a fixed mapping. Some Unreal allocator paths
-        // retain that sentinel when asking BatchMap to choose the virtual
-        // address, even though the original entry point supplies MAP_FIXED.
-        // Retry only that otherwise-impossible combination as a chosen-address
-        // map; nonzero fixed mappings keep their strict replacement semantics.
-        if (result == KernelError.einval.raw() and
-            requested_start == 0 and
-            flags & map_fixed != 0 and
-            (operation == .map_direct or operation == .map_flexible))
-        {
-            const choose_address_flags = flags & ~map_fixed;
-            result = switch (operation) {
-                .map_direct => mapDirectMemory(
+            if (entry.length == 0) {
+                if (processed_pointer) |output| output.* = processed;
+                return KernelError.einval.raw();
+            }
+            if (entry.operation < @intFromEnum(BatchOperation.map_direct) or
+                entry.operation > @intFromEnum(BatchOperation.type_protect))
+            {
+                if (processed_pointer) |output| output.* = processed;
+                return KernelError.einval.raw();
+            }
+            const operation: BatchOperation = @enumFromInt(entry.operation);
+            const protection_bits: i32 = entry.protection;
+            const requested_start = entry.start;
+            var result = switch (operation) {
+                .map_direct => sceKernelMapDirectMemory(
                     &entry.start,
                     entry.length,
                     protection_bits,
-                    choose_address_flags,
+                    flags,
                     entry.offset,
                     0,
-                    entry.memory_type,
+                ),
+                .unmap => sceKernelMunmap(entry.start, entry.length),
+                .protect, .type_protect => sceKernelMprotect(
+                    entry.start,
+                    entry.length,
+                    protection_bits,
                 ),
                 .map_flexible => mapFlexibleMemory(
                     &entry.start,
                     entry.length,
                     protection_bits,
-                    choose_address_flags,
+                    flags,
                     "batch",
                 ),
-                else => unreachable,
             };
-            if (result == errno.ok) {
-                std.debug.print(
-                    "[batch map {d}] selected address 0x{x} for zero-start {s} mapping\n",
-                    .{ index, entry.start, @tagName(operation) },
-                );
-            }
-        }
-        if (result != errno.ok) {
-            std.debug.print(
-                "[batch map {d}] failed result=0x{x} op={s} start=0x{x}->0x{x} offset=0x{x} length=0x{x} prot=0x{x} type=0x{x} flags=0x{x}\n",
-                .{
-                    index,
-                    @as(u32, @bitCast(result)),
-                    @tagName(operation),
-                    requested_start,
-                    entry.start,
-                    entry.offset,
+            // The graphics driver owns some physical ranges through its main
+            // direct-memory arena even after the fine-grained allocation tracker
+            // has released or split their bookkeeping nodes. BatchMap is the
+            // driver's commit boundary, so accept an otherwise-valid in-pool
+            // direct mapping and retain the entry's hardware memory type.
+            if (result == KernelError.einval.raw() and operation == .map_direct) {
+                result = mapDirectMemory(
+                    &entry.start,
                     entry.length,
-                    entry.protection,
+                    protection_bits,
+                    flags,
+                    entry.offset,
+                    0,
                     entry.memory_type,
-                    @as(u32, @bitCast(flags)),
-                },
-            );
-            if (processed_pointer) |output| output.* = processed;
-            return result;
-        }
-        processed += 1;
+                );
+                if (result == errno.ok) {
+                    std.debug.print(
+                        "[batch map {d}] accepted in-pool direct range absent from allocation tracker: offset=0x{x}+0x{x}\n",
+                        .{ index, entry.offset, entry.length },
+                    );
+                }
+            }
+            // A zero start cannot name a fixed mapping. Some Unreal allocator paths
+            // retain that sentinel when asking BatchMap to choose the virtual
+            // address, even though the original entry point supplies MAP_FIXED.
+            // Retry only that otherwise-impossible combination as a chosen-address
+            // map; nonzero fixed mappings keep their strict replacement semantics.
+            if (result == KernelError.einval.raw() and
+                requested_start == 0 and
+                flags & map_fixed != 0 and
+                (operation == .map_direct or operation == .map_flexible))
+            {
+                const choose_address_flags = flags & ~map_fixed;
+                result = switch (operation) {
+                    .map_direct => mapDirectMemory(
+                        &entry.start,
+                        entry.length,
+                        protection_bits,
+                        choose_address_flags,
+                        entry.offset,
+                        0,
+                        entry.memory_type,
+                    ),
+                    .map_flexible => mapFlexibleMemory(
+                        &entry.start,
+                        entry.length,
+                        protection_bits,
+                        choose_address_flags,
+                        "batch",
+                    ),
+                    else => unreachable,
+                };
+                if (result == errno.ok) {
+                    std.debug.print(
+                        "[batch map {d}] selected address 0x{x} for zero-start {s} mapping\n",
+                        .{ index, entry.start, @tagName(operation) },
+                    );
+                }
+            }
+            if (result != errno.ok) {
+                std.debug.print(
+                    "[batch map {d}] failed result=0x{x} op={s} start=0x{x}->0x{x} offset=0x{x} length=0x{x} prot=0x{x} type=0x{x} flags=0x{x}\n",
+                    .{
+                        index,
+                        @as(u32, @bitCast(result)),
+                        @tagName(operation),
+                        requested_start,
+                        entry.start,
+                        entry.offset,
+                        entry.length,
+                        entry.protection,
+                        entry.memory_type,
+                        @as(u32, @bitCast(flags)),
+                    },
+                );
+                if (processed_pointer) |output| output.* = processed;
+                return result;
+            }
+            processed += 1;
         }
     }
     if (processed_pointer) |output| output.* = processed;
@@ -2505,6 +2517,55 @@ test "batch map chooses an address for a zero-start direct entry" {
     try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(physical, page_size));
 }
 
+test "batch map coalesces virtual protection and unmaps while preserving partial progress" {
+    var address_space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, direct_memory_size);
+    defer address_space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+    var physical: u64 = 0;
+    try testing.expectEqual(errno.ok, sceKernelAllocateDirectMemory(0, direct_memory_size, 3 * page_size, page_size, 0, &physical));
+    var address: u64 = 0;
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&address, 3 * page_size, prot_cpu_read | prot_cpu_write, 0, physical, 0));
+    var entries: [3]BatchMapEntry = undefined;
+    for (&entries, 0..) |*entry, index| entry.* = .{
+        .start = address + index * page_size,
+        .offset = 0,
+        .length = page_size,
+        .protection = prot_cpu_read,
+        .memory_type = 0,
+        .reserved = 0,
+        .operation = @intFromEnum(BatchOperation.protect),
+    };
+    var processed: i32 = -1;
+    try testing.expectEqual(errno.ok, sceKernelBatchMap(&entries, entries.len, &processed));
+    try testing.expectEqual(@as(i32, 3), processed);
+    for (entries) |entry| {
+        var info = VirtualQueryInfo{};
+        try testing.expectEqual(errno.ok, sceKernelVirtualQuery(entry.start, 0, &info, @sizeOf(VirtualQueryInfo)));
+        try testing.expectEqual(@as(i32, prot_cpu_read), info.protection);
+    }
+    for (&entries) |*entry| entry.operation = @intFromEnum(BatchOperation.unmap);
+    // The combined span is one full page, but each slice is invalid for
+    // munmap. No entry may be consumed and the original mapping must survive.
+    const valid_entries = entries;
+    entries[0].length = 1;
+    entries[1].start = address + 1;
+    entries[1].length = page_size - 1;
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelBatchMap(&entries, 2, &processed));
+    try testing.expectEqual(@as(i32, 0), processed);
+    try testing.expect(address_space.isMappedAs(address, 3 * page_size, .direct_memory));
+    entries = valid_entries;
+    entries[2].length = 0;
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelBatchMap(&entries, entries.len, &processed));
+    try testing.expectEqual(@as(i32, 2), processed);
+    try testing.expect(!address_space.isMappedAs(address, page_size, .direct_memory));
+    try testing.expect(!address_space.isMappedAs(address + page_size, page_size, .direct_memory));
+    try testing.expect(address_space.isMappedAs(address + 2 * page_size, page_size, .direct_memory));
+    try testing.expectEqual(errno.ok, sceKernelMunmap(address + 2 * page_size, page_size));
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(physical, 3 * page_size));
+}
+
 test "batch map accepts a valid in-pool direct range missing from the tracker" {
     var address_space = try memory.AddressSpace.initWithDirectMemory(
         testing.allocator,
@@ -3081,6 +3142,29 @@ test "contiguous runs stop at every discontinuity a combined mapping would hide"
     var zero_length = adjacent;
     zero_length[1].length = 0;
     try std.testing.expectEqual(@as(usize, 1), contiguousRun(&zero_length));
+    zero_length = adjacent;
+    zero_length[0].length = 0;
+    try std.testing.expectEqual(@as(usize, 1), contiguousRun(&zero_length));
+
+    // Streaming unmaps and protection changes do not name physical memory.
+    // Noncontiguous or overflowing unused offsets must not split these runs.
+    for ([_]BatchOperation{ .unmap, .protect, .type_protect }) |operation| {
+        var virtual_only = adjacent;
+        for (&virtual_only) |*item| {
+            item.operation = @intFromEnum(operation);
+            item.offset = 0;
+        }
+        try std.testing.expectEqual(@as(usize, 3), contiguousRun(&virtual_only));
+        virtual_only[0].offset = std.math.maxInt(u64);
+        virtual_only[1].offset = 0x1234;
+        try std.testing.expectEqual(@as(usize, 3), contiguousRun(&virtual_only));
+        virtual_only[2].start += step;
+        try std.testing.expectEqual(@as(usize, 2), contiguousRun(&virtual_only));
+    }
+    var invalid_operation = adjacent;
+    for (&invalid_operation) |*item| item.operation = 255;
+    try std.testing.expectEqual(@as(usize, 1), contiguousRun(&invalid_operation));
+    try std.testing.expectEqual(@as(usize, 0), contiguousRun(&.{}));
 
     // A run of one is what a lone entry reports, and the length never exceeds
     // the slice it was given.

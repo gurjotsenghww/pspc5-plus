@@ -8258,6 +8258,30 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(misses, renderer.graphics_pipeline_cache_misses);
     std.debug.print("normalized color exports passed: FP16, UINT32, UNORM16 and SNORM16 in separate MRTs\n", .{});
 
+    // A real MRT draw still writes its other attachments while slot zero's
+    // mask is disabled. Its changed shader must not dirty or alter slot zero.
+    const masked_index = renderer.latest_render_target_index.?;
+    const masked_epoch = renderer.render_targets.items[masked_index].content_generation;
+    const masked_generation = renderer.render_targets.items[masked_index].gpu_generation;
+    var masked_fragment = fragment;
+    masked_fragment[1] = 0x0000_3c00;
+    masked_fragment[3] = 0x3c00_0000;
+    for (masked_fragment, 0..) |word, index| guest.word(0xd00 + index * 4, word);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 13);
+    try state.writeRegister(.context, 0x08e, 0xf310);
+    const draws_before_mask = renderer.translated_draws;
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expect(renderer.translated_draws > draws_before_mask);
+    try std.testing.expectEqual(masked_epoch, renderer.render_targets.items[masked_index].content_generation);
+    try std.testing.expectEqual(masked_generation, renderer.render_targets.items[masked_index].gpu_generation);
+    for ([_]u8{ 64, 128, 191, 255 }, guest.bytes[0x2000 + pixel * 4 ..][0..4]) |expected, actual|
+        try std.testing.expect(@abs(@as(i16, actual) - expected) <= 1);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 9);
+    try state.writeRegister(.context, 0x08e, 0xf31f);
+    std.debug.print("masked color attachment passed: other MRTs draw, retained pixels and unchanged content epoch\n", .{});
+
     try state.writeRegister(.context, 0x31c, 6 << 2);
     _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
     if (renderer.last_draw_error) |err| return err;

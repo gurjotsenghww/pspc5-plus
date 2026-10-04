@@ -350,9 +350,59 @@ The ReleaseFast repeat with runner SHA-256
 reaches brightness and the tree. Each presents 37 frames in 30.049 seconds
 (**1.231 FPS**). The previous runner presented 42 frames per interval; this
 repeat shows no performance improvement, with differing pipeline-cache and
-animation history. Tree streaks remain. Validation beyond the tree is ongoing;
-the two affected compute passes and character control are not yet confirmed.
+animation history. Tree streaks remain. The run proceeds into the dark 3D
+cinematic. A subsequent 60.090-second interval presents only one frame
+(**0.017 FPS**), including a long stall; this is not steady gameplay FPS.
+Character control is not reached.
+
+![Dark cinematic with unresolved lighting and geometry](../images/yotei-packed-post-tree-2026-10-04.png)
+
+The live compute-program sampler observes both previously rejected programs,
+and this log contains no `UnsupportedStorageImage` rejection. This is narrower
+evidence than complete shader correctness. Missing pixel resource `s28` and an
+unresolved compute sampler in `0x800027c200` still reject work. The packed
+attachment path also exposes a new `UnsupportedColorTarget` rejection: a
+six-attachment pass enables source-alpha blending on its packed UNORM plane.
+Later frame counters record one failed draw per frame and no failed dispatches,
+while roughly 11,800 storage-resource candidates remain unresolved; those
+candidate counts are not proof that every candidate is accessed by the GPU.
+That operation is not yet implemented for the integer representation, so this
+candidate is not installed over the preceding local runner.
+
+The dark cinematic continues to upload several GiB of texture data per frame.
+For example, flip 1617 reports 5,590,390 KiB of uploads, including 4,043,666 KiB
+of sampled textures, 5,847 texture misses and 5,957 evictions. Its 11.813-second
+frame includes 5.251 seconds of fence waits. A matched-symbol CPU sample also
+finds substantial time mapping and unmapping streaming memory. The run is
+deliberately stopped for an isolated rebuild; it is not a spontaneous crash.
 
 The preceding repeat also reports missing streamed texture backing (`GuestMemoryReadFailed`);
 read-only Windows mapping queries find reserved, unreadable ranges at several
 reported texture addresses. This separate issue remains under investigation.
+
+## Color content generations and virtual-only mapping batches
+
+Render-target LRU ages no longer stand in for texture-content changes. A
+separate global content generation advances on actual GPU writes and seeds;
+rebinding or reading an attachment only changes its eviction age. Draws with
+color writes disabled preserve the content generation of initialized targets.
+Depth operations and other writable MRT attachments still execute normally.
+This prevents a read-only use from invalidating a sampled snapshot without
+discarding real changes.
+
+Batch-map coalescing now requires contiguous physical offsets only for direct
+mappings. Unmap and protection entries can retain zero or stale unused offsets
+while adjacent virtual ranges are combined. Per-entry alignment, operation,
+length, protection and memory-type constraints remain enforced; invalid slices
+cannot become valid merely because their combined size is page aligned. Failed
+batches retain the processed prefix count.
+
+Seven ReleaseSafe Vulkan probe groups pass with Khronos synchronization
+validation and no VUID or synchronization errors: sampled-array refresh,
+integer colors, target reuse, storage reuse, color-cube publication,
+sampled-storage refresh, and feedback snapshots. The new checks retain a
+refreshed sampled image after a producer rebind and verify unchanged pixels
+and generations for a masked MRT attachment while another attachment is drawn.
+Five filtered kernel tests pass, including native protection/unmapping,
+invalid sub-page entries and partial batch progress. Runtime performance of
+these changes remains to be measured in the rebuilt runner.

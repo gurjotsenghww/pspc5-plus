@@ -2547,10 +2547,11 @@ const CachedRenderTarget = struct {
     shader_read_layout: bool = false,
     gpu_generation: u64 = 0,
     host_generation: u64 = 0,
+    /// Global content epoch; reading or rebinding this target only touches LRU.
+    content_generation: u64 = 0,
     /// Incremented only when a draw actually exports colour (CB MODE=NORMAL
-    /// and a nonzero write mask). Metadata/DISABLE passes bump gpu_generation
-    /// without producing texels; HDR resolve uses this to detect an empty
-    /// G-buffer and substitute environment lighting.
+    /// and a nonzero write mask). Initialization can seed texels without a
+    /// colour export. HDR resolve uses this to detect an empty G-buffer.
     color_export_generation: u64 = 0,
     last_used_sequence: u64 = 0,
     /// Prepared bindings must survive cache misses before their draw is queued.
@@ -5311,6 +5312,7 @@ pub const Renderer = struct {
     htile_target_sequence: u64 = 0,
     latest_render_target_index: ?usize = null,
     render_target_sequence: u64 = 0,
+    render_target_content_sequence: u64 = 0,
     completed_frames: std.ArrayList(CachedFrame) = .empty,
     latest_frame_index: ?usize = null,
     frame_sequence: u64 = 0,
@@ -10383,8 +10385,7 @@ pub const Renderer = struct {
         const cached = &self.render_targets.items[resolved_target_index];
         cached.initialized = true;
         cached.shader_read_layout = false;
-        cached.gpu_generation +%= 1;
-        _ = self.image_aliases.markWrite(cached.alias_token);
+        self.markRenderTargetWritten(cached);
         cached.last_used_sequence = self.render_target_sequence;
         self.latest_render_target_index = resolved_target_index;
         for (self.completed_frames.items) |*frame| {
@@ -10457,8 +10458,7 @@ pub const Renderer = struct {
         const cached = &self.render_targets.items[index];
         cached.initialized = true;
         cached.shader_read_layout = false;
-        cached.gpu_generation +%= 1;
-        _ = self.image_aliases.markWrite(cached.alias_token);
+        self.markRenderTargetWritten(cached);
         for (self.completed_frames.items) |*frame| {
             if (frame.guest_address == descriptor.address) frame.needs_writeback = false;
         }
@@ -14749,8 +14749,7 @@ pub const Renderer = struct {
         const cached_destination = &self.render_targets.items[destination_index];
         cached_destination.initialized = true;
         cached_destination.shader_read_layout = true;
-        cached_destination.gpu_generation +%= 1;
-        _ = self.image_aliases.markWrite(cached_destination.alias_token);
+        self.markRenderTargetWritten(cached_destination);
         self.render_target_sequence +%= 1;
         cached_destination.last_used_sequence = self.render_target_sequence;
         self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
@@ -15727,8 +15726,7 @@ pub const Renderer = struct {
             try self.submitOneShot(command_buffer);
             const cached = &self.render_targets.items[index];
             cached.shader_read_layout = false;
-            cached.gpu_generation +%= 1;
-            _ = self.image_aliases.markWrite(cached.alias_token);
+            self.markRenderTargetWritten(cached);
             self.noteComputeWrite("dcc-metadata-clear", descriptor.address, descriptor.width, descriptor.height, 0);
         }
     }
@@ -15845,6 +15843,14 @@ pub const Renderer = struct {
             "[vulkan dcb] flip #{d} guest bytes @0x{x} carry {d} coloured pixels of {d}\n",
             .{ self.flip_callbacks, buffer.address, coloured, wanted / 4 },
         );
+    }
+
+    fn markRenderTargetWritten(self: *Renderer, cached: *CachedRenderTarget) void {
+        self.render_target_content_sequence +%= 1;
+        if (self.render_target_content_sequence == 0) self.render_target_content_sequence = 1;
+        cached.content_generation = self.render_target_content_sequence;
+        cached.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(cached.alias_token);
     }
 
     fn acquireRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!usize {
@@ -16193,8 +16199,7 @@ pub const Renderer = struct {
         const dest = &self.render_targets.items[destination_index];
         dest.initialized = true;
         dest.shader_read_layout = false;
-        dest.gpu_generation +%= 1;
-        _ = self.image_aliases.markWrite(dest.alias_token);
+        self.markRenderTargetWritten(dest);
         dest.last_used_sequence = self.render_target_sequence;
         self.render_targets.items[source_index].shader_read_layout = false;
         self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
@@ -16360,8 +16365,7 @@ pub const Renderer = struct {
         const cached_destination = &self.render_targets.items[destination_index];
         cached_destination.initialized = true;
         cached_destination.shader_read_layout = false;
-        cached_destination.gpu_generation +%= 1;
-        _ = self.image_aliases.markWrite(cached_destination.alias_token);
+        self.markRenderTargetWritten(cached_destination);
         cached_destination.last_used_sequence = self.render_target_sequence;
         if (flip_vertical) cached_destination.scanout_flip_vertical = true;
         self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
@@ -16703,23 +16707,20 @@ pub const Renderer = struct {
 
         self.render_target_sequence +%= 1;
         const cached = &self.render_targets.items[target_index];
+        if (!cached.initialized or pipeline_state.color_write_masks[target.descriptor.slot] != 0)
+            self.markRenderTargetWritten(cached);
         cached.initialized = true;
-        cached.gpu_generation +%= 1;
         if (pipeline_state.color_write_masks[target.descriptor.slot] != 0)
             cached.color_export_generation +%= 1;
-        _ = self.image_aliases.markWrite(cached.alias_token);
         cached.last_used_sequence = self.render_target_sequence;
         for (extra_indices[0..extra_colors.len], extra_colors) |extra_index, extra| {
             self.render_target_sequence +%= 1;
             const extra_cached = &self.render_targets.items[extra_index];
+            const writes_color = extra.descriptor.slot < pipeline_state.color_write_masks.len and
+                pipeline_state.color_write_masks[extra.descriptor.slot] != 0;
+            if (!extra_cached.initialized or writes_color) self.markRenderTargetWritten(extra_cached);
             extra_cached.initialized = true;
-            extra_cached.gpu_generation +%= 1;
-            if (extra.descriptor.slot < pipeline_state.color_write_masks.len and
-                pipeline_state.color_write_masks[extra.descriptor.slot] != 0)
-            {
-                extra_cached.color_export_generation +%= 1;
-            }
-            _ = self.image_aliases.markWrite(extra_cached.alias_token);
+            if (writes_color) extra_cached.color_export_generation +%= 1;
             extra_cached.last_used_sequence = self.render_target_sequence;
         }
         if (depth_index) |index| {
@@ -18319,8 +18320,7 @@ pub const Renderer = struct {
                 try self.submitOneShot(commands);
                 cached.initialized = true;
                 cached.shader_read_layout = false;
-                cached.gpu_generation += 1;
-                _ = self.image_aliases.markWrite(cached.alias_token);
+                self.markRenderTargetWritten(cached);
                 self.render_target_sequence += 1;
                 cached.last_used_sequence = self.render_target_sequence;
             };
@@ -18558,7 +18558,7 @@ pub const Renderer = struct {
             try self.submitOneShot(clear_commands);
             self.render_target_sequence += 1;
             self.render_targets.items[index].initialized = true;
-            self.render_targets.items[index].gpu_generation += 1;
+            self.markRenderTargetWritten(&self.render_targets.items[index]);
             self.render_targets.items[index].last_used_sequence = self.render_target_sequence;
             // Missing CPU tracking and a changed CPU generation both reject.
             try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, 0, 1));
@@ -18603,6 +18603,17 @@ pub const Renderer = struct {
                 }
             }
         }
+        try std.testing.expectEqual(@as(u64, 2), self.frame_profile.sampled_array_refreshes);
+        // Rebinding the producer changes its eviction age, not its pixels.
+        // A read-only source must retain the already refreshed sampled array.
+        try self.beginDescriptorBatch(true);
+        const epoch = self.sampledSourceGeneration(descriptor.address, seed.len);
+        const age = self.render_targets.items[index].last_used_sequence;
+        try std.testing.expectEqual(index, try self.acquireRenderTarget(target));
+        try std.testing.expect(self.render_targets.items[index].last_used_sequence > age);
+        try std.testing.expectEqual(epoch, self.sampledSourceGeneration(descriptor.address, seed.len));
+        const reused = try self.stageSampledImage(descriptor, sampler, 0, .two_d_array, null);
+        try std.testing.expectEqual(original.image.handle, reused.image.handle);
         try std.testing.expectEqual(@as(u64, 2), self.frame_profile.sampled_array_refreshes);
         try std.testing.expectEqual(before_upload, self.frame_profile.texture_upload_bytes);
         try std.testing.expectEqual(before_readback, self.frame_profile.readback_bytes);
@@ -18650,7 +18661,7 @@ pub const Renderer = struct {
             try self.transitionTrackedImage(commands, source.handle, range, image_state.color_attachment_usage);
             try self.submitOneShot(commands);
             self.render_targets.items[index].initialized = true;
-            self.render_targets.items[index].gpu_generation +%= 1;
+            self.markRenderTargetWritten(&self.render_targets.items[index]);
             resources.images[pass] = try self.stageSampledImage(descriptor, sampler, 0, .two_d, target);
             resources.image_count += 1;
             try std.testing.expect(resources.images[pass].owns_image);
@@ -22671,8 +22682,7 @@ pub const Renderer = struct {
         const cached = &self.render_targets.items[target_index];
         cached.initialized = true;
         cached.shader_read_layout = false;
-        cached.gpu_generation +%= 1;
-        _ = self.image_aliases.markWrite(cached.alias_token);
+        self.markRenderTargetWritten(cached);
         cached.last_used_sequence = self.render_target_sequence;
         self.latest_render_target_index = target_index;
         for (self.completed_frames.items) |*frame| {
@@ -24850,9 +24860,9 @@ pub const Renderer = struct {
                 self.render_target_sequence +%= 1;
                 const target = &self.render_targets.items[target_index];
                 target.initialized = true;
-                target.gpu_generation +%= 1;
+                self.markRenderTargetWritten(target);
                 target.last_used_sequence = self.render_target_sequence;
-                _ = self.image_aliases.markWrite(target.alias_token);
+
                 // Trace captures are diagnostic runs: materialize each compute
                 // result at the producer boundary so the first pass that loses
                 // scene data can be identified from its guest address.
@@ -26974,10 +26984,11 @@ pub const Renderer = struct {
         // Completed frames change only after readback. A queued attachment
         // write must invalidate an earlier sampled snapshot even with canonical
         // alias tracking disabled, before a cache hit can bypass that readback.
+        // Rebinding or reading an attachment advances LRU but not this epoch.
         var target_sequence: u64 = 0;
         for (self.render_targets.items) |cached| {
             if (!cached.initialized or !byteRangesOverlap(address, visible_bytes, cached.target.descriptor.address, cached.target.layout.required_source_bytes)) continue;
-            target_sequence = @max(target_sequence, cached.last_used_sequence);
+            target_sequence = @max(target_sequence, cached.content_generation);
         }
         // Storage producers can use another format or extent, so direct image
         // reuse is not always possible. Include their content generation even
@@ -30912,11 +30923,10 @@ pub const Renderer = struct {
     }
 
     fn reportResourceFailure(self: *Renderer, bindings: *const gpu.ShaderBindings, inst: gpu.ShaderInstruction, scalar: *const gpu.scalar_provenance.ScalarRegisters) void {
-        // A missing graphics resource rejects a draw. Retain its scalar
+        // A missing image resource rejects a draw or dispatch. Retain its scalar
         // evidence on the first occurrence without enabling verbose buffer
         // lifetime tracing for the entire run. The bounded table below keeps
         // repeated failures from flooding the log.
-        if (!self.trace_resource_failures and bindings.stage == .compute) return;
         for (&self.reported_resource_failures) |*entry| {
             if (entry.*) |known| {
                 if (known.program == bindings.program_address and known.pc == inst.pc) return;
@@ -31059,7 +31069,7 @@ pub const Renderer = struct {
             const target = candidate orelse continue;
             if (!target.isActive()) continue;
             std.debug.print(
-                "[vulkan dcb] rejected target slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} num={d} swap={d} tile={f} samples={d} frags={d} dcc={any} cmask={any} fmask={any}\n",
+                "[vulkan dcb] rejected target slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} num={d} swap={d} tile={f} samples={d} frags={d} dcc={any} cmask={any} fmask={any} mask=0x{x} blend={any}\n",
                 .{
                     target.slot,
                     target.address,
@@ -31075,6 +31085,8 @@ pub const Renderer = struct {
                     target.dcc_enabled,
                     target.cmask_fast_clear,
                     target.fmask_compression,
+                    target.write_mask,
+                    rejected_state.blends[target.slot],
                 },
             );
         }
