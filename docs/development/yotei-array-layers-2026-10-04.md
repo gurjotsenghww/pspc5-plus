@@ -293,5 +293,66 @@ scheduling disabled/enabled, preserving the complete pixel result when
 repeated CPU reseeds are queued. It retains one 256-byte shared readback
 buffer. The MRT probe seeds four attachments with distinct untouched pixels,
 forces ring overflow, and checks those pixels and rendered exports, including
-the source offsets and spill lifetime. This is allocation and correctness
-evidence; the new game run is still pending.
+the source offsets and spill lifetime.
+
+The ReleaseFast repeat uses runner SHA-256
+`58977d5e64d0e763ee8b37d189016ed3e5af850eda032e46f3f100654f6a1d72`,
+subsequently installed with its matching PDB in `zig-out/bin`. With the same
+1080p output, Speed mode and performance preference, brightness presents
+42 frames in 30.045 seconds (**1.398 FPS**); the tree presents 42 in 30.047
+seconds (**1.398 FPS**). The preceding build presented 38 frames in each
+interval. This is a small observed increase, not a controlled attribution:
+pipeline-cache history and animation position differ. No input, profiling,
+capture or compilation overlaps either interval.
+
+The tree inventory retains a **72 MiB shared image transfer buffer** and no
+per-color-target host readbacks. Tree detail remains visible, including the
+unresolved bright streaks. This repeat also reaches the illustrated movie.
+It is manually stopped after 1,492 seconds for the next format fix; character
+control and post-movie gameplay FPS remain unconfirmed.
+
+## Packed normalized render targets and compute reads
+
+Selective resource diagnostics identify a concrete reason for two rejected
+compute dispatches: program `0x8000265d00` at `0xf0`, and `0x80003cfa00` at
+`0x29c`, load valid T# tuples whose unified format is **30**. The decoder
+rejects that encoding before an image can be bound. AMD's
+[GFX10 format table](https://chromium.googlesource.com/chromiumos/third_party/mesa/+/refs/heads/stabilize-13982.70.B-chromeos-amd/src/amd/registers/gfx10-rsrc.json)
+names it `10_11_11_UNORM`; the local KytyPS5 format definitions also retain
+this normalized packed format. This is descriptor/ISA evidence, not copied
+shader code.
+
+The renderer also previously represented `CB_COLOR_INFO` format 6 with
+number type UNORM as `B10G11R11_UFLOAT_PACK32`. Those bit patterns have different
+meanings. The new implementation retains guest bits in an `R32_UINT` image,
+packs normalized fragment exports into 11/11/10 bits, and decodes normalized
+channels at compute `IMAGE_LOAD`. Compute stores clamp and quantize back to
+the packed representation. Component selection, default alpha and export
+component permutation remain explicit. Floating-point format 36 retains its
+native float representation.
+
+Vulkan has no matching packed UNORM attachment, so blending and
+partial RGB attachment writes remain explicitly unsupported. Filtered sampled
+views of format 30 are not implemented by this change. The fix covers the
+observed compute image reads and full RGB attachment exports; it does not
+claim complete shader or format coverage.
+
+Four descriptor tests pass. ReleaseSafe `--packed-unorm` validates 64-pixel
+reads with independent packed seeds, changed selectors and input data,
+normalized stores with out-of-range values, and exact fragment-export bytes.
+The storage cases pass with timeline scheduling off and on. Native
+`--integer-colors`, `--sampled-storage-refresh`, `--storage-reuse` and
+`--image-d16` also pass. All five groups run with Khronos validation and
+synchronization validation, without VUID or synchronization errors.
+
+The ReleaseFast repeat with runner SHA-256
+`a2b61466d8a08c2dc23f5d05811169dd44ce81880603a9f026edbb840faaddc8`
+reaches brightness and the tree. Each presents 37 frames in 30.049 seconds
+(**1.231 FPS**). The previous runner presented 42 frames per interval; this
+repeat shows no performance improvement, with differing pipeline-cache and
+animation history. Tree streaks remain. Validation beyond the tree is ongoing;
+the two affected compute passes and character control are not yet confirmed.
+
+The preceding repeat also reports missing streamed texture backing (`GuestMemoryReadFailed`);
+read-only Windows mapping queries find reserved, unreadable ranges at several
+reported texture addresses. This separate issue remains under investigation.

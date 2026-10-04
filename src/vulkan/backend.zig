@@ -2133,11 +2133,11 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
             7 => .{ .vulkan = vk.format_r16g16_sfloat, .bytes_per_texel = 4 },
             else => null,
         },
-        // DATA_FORMAT_10_11_11. FLOAT is the native packing; Yotei also binds
-        // NUMBER_FORMAT_UNORM on the same 32-bit layout, and Vulkan has no
-        // 11-11-10 UNORM format, so keep the packed 32-bit attachment.
+        // Vulkan has no 11-11-10 UNORM format. Preserve its exact bits in
+        // R32_UINT and quantize the float exports in the shader epilogue.
         6 => switch (descriptor.number_type) {
-            0, 7 => .{ .vulkan = vk.format_b10g11r11_ufloat_pack32, .bytes_per_texel = 4 },
+            0 => .{ .vulkan = vk.format_r32_uint, .bytes_per_texel = 4 },
+            7 => .{ .vulkan = vk.format_b10g11r11_ufloat_pack32, .bytes_per_texel = 4 },
             else => null,
         },
         // DATA_FORMAT_10_10_10_2 + NUMBER_FORMAT_UNORM. COMP_SWAP is handled
@@ -2197,6 +2197,7 @@ fn colorTargetComponentCount(format: u8) ?usize {
 /// physical surface component. Unused selectors complete a permutation so the
 /// same mapping can also translate CB_TARGET_MASK into Vulkan write-mask bits.
 fn colorTargetExportType(descriptor: gpu.resources.ColorTarget) rdna2.spirv.ColorExportType {
+    if (descriptor.format == 6 and descriptor.number_type == 0) return .r11g11b10_unorm;
     return switch (descriptor.number_type) {
         4 => .uint32,
         5 => .sint32,
@@ -13175,6 +13176,14 @@ pub const Renderer = struct {
             else
                 0;
             const blend = render.blends[slot];
+            if (colorTargetExportType(color.descriptor) == .r11g11b10_unorm) {
+                const physical_mask = result.color_write_masks[slot] & 7;
+                // One host integer channel contains all three guest channels.
+                // Partial updates and blending require read/modify/write and
+                // cannot silently use integer attachment semantics.
+                if (physical_mask != 0 and (physical_mask != 7 or blend.enabled)) return Error.UnsupportedColorTarget;
+                result.color_write_masks[slot] = if (physical_mask == 0) 0 else 1;
+            }
             // Integer attachments reject colour blending; Yotei's ID plane is
             // R32_UINT and the G-buffer pass that fills it has blend off already.
             const integer_color = colorTargetExportType(color.descriptor) != .float32;
@@ -33934,6 +33943,7 @@ fn storageImageFormat(unified_format: u16) ?StorageImageFormat {
         27 => .{ .spirv = .rg16_uint, .vulkan = vk.format_r16g16_uint },
         28 => .{ .spirv = .rg16_sint, .vulkan = vk.format_r16g16_sint },
         29 => .{ .spirv = .rg16_float, .vulkan = vk.format_r16g16_sfloat },
+        30 => .{ .spirv = .r11g11b10_unorm, .vulkan = vk.format_r32_uint },
         36 => .{ .spirv = .r11g11b10_float, .vulkan = vk.format_b10g11r11_ufloat_pack32 },
         50 => .{ .spirv = .rgb10a2_unorm, .vulkan = vk.format_a2b10g10r10_unorm_pack32 },
         56 => .{ .spirv = .rgba8_unorm, .vulkan = vk.format_r8g8b8a8_unorm },
@@ -34130,7 +34140,7 @@ fn storageImageBytesPerTexel(unified_format: u16) u8 {
     return switch (unified_format) {
         1...6, 128 => 1,
         7...19, 129 => 2,
-        20...29, 36, 50, 56...61, 130 => 4,
+        20...30, 36, 50, 56...61, 130 => 4,
         62...71 => 8,
         75...77 => 16,
         169...182 => (gpu.elementLayoutForUnifiedFormat(unified_format) orelse unreachable).bytes,
@@ -39474,7 +39484,7 @@ test "10-10-10-2 UNORM color targets use the matching packed Vulkan format" {
     try std.testing.expect(colorTargetFormat(descriptor) == null);
 }
 
-test "10-11-11 UNORM colour targets share the packed 32-bit attachment" {
+test "10-11-11 UNORM colour targets preserve packed normalized bits" {
     var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
     descriptor.format = 6;
     descriptor.number_type = 7;
@@ -39482,7 +39492,8 @@ test "10-11-11 UNORM colour targets share the packed 32-bit attachment" {
 
     descriptor.number_type = 0;
     const unorm = colorTargetFormat(descriptor).?;
-    try std.testing.expectEqual(vk.format_b10g11r11_ufloat_pack32, unorm.vulkan);
+    try std.testing.expectEqual(vk.format_r32_uint, unorm.vulkan);
+    try std.testing.expectEqual(rdna2.spirv.ColorExportType.r11g11b10_unorm, colorTargetExportType(descriptor));
     try std.testing.expectEqual(@as(u8, 4), unorm.bytes_per_texel);
 }
 

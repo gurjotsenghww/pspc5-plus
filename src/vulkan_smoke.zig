@@ -791,6 +791,63 @@ fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: boo
     std.debug.print("sampled storage refresh passed: {s} writer, timeline={}, cached UNORM view, pending/published writes, sampler change, read-only reuse and CPU upload\n", .{ if (buffer_writer) "buffer" else "image", timeline });
 }
 
+fn runPackedUnormStorageProbe(allocator: std.mem.Allocator, timeline: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = timeline });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        0xf000_0f08, 0x0000_0400, // load RGBA, T#s0
+        0xf020_0f08, 0x0002_0400, // store RGBA, T#s8
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x1000 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 0x10);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, (16 << 1) | (1 << 11));
+    for ([_]u32{ 4, 16, 1 }, 0..) |size, axis| try state.writeRegister(.shader, 0x207 + @as(u32, @intCast(axis)), size);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    const packed_cases = [_]u32{ 0, 0xffffffff, 1, 0x800, 0x400000, 0x200 | (1024 << 11) | (767 << 22), 0x12345678, 0x87654321 };
+    for (0..3) |pass| {
+        const storing = pass == 2;
+        for (0..16) |y| for (0..4) |x| {
+            if (storing) {
+                for ([_]f32{ -1, 0.5, 2, 1 }, 0..) |value, channel|
+                    guest.word(0x5000 + y * 256 + x * 16 + channel * 4, @bitCast(value));
+            } else guest.word(0x5000 + y * 256 + x * 4, packed_cases[(y * 4 + x + pass) % packed_cases.len]);
+        };
+        @memset(guest.bytes[0x9000..0xa000], 0xcc);
+        for ([_]u32{ 0x5000, 0x9000 }, 0..) |address, slot| {
+            var descriptor = imageDescriptorWords(address, 4, 16);
+            const format: u32 = if ((slot == 0) == storing) 77 else 30;
+            descriptor[1] = (descriptor[1] & ~@as(u32, 0x1ff00000)) | (format << 20);
+            // The second read changes selectors, including constant alpha.
+            if (slot == 0 and pass == 1) descriptor[3] = (descriptor[3] & ~@as(u32, 0xfff)) | 0x032e; // Z,Y,X,1
+            for (descriptor, 0..) |word, component|
+                try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(slot * 8 + component)), word);
+        }
+        _ = try executor.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 });
+        if (renderer.last_dispatch_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        for (0..16) |y| for (0..4) |x| {
+            if (storing) {
+                try std.testing.expectEqual(@as(u32, (1024 << 11) | (1023 << 22)), std.mem.readInt(u32, guest.bytes[0x9000 + y * 256 + x * 4 ..][0..4], .little));
+            } else {
+                const packed_word = packed_cases[(y * 4 + x + pass) % packed_cases.len];
+                var values = [_]f32{ @as(f32, @floatFromInt(packed_word & 2047)) / 2047, @as(f32, @floatFromInt((packed_word >> 11) & 2047)) / 2047, @as(f32, @floatFromInt(packed_word >> 22)) / 1023, 1 };
+                if (pass == 1) std.mem.swap(f32, &values[0], &values[2]);
+                for (values, 0..) |expected, channel| {
+                    const actual: f32 = @bitCast(std.mem.readInt(u32, guest.bytes[0x9000 + y * 256 + x * 16 + channel * 4 ..][0..4], .little));
+                    try std.testing.expectApproxEqAbs(expected, actual, 0.000001);
+                }
+            }
+        };
+    }
+    std.debug.print("packed 11/11/10 UNORM passed: load, selectors, refreshed input, clamped store and round-to-even; timeline={}\n", .{timeline});
+}
+
 fn runPredicatedImageLoadProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -8201,6 +8258,14 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(misses, renderer.graphics_pipeline_cache_misses);
     std.debug.print("normalized color exports passed: FP16, UINT32, UNORM16 and SNORM16 in separate MRTs\n", .{});
 
+    try state.writeRegister(.context, 0x31c, 6 << 2);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqual(@as(u32, 512 | (1024 << 11) | (767 << 22)), std.mem.readInt(u32, guest.bytes[0x2000 + pixel * 4 ..][0..4], .little));
+    try state.writeRegister(.context, 0x31c, 10 << 2);
+    std.debug.print("packed UNORM attachment passed: FP16 export quantized to exact 11/11/10 guest bits\n", .{});
+
     // A later Yotei pass renders directly into a two-channel signed-normalized
     // attachment before sampling it as RG16_SNORM. Keep both signs intact.
     var signed_fragment = fragment;
@@ -12664,6 +12729,12 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
         try runStorageImageReuseProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-unorm")) {
+        try runPackedUnormStorageProbe(allocator, false);
+        try runPackedUnormStorageProbe(allocator, true);
+        try runNormalizedColorProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--host-import")) {

@@ -206,6 +206,7 @@ pub const StorageImageFormat = enum(u16) {
     rg16_uint = 27,
     rg16_sint = 28,
     rg16_float = 29,
+    r11g11b10_unorm = 30,
     r11g11b10_float = 36,
     rgb10a2_unorm = 50,
     rgba8_unorm = 56,
@@ -279,7 +280,7 @@ pub const NggLdsExport = struct {
     source_pcs: [4]?u32 = @splat(null),
 };
 
-pub const ColorExportType = enum { float32, uint32, sint32 };
+pub const ColorExportType = enum { float32, uint32, sint32, r11g11b10_unorm };
 pub const PackedColorExport = enum { float16, unorm16, snorm16 };
 
 pub const FragmentInputs = struct {
@@ -327,7 +328,7 @@ pub const FragmentInputs = struct {
 fn colorExportValueType(color_type: ColorExportType) ValueType {
     return switch (color_type) {
         .float32 => .float32,
-        .uint32 => .bits32,
+        .uint32, .r11g11b10_unorm => .bits32,
         .sint32 => .sint32,
     };
 }
@@ -661,7 +662,7 @@ const WorkgroupAccess = struct {
 
 fn storageImageValueType(format: StorageImageFormat) ValueType {
     return switch (format) {
-        .r8_uint, .r16_uint, .rg8_uint, .r32_uint, .rg16_uint, .rgba8_uint, .rg32_uint, .rgba16_uint, .rgba32_uint => .bits32,
+        .r8_uint, .r16_uint, .rg8_uint, .r32_uint, .rg16_uint, .rgba8_uint, .rg32_uint, .rgba16_uint, .rgba32_uint, .r11g11b10_unorm => .bits32,
         .r8_sint, .r16_sint, .rg8_sint, .r32_sint, .rg16_sint, .rgba8_sint, .rg32_sint, .rgba16_sint, .rgba32_sint => .sint32,
         .r8_unorm, .r8_snorm, .r16_unorm, .r16_snorm, .r16_float, .rg8_unorm, .rg8_snorm, .r32_float, .rg16_unorm, .rg16_snorm, .rg16_float, .r11g11b10_float, .rgb10a2_unorm, .rgba8_unorm, .rgba8_snorm, .rg32_float, .rgba16_unorm, .rgba16_snorm, .rgba16_float, .rgba32_float => .float32,
     };
@@ -701,7 +702,7 @@ fn storageImageSpirvFormat(format: StorageImageFormat) u32 {
         .rgba32_uint => 30, // Rgba32ui
         .rgba16_uint => 31, // Rgba16ui
         .rgba8_uint => 32, // Rgba8ui
-        .r32_uint => 33, // R32ui
+        .r32_uint, .r11g11b10_unorm => 33, // R32ui
         .rg32_uint => 35, // Rg32ui
         .rg16_uint => 36, // Rg16ui
         .rg8_uint => 37, // Rg8ui
@@ -725,6 +726,7 @@ fn storageImageNeedsExtendedFormats(format: StorageImageFormat) bool {
         .rgba16_uint,
         .rgba8_uint,
         .r32_uint,
+        .r11g11b10_unorm,
         => false,
         else => true,
     };
@@ -1280,7 +1282,11 @@ const Builder = struct {
                 const color_mask = options.color_export_mask;
                 for (0..self.color_outputs.len) |slot| {
                     if (color_mask & (@as(u8, 1) << @intCast(slot)) == 0) continue;
-                    const type_index = @intFromEnum(options.color_export_types[slot]);
+                    const type_index: usize = switch (options.color_export_types[slot]) {
+                        .float32 => 0,
+                        .uint32, .r11g11b10_unorm => 1,
+                        .sint32 => 2,
+                    };
                     if (output_pointers[type_index] == 0) {
                         const vector_type = try self.ensureVec4(colorExportValueType(options.color_export_types[slot]));
                         output_pointers[type_index] = self.id();
@@ -5590,7 +5596,8 @@ const Builder = struct {
             return;
         }
         const is_position = output == self.position_output;
-        if (self.stage == .fragment and self.color_export_types[inst.export_target] != .float32) {
+        const packed_unorm = self.stage == .fragment and self.color_export_types[inst.export_target] == .r11g11b10_unorm;
+        if (self.stage == .fragment and self.color_export_types[inst.export_target] != .float32 and !packed_unorm) {
             return self.exportIntegerColor(inst, output);
         }
         const zero = try self.constant(.float32, @bitCast(@as(f32, 0)));
@@ -5677,9 +5684,15 @@ const Builder = struct {
                 self.color_export_mappings[inst.export_target],
             );
         }
+        const output_vector_type = if (packed_unorm) try self.ensureVec4(.bits32) else self.vector4_type;
+        if (packed_unorm) {
+            const packed_word = try self.packR11G11B10Unorm(components);
+            const bits_zero = try self.constant(.bits32, 0);
+            components = .{ packed_word, bits_zero, bits_zero, bits_zero };
+        }
         const vector = self.id();
         try self.emit(&self.body, 80, &.{
-            self.vector4_type,
+            output_vector_type,
             vector,
             components[0],
             components[1],
@@ -5689,9 +5702,9 @@ const Builder = struct {
         var exported = vector;
         if (try self.laneEnabled()) |enabled| {
             const current = self.id();
-            try self.emit(&self.body, 61, &.{ self.vector4_type, current, output }); // OpLoad
+            try self.emit(&self.body, 61, &.{ output_vector_type, current, output }); // OpLoad
             const selected = self.id();
-            try self.emit(&self.body, 169, &.{ self.vector4_type, selected, enabled, vector, current }); // OpSelect
+            try self.emit(&self.body, 169, &.{ output_vector_type, selected, enabled, vector, current }); // OpSelect
             exported = selected;
         }
         try self.emit(&self.body, 62, &.{ output, exported }); // OpStore
@@ -5702,6 +5715,51 @@ const Builder = struct {
                     try self.emit(&self.body, 62, &.{ variable, exported });
             }
         }
+    }
+
+    /// Vulkan has no normalized 11/11/10 image. Its R32_UINT backing keeps
+    /// the guest bits intact; normalization happens at the instruction edge.
+    fn packR11G11B10Unorm(self: *Builder, values: [4]u32) Error!u32 {
+        var packed_word = try self.constant(.bits32, 0);
+        const zero = try self.constant(.float32, 0);
+        const one = try self.constant(.float32, @bitCast(@as(f32, 1)));
+        for ([_]u32{ 2047, 2047, 1023 }, [_]u32{ 0, 11, 22 }, 0..) |maximum, shift, component| {
+            const nan = self.id();
+            try self.emit(&self.body, 156, &.{ self.bool_type, nan, values[component] }); // OpIsNan
+            const finite = self.id();
+            try self.emit(&self.body, 169, &.{ self.float_type, finite, nan, zero, values[component] });
+            const clamped = self.id();
+            try self.emit(&self.body, 12, &.{ self.float_type, clamped, self.ensureGlslStd450(), 43, finite, zero, one });
+            const scaled = self.id();
+            try self.emit(&self.body, 133, &.{ self.float_type, scaled, clamped, try self.constant(.float32, @bitCast(@as(f32, @floatFromInt(maximum)))) });
+            const rounded = self.id();
+            try self.emit(&self.body, 12, &.{ self.float_type, rounded, self.ensureGlslStd450(), 2, scaled }); // RoundEven
+            const integer = self.id();
+            try self.emit(&self.body, 109, &.{ self.bits_type, integer, rounded }); // OpConvertFToU
+            const shifted = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, shifted, integer, try self.constant(.bits32, shift) });
+            const combined = self.id();
+            try self.emit(&self.body, 197, &.{ self.bits_type, combined, packed_word, shifted });
+            packed_word = combined;
+        }
+        return packed_word;
+    }
+
+    fn unpackR11G11B10Unorm(self: *Builder, texel: u32) Error![4]u32 {
+        const packed_word = self.id();
+        try self.emit(&self.body, 81, &.{ self.bits_type, packed_word, texel, 0 });
+        var values: [4]u32 = undefined;
+        for ([_]u32{ 11, 11, 10 }, [_]u32{ 0, 11, 22 }, 0..) |width, shift, component| {
+            const bits = self.id();
+            try self.emit(&self.body, 203, &.{ self.bits_type, bits, packed_word, try self.constant(.bits32, shift), try self.constant(.bits32, width) });
+            const converted = self.id();
+            try self.emit(&self.body, 112, &.{ self.float_type, converted, bits }); // OpConvertUToF
+            values[component] = self.id();
+            const maximum: f32 = @floatFromInt((@as(u32, 1) << @intCast(width)) - 1);
+            try self.emit(&self.body, 136, &.{ self.float_type, values[component], converted, try self.constant(.float32, @bitCast(maximum)) });
+        }
+        values[3] = try self.constant(.float32, @bitCast(@as(f32, 1)));
+        return values;
     }
 
     fn exportIntegerColor(self: *Builder, inst: instruction.Instruction, output: u32) Error!void {
@@ -6226,12 +6284,16 @@ const Builder = struct {
         const texel = self.id();
         try self.emit(&self.body, 98, &.{ vector_type, texel, image, coordinates }); // OpImageRead
 
+        const unpacked = if (binding.format == .r11g11b10_unorm) try self.unpackR11G11B10Unorm(texel) else null;
+        const result_type: ValueType = if (unpacked != null) .float32 else value_type;
+
         var destination_index: u32 = 0;
         for (0..4) |component| {
             const bit = @as(u4, 1) << @intCast(component);
             if (inst.data_mask & bit == 0) continue;
             const selector = binding.dst_select[component];
             const value = if (selector >= 4) blk: {
+                if (unpacked) |values| break :blk values[selector - 4];
                 const extracted = self.id();
                 try self.emit(&self.body, 81, &.{
                     self.typeId(value_type),
@@ -6240,11 +6302,11 @@ const Builder = struct {
                     selector - 4,
                 }); // OpCompositeExtract
                 break :blk extracted;
-            } else try self.storageImageConstant(value_type, selector);
+            } else try self.storageImageConstant(result_type, selector);
             try self.imageResultComponent(
                 inst,
                 destination_index,
-                .{ .id = value, .value_type = value_type },
+                .{ .id = value, .value_type = result_type },
             );
             destination_index += 1;
         }
@@ -6263,7 +6325,7 @@ const Builder = struct {
         }
         const binding = self.storageImageBinding(inst.src1.reg, inst.pc) orelse return Error.InvalidStorageBinding;
         const descriptor_index: usize = @intCast(binding.descriptor_index);
-        const value_type = storageImageValueType(binding.format);
+        const value_type: ValueType = if (binding.format == .r11g11b10_unorm) .float32 else storageImageValueType(binding.format);
         const vector_type = self.storage_image_vector_types[descriptor_index];
         if (vector_type == 0) return Error.InvalidStorageBinding;
         const image = try self.loadStorageImage(binding);
@@ -6290,6 +6352,11 @@ const Builder = struct {
                     break;
                 }
             }
+        }
+        if (binding.format == .r11g11b10_unorm) {
+            const packed_word = try self.packR11G11B10Unorm(physical_values);
+            const zero = try self.constant(.bits32, 0);
+            physical_values = .{ packed_word, zero, zero, zero };
         }
         const texel = self.id();
         try self.emit(&self.body, 80, &.{
