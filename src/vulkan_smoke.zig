@@ -9195,7 +9195,7 @@ fn runFlatWaveSnapshotProbe(allocator: std.mem.Allocator) !void {
     for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
     var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
     defer analysis.deinit(allocator);
-    for ([_]bool{ false, true }) |bvh_mode1| {
+    for ([_]bool{ false, true }) |compact_lookup| for ([_]bool{ false, true }) |bvh_mode1| {
         if (bvh_mode1 and !renderer.storage_buffer_nonuniform_indexing) continue;
         var module = try analysis.translateSpirv(allocator, .{
             .stage = .compute,
@@ -9205,7 +9205,11 @@ fn runFlatWaveSnapshotProbe(allocator: std.mem.Allocator) !void {
                 .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 8 },
                 .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
             },
-            .flat_memories = &.{ .{ .descriptor_index = 2, .fault_record_word = 20 }, .{ .descriptor_index = 3 } },
+            .flat_memories = if (compact_lookup)
+                &.{ .{ .descriptor_index = 2, .fault_record_word = 20 }, .{ .descriptor_index = 4 }, .{ .descriptor_index = 5 }, .{ .descriptor_index = 3 } }
+            else
+                &.{ .{ .descriptor_index = 2, .fault_record_word = 20 }, .{ .descriptor_index = 3 } },
+            .snapshot_unbound_reads = compact_lookup,
             .bvh_intersection_mode1 = bvh_mode1,
         });
         defer module.deinit(allocator);
@@ -9236,6 +9240,11 @@ fn runFlatWaveSnapshotProbe(allocator: std.mem.Allocator) !void {
             _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, 64 * 16);
             _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 96);
             _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, 48);
+            if (compact_lookup) {
+                @memset(guest.bytes[0x12200..0x12220], 0);
+                _ = try renderer.stageGuestStorageBufferAt(4, 0x12200, 16);
+                _ = try renderer.stageGuestStorageBufferAt(5, 0x12210, 16);
+            }
             _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
             var output: [64 * 16]u8 = undefined;
             try renderer.readbackGuestStorageBuffer(0x11000, &output);
@@ -9257,7 +9266,7 @@ fn runFlatWaveSnapshotProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(faults, std.mem.readInt(u32, header[8..12], .little));
             try std.testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, header[80..84], .little));
         }
-    }
+    };
     std.debug.print("FLAT wave snapshots passed: divergent descriptors, last overlapping region wins, unaligned loads, relocation, partial vector bounds and faults\n", .{});
 }
 
@@ -9266,7 +9275,7 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
-    for ([_]bool{ false, true }) |bvh_mode1| for ([_]bool{ false, true }) |repeat| for ([_]u32{ 125, 0, 106 }) |saddr| for ([_]i32{ -4, 0, 4 }) |offset| {
+    for ([_]bool{ false, true }) |compact_lookup| for ([_]bool{ false, true }) |bvh_mode1| for ([_]bool{ false, true }) |repeat| for ([_]u32{ 125, 0, 106 }) |saddr| for ([_]i32{ -4, 0, 4 }) |offset| {
         if (bvh_mode1 and !renderer.storage_buffer_nonuniform_indexing) continue;
         const scalar_base = saddr != 125;
         const code = [_]u32{
@@ -9294,7 +9303,11 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
                 .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 8 },
                 .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
             },
-            .flat_memories = &.{ .{ .descriptor_index = 2, .fault_record_word = 12 }, .{ .descriptor_index = 3 } },
+            .flat_memories = if (compact_lookup)
+                &.{ .{ .descriptor_index = 2, .fault_record_word = 12 }, .{ .descriptor_index = 4 }, .{ .descriptor_index = 5 }, .{ .descriptor_index = 3 } }
+            else
+                &.{ .{ .descriptor_index = 2, .fault_record_word = 12 }, .{ .descriptor_index = 3 } },
+            .snapshot_unbound_reads = compact_lookup,
             .bvh_intersection_mode1 = bvh_mode1,
         });
         defer module.deinit(allocator);
@@ -9321,6 +9334,11 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
             for (0..4) |word| guest.word(0x12030 + word * 4, 0);
             _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 64);
             _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, 48);
+            if (compact_lookup) {
+                @memset(guest.bytes[0x12200..0x12220], 0);
+                _ = try renderer.stageGuestStorageBufferAt(4, 0x12200, 16);
+                _ = try renderer.stageGuestStorageBufferAt(5, 0x12210, 16);
+            }
             _ = try renderer.dispatchSpirv(module.words, .{ pointers.len, 1, 1 });
             var output: [pointers.len * 16]u8 = undefined;
             try renderer.readbackGuestStorageBuffer(0x11000, &output);
@@ -9548,51 +9566,75 @@ fn runUnboundSnapshotProbe(allocator: std.mem.Allocator) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
-    const code = [_]u32{
-        sop1(3, 0, 255), 0x1000, sop1(3, 1, 255), 0x20,
-        0xf408_0200,                0xfa00_0000, // runtime V# s8 <- pointer s0
-        mubuf(0x0d, 0, 2, 0, 8)[0], mubuf(0x0d, 0, 2, 0, 8)[1],
-        sop1(3, 106, 134), // VCC is a scalar byte offset of 6, aligned to 4 by SMEM
-        0xf424_0504,                 106 << 25, // s_buffer_load_dwordx2 s20, V#s8, VCC
-        vop1(1, 4, 20),              vop1(1, 5, 21),
-        mubuf(0x1e, 0, 2, 0, 12)[0], mubuf(0x1e, 0, 2, 0, 12)[1],
-        0xbf81_0000,
-    };
-    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
-    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
-    defer analysis.deinit(allocator);
-    var module = try analysis.translateSpirv(allocator, .{
-        .stage = .compute,
-        .local_size = .{ 8, 1, 1 },
-        .wave32 = true,
-        .compute_inputs = .{ .local_invocation_id_components = 1 },
-        .snapshot_unbound_reads = true,
-        .storage_buffers = &.{.{ .resource_sgpr = 12, .descriptor_index = 0, .stride = 16 }},
-        .flat_memories = &.{.{ .descriptor_index = 1, .fault_record_word = 132 }},
-    });
-    defer module.deinit(allocator);
-    guest.word(0x12000, 0x1000);
-    guest.word(0x12004, 0x20);
-    guest.word(0x1200c, 512);
-    for ([_]u32{ 0x1080, 0x80020, 4, 0x16204 }, 0..) |word, index| guest.word(0x12010 + index * 4, word);
-    for (0..8) |index| guest.word(0x12090 + index * 4, @intCast(0xabc00000 + index));
-    for (0..2) |missing| {
-        guest.word(0x12004, if (missing == 0) 0x20 else 0x21);
-        guest.word(0x12008, 0);
-        _ = try renderer.stageGuestStorageBufferAt(0, 0x11000, 8 * 16);
-        _ = try renderer.stageGuestStorageBufferAt(1, 0x12000, 544);
-        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
-        var output: [8 * 16]u8 = undefined;
-        try renderer.readbackGuestStorageBuffer(0x11000, &output);
-        for (0..8) |lane| for (0..4) |word| {
-            const expected: u32 = if (missing != 0 or (word < 2 and lane >= 4)) 0 else if (word < 2) @intCast(0xabc00000 + lane * 2 + word) else @intCast(0xabc00001 + word - 2);
-            const actual = std.mem.readInt(u32, output[lane * 16 + word * 4 ..][0..4], .little);
-            if (actual != expected) std.debug.print("snapshot case={d} lane={d} word={d} expected={x} actual={x}\n", .{ missing, lane, word, expected, actual });
-            try std.testing.expectEqual(expected, actual);
+    for ([_]bool{ false, true }) |repeat| {
+        const body = [_]u32{
+            sop1(3, 0, 255), 0x1000, sop1(3, 1, 255), 0x20,
+            0xf408_0200,                0xfa00_0000, // runtime V# s8 <- pointer s0
+            mubuf(0x0d, 0, 2, 0, 8)[0], mubuf(0x0d, 0, 2, 0, 8)[1],
+            sop1(3, 106, 134), // VCC is a scalar byte offset of 6, aligned to 4 by SMEM
+            0xf424_0504,                 106 << 25, // s_buffer_load_dwordx2 s20, V#s8, VCC
+            vop1(1, 4, 20),              vop1(1, 5, 21),
+            mubuf(0x1e, 0, 2, 0, 12)[0], mubuf(0x1e, 0, 2, 0, 12)[1],
         };
-        var header: [544]u8 = undefined;
-        try renderer.readbackGuestStorageBuffer(0x12000, &header);
-        try std.testing.expectEqual(@as(u32, if (missing == 0) 0 else 32), std.mem.readInt(u32, header[8..12], .little));
+        const code = [_]u32{if (repeat) 0xbe9e_0382 else 0xbf80_0000} ++ body ++ [_]u32{
+            if (repeat) 0x811e_c11e else 0xbf80_0000,
+            if (repeat) 0xbf06_801e else 0xbf80_0000,
+            if (repeat) 0xbf84_0000 | (@as(u32, @bitCast(-@as(i32, body.len + 3))) & 0xffff) else 0xbf80_0000,
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+        defer analysis.deinit(allocator);
+        for ([_]bool{ false, true }) |compact_lookup| {
+            var module = try analysis.translateSpirv(allocator, .{
+                .stage = .compute,
+                .local_size = .{ 8, 1, 1 },
+                .wave32 = true,
+                .compute_inputs = .{ .local_invocation_id_components = 1 },
+                .snapshot_unbound_reads = true,
+                .storage_buffers = &.{.{ .resource_sgpr = 12, .descriptor_index = 0, .stride = 16 }},
+                .flat_memories = if (compact_lookup)
+                    &.{ .{ .descriptor_index = 1, .fault_record_word = 132 }, .{ .descriptor_index = 2 }, .{ .descriptor_index = 3 }, .{ .descriptor_index = 4 } }
+                else
+                    &.{.{ .descriptor_index = 1, .fault_record_word = 132 }},
+            });
+            defer module.deinit(allocator);
+            guest.word(0x12000, 0x1000);
+            guest.word(0x12004, 0x20);
+            guest.word(0x1200c, 512);
+            for ([_]u32{ 0x1080, 0x80020, 4, 0x16204 }, 0..) |word, index| guest.word(0x12010 + index * 4, word);
+            for (0..8) |index| guest.word(0x12090 + index * 4, @intCast(0xabc00000 + index));
+            for (0..2) |missing| {
+                guest.word(0x12004, if (missing == 0) 0x20 else 0x21);
+                guest.word(0x12008, 0);
+                _ = try renderer.stageGuestStorageBufferAt(0, 0x11000, 8 * 16);
+                _ = try renderer.stageGuestStorageBufferAt(1, 0x12000, 544);
+                if (compact_lookup) {
+                    @memset(guest.bytes[0x12300..0x12330], 0);
+                    for (0..2) |region| _ = try renderer.stageGuestStorageBufferAt(@intCast(2 + region), 0x12300 + region * 16, 16);
+                    // A later region overlaps the data only, leaving the descriptor
+                    // in the first region. This must win for both SMEM and MUBUF.
+                    guest.word(0x12400, 0x1080);
+                    guest.word(0x12404, if (missing == 0) 0x20 else 0x21);
+                    guest.word(0x1240c, 32);
+                    for (0..8) |index| guest.word(0x12410 + index * 4, @intCast(0xabc10000 + index));
+                    _ = try renderer.stageGuestStorageBufferAt(4, 0x12400, 48);
+                }
+                _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+                var output: [8 * 16]u8 = undefined;
+                try renderer.readbackGuestStorageBuffer(0x11000, &output);
+                for (0..8) |lane| for (0..4) |word| {
+                    const data_base: u32 = if (compact_lookup) 0xabc10000 else 0xabc00000;
+                    const expected: u32 = if (missing != 0 or (word < 2 and lane >= 4)) 0 else if (word < 2) data_base + @as(u32, @intCast(lane * 2 + word)) else data_base + @as(u32, @intCast(word - 1));
+                    const actual = std.mem.readInt(u32, output[lane * 16 + word * 4 ..][0..4], .little);
+                    if (actual != expected) std.debug.print("snapshot case={d} lane={d} word={d} expected={x} actual={x}\n", .{ missing, lane, word, expected, actual });
+                    try std.testing.expectEqual(expected, actual);
+                };
+                var header: [544]u8 = undefined;
+                try renderer.readbackGuestStorageBuffer(0x12000, &header);
+                try std.testing.expectEqual(@as(u32, if (missing == 0) 0 else if (repeat) 64 else 32), std.mem.readInt(u32, header[8..12], .little));
+            }
+        }
     }
     std.debug.print("Unbound snapshot reads passed: runtime SMEM descriptor, indexed MUBUF, scalar VCC offsets, bounds and missing-pointer faults\n", .{});
 }
@@ -9615,108 +9657,118 @@ fn runBvhIntersectionProbe(allocator: std.mem.Allocator) !void {
     for (code.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
     var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.items.len);
     defer analysis.deinit(allocator);
-    var module = try analysis.translateSpirv(allocator, .{
-        .stage = .compute,
-        .local_size = .{ 16, 1, 1 },
-        .wave32 = true,
-        .compute_inputs = .{ .local_invocation_id_components = 1 },
-        .bvh_intersection_mode1 = true,
-        .storage_buffers = &.{ .{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 44 }, .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 } },
-        .flat_memories = &.{.{ .descriptor_index = 2, .fault_record_word = 148 }},
-    });
-    defer module.deinit(allocator);
-    const snapshot = 0x12000;
-    guest.word(snapshot, 0x1000);
-    guest.word(snapshot + 4, 0x20);
-    guest.word(snapshot + 8, 0);
-    guest.word(snapshot + 12, 576);
-    const vertices = [5][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ 0, 1 }, .{ 2, 1 }, .{ -2, 2 } };
-    const triangles = [4][3]usize{ .{ 0, 1, 2 }, .{ 1, 3, 2 }, .{ 2, 3, 4 }, .{ 2, 4, 0 } };
-    for (0..4) |kind| {
-        const at = snapshot + 16 + (kind + 1) * 64;
-        for (vertices, 0..) |vertex, index| {
-            guest.word(at + index * 12, @bitCast(vertex[0]));
-            guest.word(at + index * 12 + 4, @bitCast(vertex[1]));
-            guest.word(at + index * 12 + 8, @bitCast(@as(f32, @floatFromInt(2 + kind * 2))));
+    for ([_]bool{ false, true }) |compact_lookup| {
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .local_size = .{ 16, 1, 1 },
+            .wave32 = true,
+            .compute_inputs = .{ .local_invocation_id_components = 1 },
+            .bvh_intersection_mode1 = true,
+            .storage_buffers = &.{ .{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 44 }, .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 } },
+            .snapshot_unbound_reads = compact_lookup,
+            .flat_memories = if (compact_lookup)
+                &.{ .{ .descriptor_index = 2, .fault_record_word = 148 }, .{ .descriptor_index = 3 }, .{ .descriptor_index = 4 }, .{ .descriptor_index = 5 } }
+            else
+                &.{.{ .descriptor_index = 2, .fault_record_word = 148 }},
+        });
+        defer module.deinit(allocator);
+        const snapshot = 0x12000;
+        guest.word(snapshot, 0x1000);
+        guest.word(snapshot + 4, 0x20);
+        guest.word(snapshot + 8, 0);
+        guest.word(snapshot + 12, 576);
+        const vertices = [5][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ 0, 1 }, .{ 2, 1 }, .{ -2, 2 } };
+        const triangles = [4][3]usize{ .{ 0, 1, 2 }, .{ 1, 3, 2 }, .{ 2, 3, 4 }, .{ 2, 4, 0 } };
+        for (0..4) |kind| {
+            const at = snapshot + 16 + (kind + 1) * 64;
+            for (vertices, 0..) |vertex, index| {
+                guest.word(at + index * 12, @bitCast(vertex[0]));
+                guest.word(at + index * 12 + 4, @bitCast(vertex[1]));
+                guest.word(at + index * 12 + 8, @bitCast(@as(f32, @floatFromInt(2 + kind * 2))));
+            }
+            // Identity barycentric swizzle (I=1, J=2) for each of four triangles.
+            guest.word(at + 60, 0x09090909);
         }
-        // Identity barycentric swizzle (I=1, J=2) for each of four triangles.
-        guest.word(at + 60, 0x09090909);
-    }
-    for ([_]bool{ false, true }) |half| {
-        const at = snapshot + 16 + @as(usize, if (half) 8 else 6) * 64;
-        for ([_]u32{ 3, 1, 0, 2 }, 0..) |kind, child| {
-            guest.word(at + child * 4, (kind + 1) * 8 + kind);
-            const z: f32 = @floatFromInt(2 + kind * 2);
-            const bounds = [_]f32{ -10, -10, z, 10, 10, z + 0.5 };
-            if (half) {
-                for (0..3) |pair| {
-                    const a: u16 = @bitCast(@as(f16, @floatCast(bounds[pair * 2])));
-                    const b: u16 = @bitCast(@as(f16, @floatCast(bounds[pair * 2 + 1])));
-                    guest.word(at + 16 + child * 12 + pair * 4, @as(u32, a) | (@as(u32, b) << 16));
-                }
-            } else for (bounds, 0..) |value, component| guest.word(at + 16 + child * 24 + component * 4, @bitCast(value));
+        for ([_]bool{ false, true }) |half| {
+            const at = snapshot + 16 + @as(usize, if (half) 8 else 6) * 64;
+            for ([_]u32{ 3, 1, 0, 2 }, 0..) |kind, child| {
+                guest.word(at + child * 4, (kind + 1) * 8 + kind);
+                const z: f32 = @floatFromInt(2 + kind * 2);
+                const bounds = [_]f32{ -10, -10, z, 10, 10, z + 0.5 };
+                if (half) {
+                    for (0..3) |pair| {
+                        const a: u16 = @bitCast(@as(f16, @floatCast(bounds[pair * 2])));
+                        const b: u16 = @bitCast(@as(f16, @floatCast(bounds[pair * 2 + 1])));
+                        guest.word(at + 16 + child * 12 + pair * 4, @as(u32, a) | (@as(u32, b) << 16));
+                    }
+                } else for (bounds, 0..) |value, component| guest.word(at + 16 + child * 24 + component * 4, @bitCast(value));
+            }
         }
-    }
-    for (0..16) |lane| {
-        const kind = lane % 4;
-        const tri = triangles[kind];
-        const x = (vertices[tri[0]][0] + vertices[tri[1]][0] + vertices[tri[2]][0]) / 3;
-        const y = (vertices[tri[0]][1] + vertices[tri[1]][1] + vertices[tri[2]][1]) / 3;
-        const ray = [_]u32{
-            if (lane == 12) 6 * 8 + 5 else if (lane == 13) 8 * 8 + 4 else if (lane == 14) 9 * 8 else if (lane == 15) 0x1e else @intCast((kind + 1) * 8 + kind),
-            @bitCast(@as(f32, 20)),
-            @bitCast(@as(f32, if (lane >= 12) 0 else if (lane >= 4 and lane < 8) 100 else x)),
-            @bitCast(@as(f32, if (lane >= 12) 0 else y)),
-            @bitCast(@as(f32, if (lane >= 8 and lane < 12) 10 else 0)),
-            0,
-            0,
-            if (lane >= 8 and lane < 12) 0xbf800000 else 0x3f800000,
-            0x7f800000,
-            0x7f800000,
-            if (lane >= 8 and lane < 12) 0xbf800000 else 0x3f800000,
-        };
-        for (ray, 0..) |word, component| guest.word(0x10000 + lane * 44 + component * 4, word);
-    }
-    _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 16 * 44);
-    _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, 16 * 16);
-    _ = try renderer.stageGuestStorageBufferAt(2, snapshot, 608);
-    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
-    var output: [16 * 16]u8 = undefined;
-    try renderer.readbackGuestStorageBuffer(0x11000, &output);
-    for (0..16) |lane| {
-        var words: [4]u32 = undefined;
-        for (&words, 0..) |*word, component| word.* = std.mem.readInt(u32, output[lane * 16 + component * 4 ..][0..4], .little);
-        std.debug.print("BVH lane={d} result={x}/{x}/{x}/{x}\n", .{ lane, words[0], words[1], words[2], words[3] });
-        if (lane >= 14) {
-            try std.testing.expectEqualSlices(u32, &.{ 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff }, &words);
-        } else if (lane >= 12) {
-            try std.testing.expectEqualSlices(u32, &.{ 8, 17, 26, 35 }, &words);
-        } else if (lane >= 4 and lane < 8) {
-            try std.testing.expectEqual(@as(u32, 0x7f800000), words[0]);
-        } else {
-            const denom: f32 = @bitCast(words[1]);
-            const distance: f32 = @as(f32, @bitCast(words[0])) / denom;
-            const z: f32 = @floatFromInt(2 + (lane % 4) * 2);
-            try std.testing.expectApproxEqAbs(if (lane >= 8) 10 - z else z, distance, 0.0001);
-            for (words[2..]) |word| try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), @as(f32, @bitCast(word)) / denom, 0.0001);
+        for (0..16) |lane| {
+            const kind = lane % 4;
+            const tri = triangles[kind];
+            const x = (vertices[tri[0]][0] + vertices[tri[1]][0] + vertices[tri[2]][0]) / 3;
+            const y = (vertices[tri[0]][1] + vertices[tri[1]][1] + vertices[tri[2]][1]) / 3;
+            const ray = [_]u32{
+                if (lane == 12) 6 * 8 + 5 else if (lane == 13) 8 * 8 + 4 else if (lane == 14) 9 * 8 else if (lane == 15) 0x1e else @intCast((kind + 1) * 8 + kind),
+                @bitCast(@as(f32, 20)),
+                @bitCast(@as(f32, if (lane >= 12) 0 else if (lane >= 4 and lane < 8) 100 else x)),
+                @bitCast(@as(f32, if (lane >= 12) 0 else y)),
+                @bitCast(@as(f32, if (lane >= 8 and lane < 12) 10 else 0)),
+                0,
+                0,
+                if (lane >= 8 and lane < 12) 0xbf800000 else 0x3f800000,
+                0x7f800000,
+                0x7f800000,
+                if (lane >= 8 and lane < 12) 0xbf800000 else 0x3f800000,
+            };
+            for (ray, 0..) |word, component| guest.word(0x10000 + lane * 44 + component * 4, word);
         }
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 16 * 44);
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, 16 * 16);
+        _ = try renderer.stageGuestStorageBufferAt(2, snapshot, 608);
+        if (compact_lookup) {
+            @memset(guest.bytes[0x12400..0x12430], 0);
+            for (0..3) |i| _ = try renderer.stageGuestStorageBufferAt(@intCast(3 + i), 0x12400 + i * 16, 16);
+        }
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        var output: [16 * 16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x11000, &output);
+        for (0..16) |lane| {
+            var words: [4]u32 = undefined;
+            for (&words, 0..) |*word, component| word.* = std.mem.readInt(u32, output[lane * 16 + component * 4 ..][0..4], .little);
+            std.debug.print("BVH lane={d} result={x}/{x}/{x}/{x}\n", .{ lane, words[0], words[1], words[2], words[3] });
+            if (lane >= 14) {
+                try std.testing.expectEqualSlices(u32, &.{ 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff }, &words);
+            } else if (lane >= 12) {
+                try std.testing.expectEqualSlices(u32, &.{ 8, 17, 26, 35 }, &words);
+            } else if (lane >= 4 and lane < 8) {
+                try std.testing.expectEqual(@as(u32, 0x7f800000), words[0]);
+            } else {
+                const denom: f32 = @bitCast(words[1]);
+                const distance: f32 = @as(f32, @bitCast(words[0])) / denom;
+                const z: f32 = @floatFromInt(2 + (lane % 4) * 2);
+                try std.testing.expectApproxEqAbs(if (lane >= 8) 10 - z else z, distance, 0.0001);
+                for (words[2..]) |word| try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), @as(f32, @bitCast(word)) / denom, 0.0001);
+            }
+        }
+        var header: [608]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(snapshot, &header);
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, header[8..12], .little));
+        // A missing snapshot is a recorded failure, whereas hardware node bounds
+        // and reserved node types above were ordinary misses without faults.
+        guest.word(snapshot + 4, 0x21);
+        _ = try renderer.stageGuestStorageBufferAt(2, snapshot, 608);
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        try renderer.readbackGuestStorageBuffer(snapshot, &header);
+        try std.testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, header[8..12], .little));
+        try std.testing.expectEqual(@as(u32, 0x20), std.mem.readInt(u32, header[600..604], .little));
     }
-    var header: [608]u8 = undefined;
-    try renderer.readbackGuestStorageBuffer(snapshot, &header);
-    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, header[8..12], .little));
-    // A missing snapshot is a recorded failure, whereas hardware node bounds
-    // and reserved node types above were ordinary misses without faults.
-    guest.word(snapshot + 4, 0x21);
-    _ = try renderer.stageGuestStorageBufferAt(2, snapshot, 608);
-    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
-    try renderer.readbackGuestStorageBuffer(snapshot, &header);
-    try std.testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, header[8..12], .little));
-    try std.testing.expectEqual(@as(u32, 0x20), std.mem.readInt(u32, header[600..604], .little));
     std.debug.print("BVH intersections passed: four triangle types, two sides, misses, FP32/FP16 sorted boxes, node bounds, reserved nodes and missing-memory faults\n", .{});
 }
 
 fn runFlatApertureProbe(allocator: std.mem.Allocator) !void {
-    for (0..4) |failure| {
+    for ([_]bool{ false, true }) |compact_lookup| for (0..4) |failure| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();
         var guest = GuestMemory{};
@@ -9756,7 +9808,11 @@ fn runFlatApertureProbe(allocator: std.mem.Allocator) !void {
             .private_memory_size_bytes = 16,
             .flat_apertures = .{ .shared = 0x8000_0000, .private = 0x7000_0000 },
             .storage_buffers = &.{.{ .resource_sgpr = 12, .descriptor_index = 0, .stride = 16 }},
-            .flat_memories = &.{.{ .descriptor_index = 1, .fault_record_word = 8 }},
+            .snapshot_unbound_reads = compact_lookup,
+            .flat_memories = if (compact_lookup)
+                &.{ .{ .descriptor_index = 1, .fault_record_word = 8 }, .{ .descriptor_index = 2 }, .{ .descriptor_index = 3 }, .{ .descriptor_index = 4 } }
+            else
+                &.{.{ .descriptor_index = 1, .fault_record_word = 8 }},
         });
         defer module.deinit(allocator);
         guest.word(0x12000, 0x1230);
@@ -9766,6 +9822,10 @@ fn runFlatApertureProbe(allocator: std.mem.Allocator) !void {
         guest.word(0x12010, 0xaabb_ccdd);
         _ = try renderer.stageGuestStorageBufferAt(0, 0x11000, 64 * 16);
         _ = try renderer.stageGuestStorageBufferAt(1, 0x12000, 48);
+        if (compact_lookup) {
+            @memset(guest.bytes[0x12400..0x12430], 0);
+            for (0..3) |i| _ = try renderer.stageGuestStorageBufferAt(@intCast(2 + i), 0x12400 + i * 16, 16);
+        }
         _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
         var output: [64 * 16]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(0x11000, &output);
@@ -9783,7 +9843,7 @@ fn runFlatApertureProbe(allocator: std.mem.Allocator) !void {
         if (failure == 3) {
             try std.testing.expectEqual(@as(u32, if (failure == 1) 0x8000_0000 else if (failure == 2) 0x7000_0000 else 0x9000_0000), std.mem.readInt(u32, header[40..44], .little));
         }
-    }
+    };
     std.debug.print("FLAT apertures passed: DS/FLAT aliasing across lanes, private isolation, global snapshots and precise unmapped aperture faults\n", .{});
 }
 
@@ -13207,7 +13267,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });
     defer renderer.deinit();
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--probe-spv")) {
+    if (args.len == 3 and (std.mem.eql(u8, args[1], "--probe-spv") or std.mem.eql(u8, args[1], "--probe-spv-cached"))) {
         const bytes = try std.Io.Dir.cwd().readFileAllocOptions(
             init.io,
             args[2],
@@ -13216,11 +13276,21 @@ pub fn main(init: std.process.Init) !void {
             .of(u32),
             null,
         );
+        defer allocator.free(bytes);
         if (bytes.len % @sizeOf(u32) != 0) return error.MisalignedSpirv;
-        try renderer.probeComputeSpirv(std.mem.bytesAsSlice(u32, bytes));
-        std.debug.print("compute SPIR-V pipeline compiled: {s} ({d} words)\n", .{
+        const cached = std.mem.eql(u8, args[1], "--probe-spv-cached");
+        const started = std.Io.Clock.awake.now(init.io);
+        if (cached) {
+            try renderer.probeCachedComputeSpirv(std.mem.bytesAsSlice(u32, bytes));
+        } else {
+            try renderer.probeComputeSpirv(std.mem.bytesAsSlice(u32, bytes));
+        }
+        const elapsed_ns = std.Io.Clock.awake.now(init.io).nanoseconds - started.nanoseconds;
+        std.debug.print("compute SPIR-V pipeline compiled: {s} ({d} words, cache={s}, compile_ms={d})\n", .{
             args[2],
             bytes.len / @sizeOf(u32),
+            if (cached) "loaded" else "none",
+            @divTrunc(elapsed_ns, std.time.ns_per_ms),
         });
         return;
     }

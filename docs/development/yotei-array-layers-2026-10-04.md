@@ -715,10 +715,158 @@ of a repeatable speedup. A read-only census at the tree finds 648 analyses with
 **zero bytes retained in every diagnostic IR array**; decoded code and
 instructions own 227,818,028 bytes. The different number of cached programs
 prevents treating the total difference as an exact whole-process memory saving.
-Tree streaks remain, and the post-tree transition is still under test.
+Tree streaks remain. After selecting Standard, the diagnostic guard stops this
+repeat after 2,344 seconds, with 58,636,980,224 committed bytes against the same
+59,294,818,304-byte limit. Character control is not reached. This is a deliberate
+memory-pressure stop, not a spontaneous game crash.
 
 The installed `zig-out/bin/game-run.exe` and matching PDB now use
 `8c449212c59d33fe644ab36ed80057ff10c7eec166e6b23b2f008e458e95e517`.
 The preceding `16761f86ba35` executable and PDB are backed up under
 `out/yotei-gameplay-20261004/installed-backup-16761f86ba35/`.
 Public release archives are unchanged.
+
+## Isolating a captured compute pipeline
+
+The 2,175,536-byte module captured while the repeat reported compute program
+`0x8000196500` passes SPIR-V validation. In a separate process with no pipeline
+cache, the original module completes in 21.021 seconds with 1,802,534,912 peak
+private bytes. Applying the SDK's offline `spirv-opt -O` produces 1,860,676 bytes
+and completes in 17.020 seconds with 1,733,201,920 peak private bytes. These are
+single-process compiler probes, not GPU execution or game FPS measurements;
+no external optimizer has been added to the renderer.
+
+The original `--probe-spv` bypasses the Vulkan driver cache. A new
+`vulkan-smoke --probe-spv-cached <module.spv>` diagnostic instead calls the same
+cached compiler job as the renderer, without dispatching the shader. With a
+separate copy of the game's 1,078,173,993-byte cache, pipeline creation takes
+47 ms; the whole probe, including startup and persistence, takes 5.126 seconds
+and peaks at 4,132,552,704 private bytes. The original game cache is untouched
+by this probe. This confirms a cache hit and does not support blaming this
+cached module for the full transition stall. Raw stack scans can retain older
+work records, so the next live audit also checks active thread work and memory.
+
+The next audit does establish active driver compilation: the compute job for
+`0x8000173b00` names worker 5696, its completion event is unset, the compiler
+queue reports one active job, and that worker consumes one CPU core inside the
+driver. A guest thread also spins while waiting. Two successive modules contain
+3,712,724 and 4,245,548 bytes. The memory guard stops this repeat after 1,160
+seconds at 58,655,993,856 committed bytes. A census before the transition finds
+659 parent analyses owning 244,602,680 decoded-array bytes and 86 cached uniform
+specializations owning another 98,099,132 bytes. Diagnostic IR arrays remain
+empty in both groups.
+
+An isolated cached probe of the original 4,245,548-byte module spends **59.473
+seconds** creating the pipeline and peaks at **7,397,425,152 private bytes**.
+Offline `spirv-opt -O` reduces it to 3,841,764 bytes, but creation still takes
+59.023 seconds and peaks at 7,289,778,176 bytes. No meaningful compiler speedup
+is demonstrated by this optimization. Reusing the original module's completed
+cache entry takes **14 ms** in a fresh probe process. The original compiled
+cache is copied back for a live repeat, with the preceding cache retained as
+`out/yotei-gameplay-20261004/cache-before-offline-173b00.bin`. The optimized
+module is never substituted into the game. This experiment concerns loading
+stalls and does not establish a higher steady frame rate.
+
+
+The live repeat with that prewarmed cache continues through setup and the tree,
+but encounters further compute variants for `0x800014e300`: captured modules
+contain 3,947,008, 4,583,200 and 3,944,748 bytes. The pending worker and compiler
+queue confirm that compilation is active. At the last progress sample, the
+renderer has presented 1,274 frames and completed 255,494 submission ticks;
+these cumulative counters are not a gameplay FPS measurement. The owned test
+is deliberately closed after 2,245 seconds for isolated translator regression
+checks. There is still no confirmed character control.
+
+
+## Compact snapshot lookup candidate
+
+The translator candidate preserves pre-existing register, EXEC and buffer-range
+SSA values across diagnostic-only fault branches. Those branches cannot change
+the guest values; values created inside the branches are still discarded at
+the merge. For compute snapshot fallback with at least four regions, it also
+hoists an immutable per-invocation region table and searches it with a bounded
+reverse loop. The first hit in reverse order preserves the existing last-region
+precedence for overlaps. Bounds checks and fault reporting remain enabled.
+
+ReleaseSafe native probes pass with Khronos synchronization validation:
+`--unbound-snapshots` now checks direct and repeated guest-loop reads, runtime
+SMEM descriptors, indexed MUBUF access, overlapping regions and missing-pointer
+fault counts. `--flat-pointers`, `--flat-material-fragment`,
+`--workgroup-image-table`, `--deferred-flat-faults` and `--bvh-intersections`
+also pass. The ReleaseFast candidate is `2bd408156d64`; the installed runner is
+still `8c449212c59d` while the separate live comparison runs. These probe results
+establish tested semantics, not a gameplay performance improvement.
+
+
+The `2bd408156d64` live repeat renders the bonus notices, wolf brightness screen
+and Medium difficulty menu. With read-only watchers stopped and no input,
+capture, build or other GPU probe during the interval, it presents **39 frames
+in 30.047 seconds (1.298 FPS)**. One frame more than the preceding 30-second
+sample is not evidence of a repeatable improvement. Bright tree streaks remain.
+After selecting Standard, the captured `0x8000173b00` module is 3,640,024 bytes
+and `0x800014e300` is 3,793,352 bytes; compilation still stalls progression.
+The first passes standalone SPIR-V validation, as do two captured startup
+modules. Its 356 buffer mappings and six snapshot regions are retained locally
+for further comparison; varying resource layouts prevent interpreting module
+size alone as an exact compiler speedup. The owned run is deliberately stopped
+after 1,565 seconds to test selected-buffer FLAT loads. Character control
+remains unconfirmed and the installed runner is unchanged.
+
+
+## Select the FLAT snapshot before reading its payload
+
+The final candidate keeps the existing unrolled range selection and reads only
+the selected buffer. Previously each FLAT dword loaded two host words from
+every captured region, then selected the matching value. With at least four
+compute snapshot regions, selection now precedes the two-word load. Later
+regions still win overlaps; the match predicate masks missing addresses, and
+byte shifts preserve unaligned words. LDS/private aperture handling and fault
+records are unchanged. No shader dispatch is skipped.
+
+A compiler stress replay uses the locally captured `0x8000173b00` code and its
+356 buffer mappings, 935 scalar values, 28 scalar-memory mappings and six FLAT
+regions. Both translators use the same explicit 512-invocation/spilled-LDS
+configuration. This controlled fixture is not byte-identical to the live job
+and is never dispatched. Each module passes SPIR-V validation, then compiles
+in a fresh process without an application pipeline-cache entry:
+
+| Translator | SPIR-V bytes | Pipeline creation | Peak private bytes |
+|---|---:|---:|---:|
+| Installed `8c449212c59d` source | 3,710,284 | 46.549 s | 3,960,901,632 |
+| First compact-lookup candidate | 3,639,148 | 54.509 s | 4,020,154,368 |
+| Selected FLAT reads with lookup loops, rejected | 3,293,296 | 99.315 s | 3,843,182,592 |
+| Selected FLAT reads with unrolled lookup | 3,414,952 | 39.364 s | 3,367,387,136 |
+
+The loop variant reduces file size but substantially slows this driver compile,
+so it is removed. The final variant reduces compiler time by about 15% and peak
+private memory by about 15% against the installed source in this single fixture.
+These are compiler results, not a demonstrated gameplay FPS increase.
+
+
+The final unrolled variant passes all seven ReleaseSafe native probe commands
+under Khronos synchronization validation: `--flat-pointers`,
+`--unbound-snapshots`, `--flat-apertures`, `--bvh-intersections`,
+`--flat-material-fragment`, `--deferred-flat-faults`, and
+`--workgroup-image-table`. These include overlapping and relocated snapshots,
+divergent lanes, unaligned/bounded reads, repeated guest loops, private/LDS
+apertures, ray intersections and precise missing-memory fault counts.
+
+The ReleaseFast runner and matching PDB are installed in `zig-out/bin` with
+SHA-256 `8cc8cf3c3c7a1082c6d1af542a7c32f2c708d2e2ed7a3a15f62269344e89d11a`.
+The preceding `8c449212c59d` pair is retained locally for rollback. Public release
+archives are unchanged. The subsequent game repeat uses the same 1080p output,
+Speed, Performance game preference, two compiler workers, disabled compute
+warmup and default resource-cache budgets as the preceding comparison.
+
+
+The installed final variant presents **37 frames in 30.046 seconds (1.231 FPS)**
+at the visible Medium difficulty menu. Read-only watchers were stopped, with no
+input, capture, build or separate GPU probe during the interval. This does not
+establish a speedup over the previous 1.265/1.298 FPS samples. Bright vertical
+tree streaks remain. A warmed sample at flip 1380 takes 783 ms, uploads
+316,467 KiB and reads back 382,058 KiB; graphics resource preparation is 156 ms
+and fence waits total 168,130 microseconds, overlapping the higher-level costs.
+The repeated frame cost is still dominated by rendering/resource work rather
+than first-use pipeline creation.
+
+![Installed selected-FLAT runner at Medium difficulty; tree streaks remain](../images/yotei-selected-flat-tree-2026-10-04.png)

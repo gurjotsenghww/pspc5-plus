@@ -50,6 +50,7 @@ zig build build-launcher               # install only the native Windows launche
 zig build launcher                      # open the native Windows launcher
 zig build vulkan-smoke                 # run the headless compute/graphics probe
 zig build vulkan-smoke -- --probe-spv out/compute-0xADDRESS.spv # compile a saved compute module
+zig build vulkan-smoke -- --probe-spv-cached out/compute-0xADDRESS.spv # use the loaded driver cache
 zig build vulkan-window-smoke          # present a diagnostic frame through a Win32 swapchain
 ```
 

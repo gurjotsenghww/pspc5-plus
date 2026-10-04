@@ -9005,6 +9005,19 @@ const Builder = struct {
 
     fn recordFlatFaultPredicate(self: *Builder, inst: instruction.Instruction, address: [2]u32, word: u32, predicate: u32) Error!void {
         if (self.flat_memory_bindings.len == 0) return Error.UnsupportedBufferAddressing;
+        // This selection only writes the external diagnostic buffer. It cannot
+        // change a guest register, EXEC, or any descriptor's bound range. Values
+        // already available before the branch dominate its merge, including
+        // when the fault path is taken. Keep those values, while discarding any
+        // cache entries first created inside either diagnostic-only block.
+        const register_values = self.mutable_register_values;
+        const lane_predicate_mask = self.lane_predicate_mask;
+        const buffer_extents = self.buffer_extents;
+        defer {
+            self.mutable_register_values = register_values;
+            self.lane_predicate_mask = lane_predicate_mask;
+            self.buffer_extents = buffer_extents;
+        }
         const zero = try self.constant(.bits32, 0);
         const taken = self.id();
         const merge = self.id();
@@ -9097,6 +9110,21 @@ const Builder = struct {
         }
     }
 
+    /// Assemble a dword without changing the byte alignment of a FLAT read.
+    /// The snapshot match predicate also masks both halves of an unmapped read.
+    fn loadFlatSnapshotWord(self: *Builder, address: BufferAddress) Error!u32 {
+        var aligned = address;
+        aligned.byte_offset = try self.andBits(address.byte_offset, 0xffff_fffc);
+        const low = try self.loadBufferWord(aligned, 0);
+        const high = try self.loadBufferWord(aligned, 1);
+        const shift = try self.subwordShift(address.byte_offset);
+        const low_part = try self.shiftRightVariable(low, shift);
+        const inverse = try self.bvhBinary(130, self.bits_type, try self.constant(.bits32, 32), shift);
+        const high_part = try self.bvhBinary(196, self.bits_type, high, try self.andBits(inverse, 31));
+        const high_selected = try self.bvhSelect(self.bits_type, try self.isNonZero(shift), high_part, try self.constant(.bits32, 0));
+        return self.bvhBinary(197, self.bits_type, low_part, high_selected);
+    }
+
     fn absoluteFlatLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         if (inst.memory_segment != 0 and inst.memory_segment != 2) return Error.UnsupportedBufferAddressing;
         if (inst.raw[0] & (1 << 13) != 0 or count > 4) return Error.UnsupportedBufferAddressing; // LDS destination
@@ -9119,7 +9147,11 @@ const Builder = struct {
             const address = try self.addFlatPointerOffset(pointer, try self.constant(.bits32, @intCast(word * 4)));
             var found = self.id();
             try self.emit(&self.body, 171, &.{ self.bool_type, found, zero, zero });
-            for (self.flat_memory_bindings, self.flat_memory_headers.items) |region, header| {
+            if (self.stage == .compute and self.snapshot_unbound_reads and self.flat_memory_bindings.len >= 4) {
+                const access = try self.bvhSnapshot(address, try self.constant(.bits32, 4));
+                values[word] = try self.loadFlatSnapshotWord(access);
+                found = access.descriptor_matches.?;
+            } else for (self.flat_memory_bindings, self.flat_memory_headers.items) |region, header| {
                 const binding = StorageBufferBinding{ .resource_sgpr = 0, .descriptor_index = region.descriptor_index };
                 const base_low = header[0];
                 const base_high = header[1];

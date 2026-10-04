@@ -12744,6 +12744,17 @@ pub const Renderer = struct {
         self.destroyPipeline(pipeline);
     }
 
+    /// Exercises the runtime compiler job with the loaded driver cache, without
+    /// allocating descriptors or dispatching the module. Use a separate working
+    /// directory when comparing cache snapshots so a probe cannot replace the
+    /// application's persisted cache.
+    pub fn probeCachedComputeSpirv(self: *Renderer, words: []const u32) Error!void {
+        var work = ComputePipelineCompileJob{ .renderer = self, .words = words };
+        ComputePipelineCompileJob.run(&work.job);
+        if (work.failure) |failure| return failure;
+        self.destroyPipeline(work.pipeline);
+    }
+
     pub fn smokeTest(self: *Renderer) Error!SmokeReport {
         const word_count = 16;
         const byte_count = word_count * @sizeOf(u32);
