@@ -38814,11 +38814,11 @@ test "R11G11B10 float color targets use the matching packed Vulkan format" {
     try std.testing.expectEqual(vk.format_b10g11r11_ufloat_pack32, format.vulkan);
     try std.testing.expectEqual(@as(u8, 4), format.bytes_per_texel);
 
-    // The same 32-bit packing is also bound as UNORM, and Vulkan has no
-    // 11-11-10 UNORM format, so the packed attachment serves both.
+    // Vulkan has no 11-11-10 UNORM attachment format. Preserve its bits in
+    // R32_UINT; shader export packing supplies the normalized encoding.
     descriptor.number_type = 0;
     try std.testing.expectEqual(
-        vk.format_b10g11r11_ufloat_pack32,
+        vk.format_r32_uint,
         colorTargetFormat(descriptor).?.vulkan,
     );
 
