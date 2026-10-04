@@ -259,3 +259,39 @@ comes through a vector-loaded pointer and nested material table; a correct
 fix must resolve and stage that table, not substitute a dummy texture.
 Post-movie control, steady gameplay FPS, dark lighting and remaining tree
 streaks are still open at this checkpoint.
+
+The repeat later presents black frames while compiling the next 3D scene.
+Flips 1607, 1608 and 1609 take 396.2, 224.8 and 123.9 seconds. These remain
+cold transitions: flip 1607 alone spends 222.1 seconds on graphics pipeline
+creation and 146.6 seconds on compute pipelines. Later logs explicitly skip
+compute dispatches with unsupported sampled resources (`0x80003aa700`,
+`0x8000364b00`) and storage images (`0x8000265d00`, `0x80003cfa00`). Shader
+translation without an unsupported-opcode report does not imply those
+dispatches execute. The owned run is manually stopped after 2,370 seconds
+for an isolated rebuild; it is not recorded as a spontaneous crash.
+
+## Color attachment transfer memory
+
+The last inventory of that run contains **1,054,163,296 bytes** of permanently
+allocated host readback buffers for 128 color targets, in addition to their
+GPU images and the 72 MiB shared storage transfer buffer. Remove those
+per-attachment buffers as well. Initial color uploads use fresh draw-ring
+slices, retaining their offsets through command recording, including MRT
+attachments and ring spills. Outside a batch, or for oversized uploads, an
+independently owned temporary buffer is retired after its queued users.
+
+Color readbacks now use the existing shared image transfer buffer. Transfer
+barriers order its reuse with storage-image readbacks and depth bridges;
+host reads still wait for completion. The `gpu targets` diagnostic reports
+`shared_image_transfer_mib` rather than the removed per-target allocation sum.
+
+Six ReleaseSafe native probe groups pass with Khronos synchronization
+validation and no validation errors: `--target-reuse`, `--integer-colors`,
+`--sampled-array-refresh`, `--color-cube-publication`, `--storage-reuse`, and
+`--depth-storage`. Target reuse checks both 64/128 entries and timeline
+scheduling disabled/enabled, preserving the complete pixel result when
+repeated CPU reseeds are queued. It retains one 256-byte shared readback
+buffer. The MRT probe seeds four attachments with distinct untouched pixels,
+forces ring overflow, and checks those pixels and rendered exports, including
+the source offsets and spill lifetime. This is allocation and correctness
+evidence; the new game run is still pending.

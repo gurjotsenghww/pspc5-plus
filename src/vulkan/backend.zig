@@ -861,11 +861,12 @@ const BufferMapping = struct {
 };
 
 const ColorTargetUpload = struct {
-    buffer: OwnedBuffer,
-    owns_buffer: bool,
+    buffer: vk.Buffer,
+    offset: vk.DeviceSize = 0,
+    owned_buffer: ?OwnedBuffer = null,
 
     fn deinit(self: ColorTargetUpload, renderer: *Renderer) void {
-        if (self.owns_buffer) renderer.destroyBuffer(self.buffer);
+        if (self.owned_buffer) |buffer| renderer.destroyBuffer(buffer);
     }
 };
 
@@ -2537,7 +2538,6 @@ const CachedRenderTarget = struct {
     render_pass: vk.RenderPass,
     framebuffer: vk.Framebuffer,
     depth_pass: ?DepthPass = null,
-    readback: OwnedBuffer,
     initialized: bool = false,
     /// Capture residency when the attachment is created, before a later
     /// eviction/readback can outlive the title's allocation.
@@ -5252,8 +5252,8 @@ pub const Renderer = struct {
     resident_image_views: std.ArrayList(CachedResidentImageView) = .empty,
     resident_samplers: std.ArrayList(CachedResidentSampler) = .empty,
     storage_image_cache: std.ArrayList(CachedStorageImage) = .empty,
-    // Storage uploads normally use the draw ring. Readback and depth bridges
-    // are ordered transfer operations, so they share one high-water buffer
+    // Image uploads normally use the draw ring. Storage/color readbacks and
+    // depth bridges are ordered transfers, so they share one high-water buffer
     // instead of retaining a host mirror for every cached image.
     storage_image_transfer: ?OwnedBuffer = null,
     storage_image_address_index: @import("sampled_image_index.zig").Index(maximum_cached_storage_images) = .{},
@@ -14082,10 +14082,10 @@ pub const Renderer = struct {
         try self.stageColorTarget(target, reader, frame);
     }
 
-    /// A target's coherent transfer buffer already has enough space for its
-    /// linear pixels. Seed it directly, then use it as the upload source until
-    /// a later image readback needs it again. The target stays pinned by the
-    /// caller through command recording, including all MRT attachments.
+    /// Initial attachment pixels live in a fresh upload-ring slice, including
+    /// all MRT seeds prepared before recording the draw. Ring spill handling
+    /// preserves these slices across wraps. Outside a batch use an independently
+    /// owned transfer buffer; no attachment needs a permanent host mirror.
     fn stageInitialColorUpload(self: *Renderer, index: usize) anyerror!ColorTargetUpload {
         const snapshot = self.render_targets.items[index];
         const target = snapshot.target;
@@ -14093,31 +14093,26 @@ pub const Renderer = struct {
         try self.flushPendingGuestWrite(target.descriptor.address, bytes);
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
-        const upload: ColorTargetUpload = if (self.reuse_color_target_transfer) blk: {
-            // An invalidated, previously drawn target can still have an upload
-            // in flight. Fresh allocations have no users to wait for. Image
-            // readbacks themselves finish before returning to their caller.
-            if (snapshot.gpu_generation != 0) try self.waitForSubmittedWork();
-            break :blk .{ .buffer = snapshot.readback, .owns_buffer = false };
-        } else .{
-            .buffer = try self.createBuffer(
+        const upload: ColorTargetUpload = if (self.reuse_color_target_transfer and
+            self.current_descriptor_slot != null and self.draw_batch_active and bytes <= draw_upload_ring_bytes)
+        blk: {
+            const slice = try self.allocateDrawUpload(bytes);
+            const mapping = try self.mapDrawUpload(slice);
+            defer mapping.release(self);
+            try self.stageInitialColorTarget(target, reader, mapping.bytes);
+            break :blk .{ .buffer = slice.buffer, .offset = slice.offset };
+        } else blk_owned: {
+            const buffer = try self.createBuffer(
                 bytes,
                 vk.buffer_usage_transfer_src_bit,
                 vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-            ),
-            .owns_buffer = true,
-        };
-        errdefer upload.deinit(self);
-        if (upload.owns_buffer) {
-            const frame = try self.allocator.alloc(u8, bytes);
-            defer self.allocator.free(frame);
-            try self.stageInitialColorTarget(target, reader, frame);
-            try self.writeMapped(upload.buffer, frame);
-        } else {
-            const mapping = try self.mapBufferRange(upload.buffer, 0, bytes);
+            );
+            errdefer self.destroyBuffer(buffer);
+            const mapping = try self.mapBufferRange(buffer, 0, bytes);
             defer mapping.release(self);
             try self.stageInitialColorTarget(target, reader, mapping.bytes);
-        }
+            break :blk_owned .{ .buffer = buffer.handle, .owned_buffer = buffer };
+        };
         self.frame_profile.upload_bytes +%= bytes;
         self.frame_profile.target_upload_bytes +%= bytes;
         return upload;
@@ -14432,7 +14427,7 @@ pub const Renderer = struct {
 
     fn createCachedRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!CachedRenderTarget {
         if (target.layout.layers > 1 and !self.shader_layer_available) return Error.UnsupportedColorTarget;
-        const frame_bytes = try colorTargetFrameBytes(target);
+        _ = try colorTargetFrameBytes(target);
         const samples = rasterSampleCount(target.descriptor.fragments_log2) orelse
             return Error.UnsupportedColorTarget;
         // Keep encoded bytes in a mutable UNORM allocation. The sRGB view
@@ -14490,12 +14485,6 @@ pub const Renderer = struct {
         }
         errdefer self.destroyFramebuffer(framebuffer);
 
-        const readback = try self.createBuffer(
-            frame_bytes,
-            vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
-            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-        );
-        errdefer self.destroyBuffer(readback);
         const alias_token = try self.image_aliases.register(
             self.allocator,
             .color_target,
@@ -14509,7 +14498,6 @@ pub const Renderer = struct {
             .view = view,
             .render_pass = render_pass,
             .framebuffer = framebuffer,
-            .readback = readback,
             .backing_was_accessible = self.colorTargetBackingAccessible(target),
             .backing_snapshot = if (self.guest_memory) |memory| ColorBackingSnapshot.capture(memory, target) else .{},
         };
@@ -14524,7 +14512,6 @@ pub const Renderer = struct {
         self.destroyFramebuffer(target.framebuffer);
         self.destroyRenderPass(target.render_pass);
         self.destroyImageView(target.view);
-        self.destroyBuffer(target.readback);
         self.destroyImage(target.image);
     }
 
@@ -15957,6 +15944,7 @@ pub const Renderer = struct {
         // difference is the whole question.
         self.frame_profile.target_readbacks +|= 1;
         const frame_bytes = try colorTargetFrameBytes(snapshot.target);
+        const transfer = try self.storageImageTransfer(frame_bytes);
         // Trace actual transfers, not thousands of already-current lookups.
         if (@atomicLoad(bool, &trace_materialized_targets, .monotonic) and
             (self.reported_materializations < 24 or self.flip_callbacks % 120 == 0))
@@ -15971,6 +15959,7 @@ pub const Renderer = struct {
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
+        self.orderStorageTransferWrite(command_buffer, transfer);
         try self.transitionTrackedImage(
             command_buffer,
             snapshot.image.handle,
@@ -15989,16 +15978,16 @@ pub const Renderer = struct {
             command_buffer,
             snapshot.image.handle,
             vk.image_layout_transfer_src_optimal,
-            snapshot.readback.handle,
+            transfer.handle,
             1,
             @ptrCast(&copy),
         );
         const host_barrier = vk.BufferMemoryBarrier{
             .source_access_mask = vk.access_transfer_write_bit,
             .destination_access_mask = vk.access_host_read_bit,
-            .buffer = snapshot.readback.handle,
+            .buffer = transfer.handle,
             .offset = 0,
-            .size = snapshot.readback.size,
+            .size = transfer.size,
         };
         self.device_functions.cmd_pipeline_barrier(
             command_buffer,
@@ -16023,7 +16012,7 @@ pub const Renderer = struct {
         var frame_scratch = try self.image_scratch.acquire(self.allocator, frame_bytes);
         defer frame_scratch.release();
         const frame = frame_scratch.bytes;
-        try self.readMapped(snapshot.readback, frame);
+        try self.readMapped(transfer, frame);
         self.frame_profile.readback_bytes += frame_bytes;
         self.frame_profile.target_readback_bytes += frame_bytes;
         if (snapshot.scanout_flip_vertical and snapshot.target.format.bytes_per_texel == 4) {
@@ -16566,6 +16555,7 @@ pub const Renderer = struct {
                 image_state.transfer_destination_usage,
             );
             const upload_copy = vk.BufferImageCopy{
+                .buffer_offset = upload.offset,
                 .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers },
                 .image_extent = .{
                     .width = target.descriptor.width,
@@ -16575,7 +16565,7 @@ pub const Renderer = struct {
             };
             self.device_functions.cmd_copy_buffer_to_image(
                 command_buffer,
-                upload.buffer.handle,
+                upload.buffer,
                 cached_snapshot.image.handle,
                 vk.image_layout_transfer_dst_optimal,
                 1,
@@ -16606,6 +16596,7 @@ pub const Renderer = struct {
                     image_state.transfer_destination_usage,
                 );
                 const upload_copy = vk.BufferImageCopy{
+                    .buffer_offset = upload.offset,
                     .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = extra.layout.layers },
                     .image_extent = .{
                         .width = extra.descriptor.width,
@@ -16615,7 +16606,7 @@ pub const Renderer = struct {
                 };
                 self.device_functions.cmd_copy_buffer_to_image(
                     command_buffer,
-                    upload.buffer.handle,
+                    upload.buffer,
                     extra_cached.image.handle,
                     vk.image_layout_transfer_dst_optimal,
                     1,
@@ -30033,8 +30024,7 @@ pub const Renderer = struct {
             for (self.guest_buffers.items) |cached| {
                 guest_buffer_cache_bytes +|= cached.device_local.size;
             }
-            var target_transfer_bytes: u64 = 0;
-            for (self.render_targets.items) |cached| target_transfer_bytes +|= cached.readback.size;
+            const target_transfer_bytes: u64 = if (self.storage_image_transfer) |buffer| buffer.size else 0;
             std.debug.print(
                 "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms flip={d}ms submits={d}/{d}cmd fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} tex_hit={d} tex_miss={d} tex_evict={d} buf_cache={d}/{d}MiB tex_cache={d} simg_cache={d}/{d}MiB\n",
                 .{
@@ -30244,7 +30234,7 @@ pub const Renderer = struct {
                 .{ self.flip_callbacks, profile.command_pool_stalls, profile.command_pool_stall_ns / std.time.ns_per_ms, self.frame_command_buffers.items.len },
             );
             std.debug.print(
-                "[gpu targets] flip={d} cache={d}/{d} transfer_mib={d}\n",
+                "[gpu targets] flip={d} cache={d}/{d} shared_image_transfer_mib={d}\n",
                 .{ self.flip_callbacks, self.render_targets.items.len, self.render_target_cache_limit, target_transfer_bytes / (1024 * 1024) },
             );
             std.debug.print(

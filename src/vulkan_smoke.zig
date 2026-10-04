@@ -6447,11 +6447,13 @@ fn runBufferTargetCoherenceProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
-    for ([_]usize{ 64, 128 }) |limit| try runResidentTargetReuseAtLimit(allocator, limit);
+    for ([_]bool{ false, true }) |timeline| {
+        for ([_]usize{ 64, 128 }) |limit| try runResidentTargetReuseAtLimit(allocator, limit, timeline);
+    }
 }
 
-fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .render_target_cache_limit = limit });
+fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize, timeline: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = timeline, .render_target_cache_limit = limit });
     defer renderer.deinit();
     var guest = SizedGuestMemory(256 * 1024){};
     const vertex = [_]u32{
@@ -6535,14 +6537,15 @@ fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !vo
         try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, guest.bytes[center..][0..4]);
     }
     // Seed a previously used attachment again while its preceding draw is
-    // queued. Upload and readback share a buffer in the resident path; compare
+    // queued. Ring slices must preserve every upload until its draw; compare
     // every pixel with the independent transient-buffer path, including pixels
     // outside the triangle that must retain their new CPU-authored values.
     const destination = 0x2000 + (limit + 3) * 0x400;
     const destination_index = for (renderer.render_targets.items, 0..) |target, index| {
         if (target.target.descriptor.address == destination) break index;
     } else return error.MissingReuseTarget;
-    const transfer = renderer.render_targets.items[destination_index].readback.handle;
+    const transfer = renderer.storage_image_transfer.?.handle;
+    try std.testing.expectEqual(@as(u64, 8 * 8 * 4), renderer.storage_image_transfer.?.size);
     var expected: [8 * 8 * 4]u8 = undefined;
     for ([_]bool{ false, true, true }, 0..) |reuse, pass| {
         renderer.reuse_color_target_transfer = reuse;
@@ -6554,7 +6557,7 @@ fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !vo
             if (renderer.last_draw_error) |err| return err;
         }
         try renderer.flushPendingGuestWrites();
-        try std.testing.expectEqual(transfer, renderer.render_targets.items[destination_index].readback.handle);
+        try std.testing.expectEqual(transfer, renderer.storage_image_transfer.?.handle);
         const actual = guest.bytes[destination..][0..expected.len];
         if (pass == 0) {
             @memcpy(&expected, actual);
@@ -6563,7 +6566,7 @@ fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !vo
             try std.testing.expect(!std.mem.eql(u8, actual[0..4], &.{ 255, 0, 0, 255 }));
         } else try std.testing.expectEqualSlices(u8, &expected, actual);
     }
-    std.debug.print("resident target reuse passed: {d} entries, warm working set, full cache, sampled source, GPU readback, released pins, queued transfer-buffer reseeding\n", .{limit});
+    std.debug.print("resident target reuse passed: {d} entries, timeline={}, warm working set, sampled source, shared 256-byte readback, released pins, queued ring reseeding\n", .{ limit, timeline });
 }
 
 fn expectStorageBufferAccounting(renderer: *const vulkan.Renderer) !void {
@@ -8157,8 +8160,23 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
     for ([_]f32{ 16, 16, 16, 16, 1, 0 }, 0..) |value, index| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
     var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    // Distinct untouched MRT pixels expose overlapping upload slices or a
+    // missing source offset. Place the first seed at the end of the ring so
+    // subsequent attachments must spill without overwriting that seed.
+    for ([_]usize{ 4, 4, 4, 8 }, 0..) |stride, slot| {
+        const address = 0x2000 + slot * 0x3000;
+        for (0..32 * 32 * stride / 4) |word|
+            guest.word(address + word * 4, 0x2345_6700 + @as(u32, @intCast(slot)));
+    }
+    renderer.draw_upload_offset = renderer.draw_upload_buffer.?.size - 32 * 32 * 4;
     _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
     try renderer.flushPendingGuestWrites();
+    if (renderer.last_draw_error) |err| return err;
+    try std.testing.expect(renderer.frame_profile.draw_upload_spills > 0);
+    for (0..4) |slot| {
+        const address = 0x2000 + slot * 0x3000;
+        try std.testing.expectEqual(0x2345_6700 + @as(u32, @intCast(slot)), std.mem.readInt(u32, guest.bytes[address..][0..4], .little));
+    }
     const pixel = 16 * 32 + 16;
     for ([_]u8{ 64, 128, 191, 255 }, guest.bytes[0x2000 + pixel * 4 ..][0..4]) |expected, actual| {
         try std.testing.expect(@abs(@as(i16, actual) - expected) <= 1);
