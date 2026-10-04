@@ -116,8 +116,8 @@ correctness and allocation checks, not game FPS measurements.
 
 The combined ReleaseFast runner is SHA-256
 `9bb91d692ceacf578afc7168ad9085e103492a07743bebfa3445e4dce5b8f5cc`.
-The installed `zig-out/bin/game-run.exe` and its PDB have been updated to this
-build; the previous installed pair is retained locally for rollback. Public
+At this checkpoint, `zig-out/bin/game-run.exe` and its PDB were updated to this
+build; the previous installed pair was retained locally for rollback. Public
 release archives are unchanged.
 With unchanged default cache budgets, its tree transition presents **38 frames
 in 30.047 seconds: 1.265 FPS**. The earlier array-only candidate presents 37:
@@ -133,5 +133,129 @@ the total process-memory difference is not a controlled benchmark.
 
 ![Combined candidate at difficulty selection](../images/yotei-shared-transfer-tree-2026-10-04.png)
 
-Continuation past this checkpoint is being tested. Post-cinematic FPS and
-controllable gameplay have not been established.
+## Continuation into the cinematic
+
+The combined build passes the bonus notices, wolf brightness calibration,
+Medium difficulty and Standard experience selection. The camera moves past
+the tree into a very dark cinematic. Opening Options displays `PAUSED` and a
+subtitle toggle, confirming that this is still the cinematic rather than
+controllable gameplay. Resuming removes that overlay, but character control
+has not been established. The owned diagnostic process is deliberately stopped
+after approximately 36 minutes for the next isolated build and native tests.
+
+Flip 1384, before any live cache-budget changes, takes **59,275 ms**. Graphics
+pipeline creation accounts for **35,376 ms across 550 misses**; the frame also
+uploads 6,412,920 KiB and reads back 2,197,188 KiB. Frame categories overlap and
+must not be added together. This is a cold-transition stall, not a stationary
+gameplay FPS sample. A later pipeline inventory contains 1,379 graphics
+pipelines and 1,180 distinct exact shader pairs; trivial render-state
+deduplication alone cannot remove most of that compilation.
+
+Host commit approaches the limit again. To continue diagnosis, the live sampled
+budget is changed from 2,048 to 1,024 MiB and the storage budget from 2,560 to
+1,280 MiB. The sampled budget is subsequently raised to 1,536 and then set to
+1,280 MiB; the render-target limit is reduced from 128 to 64. These changes are
+**diagnostic only**, occur after the reported tree measurements, and are not
+installed defaults. They reduce retained resources but cause substantial churn:
+later frames upload roughly 3.3–3.8 GiB of sampled textures. Even with only
+one or two new graphics pipelines, individual frames still take 8–15 seconds.
+Some of those frames render the pause overlay, so they are not reported as
+gameplay FPS or a controlled comparison against the default budgets.
+
+One pixel-shader resource lookup is unresolved (`s28`, program
+`0x800026ed00`, instruction `0x8b4`), and its draw is rejected. Zero unsupported
+compute-program reports do not establish complete shader or resource coverage.
+Dark rendering, tree streaks, resource churn and character control remain open.
+
+![Very dark post-tree cinematic after resuming from pause; character control is unconfirmed](../images/yotei-post-tree-dark-2026-10-04.png)
+
+## Read-only storage-image reuse
+
+The sampled fallback cache includes the storage producer's eviction sequence
+in its content identity. A read-only storage binding advances that sequence
+without changing any texels, needlessly invalidating an already uploaded
+sampled view. Use the existing storage content generation instead. Actual
+uploads, image writes, clears and depth-to-storage copies advance this
+generation; read-only bindings do not.
+
+The extended `--sampled-storage-refresh` native probe reproduces the problem
+before the change: a read-only image dispatch causes a third sampled upload
+where only two are expected. With the change, four cases pass under Khronos
+synchronization validation: image/buffer producers, each with timeline
+scheduling disabled/enabled. Pixel readbacks verify pending and published GPU
+writes, a sampler change, read-only reuse, and a later direct CPU update outside
+the sampled texture's sparse probe. No validation errors are reported.
+
+The ReleaseFast runner is SHA-256
+`7d91b76040d7c9136de8f5b59738626d48bf22ee01aa0e0c788455e7b58364da`.
+The installed executable and PDB are updated; the preceding pair remains in a
+local backup. The game repeat starts with the unchanged default cache budgets,
+1080p output, Speed preset and Performance game preference.
+
+| Visible interval | Presented frames | Duration | FPS |
+| --- | ---: | ---: | ---: |
+| Wolf brightness calibration | 38 | 30.044 s | 1.265 |
+| Tree transition into difficulty selection | 38 | 30.044 s | 1.265 |
+
+The tree result matches the preceding shared-transfer build. **No game FPS
+gain is demonstrated for this additional change.** Bark and branches remain
+visible, and the bright vertical streaks remain. Neither measurement overlaps
+input, profiling, screenshot capture or a background build. The new tree
+inventory retains the 72 MiB shared transfer buffer and records 14,654,386,176
+private process bytes; this is not a controlled memory comparison.
+
+A separate eight-second resource trace is enabled and then restored before
+these measurements. It records unresolved buffer-descriptor discovery in
+compute and export-stage branches; no `storage incomplete` fallback is reported
+in that short interval. The per-frame `storage_unresolved` counter reaches
+approximately 900, but includes potentially inactive branches and is not proof
+of that many executed missing accesses. First-occurrence graphics resource
+failures now retain bounded scalar diagnostics without requiring verbose
+buffer-lifetime tracing.
+
+## Illustrated movie and compilation stalls
+
+The read-only reuse build continues past the tree and the dark 3D cinematic
+into a clearly visible illustrated narrative movie. This is progress beyond
+setup, **not confirmation of character control**. No pause input is used in
+this repeat.
+
+![Illustrated narrative movie after the tree and dark cinematic](../images/yotei-post-tree-movie-2026-10-04.png)
+
+A 30.045-second interval during the cold 3D transition presents one frame
+(0.033 FPS). It includes first-use compilation stalls and is not a warmed
+gameplay measurement. With the default 2,048 MiB sampled-image budget, later
+flip 1491 takes 10,429 ms despite only one graphics and three compute pipeline
+misses, totaling 8 ms of pipeline creation. It uploads 1,775,144 KiB of textures
+and records 5,079 sampled misses and 5,016 evictions. Graphics resource
+preparation takes 6,620 ms, with 5,060,485 microseconds of fence waits across
+the frame. These overlapping categories must not be added together.
+
+At 13:37:42 local time, the sampled-image budget is increased live from 2,048
+to 2,560 MiB; storage-image and render-target budgets remain unchanged. The
+scene switches to video immediately afterward. Lower texture churn in the
+movie therefore **does not demonstrate a benefit from this budget change**.
+The installed default remains 2,048 MiB. The live experiment is reverted to
+that value at 13:49:46 to preserve memory headroom during compilation.
+
+Subsequent loading stalls hold the last movie image on screen. Flip 1605 takes
+239,431 ms, with 234,886 ms spent creating 15 compute pipelines. Flip 1606
+takes 105,038 ms, including 104,146 ms of compute pipeline creation. A short
+thread sample finds active NVIDIA compiler work while the submitted GPU tick
+is already complete. The foreground compiler queue remains active; its startup
+warmup has finished. These are observed compilation stalls, not proof of a
+deadlock or a game crash.
+
+Two pending compute modules are captured locally, approximately 1.6 MiB each.
+One has a 364-case dispatcher; the other has 151 cases and 140 loops. The first
+passes SPIR-V validation. An offline `spirv-opt -O` experiment reduces it from
+1,628,004 to 1,448,996 bytes in 3.50 seconds, also passing validation. This has
+not yet been timed in the driver or executed for comparison, and is not
+enabled in the renderer. No game shader bytes are published.
+
+The resource diagnostic still records a rejected pixel-shader draw at
+`0x800026ed00`, instruction `0x8b4`, sampled resource `s28`. Its descriptor
+comes through a vector-loaded pointer and nested material table; a correct
+fix must resolve and stage that table, not substitute a dummy texture.
+Post-movie control, steady gameplay FPS, dark lighting and remaining tree
+streaks are still open at this checkpoint.

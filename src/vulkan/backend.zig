@@ -26980,9 +26980,11 @@ pub const Renderer = struct {
             target_sequence = @max(target_sequence, cached.last_used_sequence);
         }
         // Storage producers can use another format or extent, so direct image
-        // reuse is not always possible. Include their resident sequence even
+        // reuse is not always possible. Include their content generation even
         // after publication: sparse CPU probes can miss the changed texels,
         // and canonical alias generations are absent in the default mode.
+        // Binding a storage image for reading advances its eviction sequence
+        // without changing its texels. That must not expire sampled snapshots.
         var storage_sequence: u64 = 0;
         if (!self.canonical_image_aliases_enabled) {
             var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, address, CachedStorageImage.address);
@@ -26990,7 +26992,7 @@ pub const Renderer = struct {
                 const cached = &self.storage_image_cache.items[index];
                 // Match flushGuestStorageImageRange's allocation-base rule.
                 if (!cached.valid or cached.descriptor.address != address) continue;
-                storage_sequence = @max(storage_sequence, cached.last_used_sequence);
+                storage_sequence = @max(storage_sequence, cached.content_generation);
             }
         }
         // Raw compute buffers can back the same texture allocation. Their
@@ -30911,7 +30913,11 @@ pub const Renderer = struct {
     }
 
     fn reportResourceFailure(self: *Renderer, bindings: *const gpu.ShaderBindings, inst: gpu.ShaderInstruction, scalar: *const gpu.scalar_provenance.ScalarRegisters) void {
-        if (!self.trace_resource_failures) return;
+        // A missing graphics resource rejects a draw. Retain its scalar
+        // evidence on the first occurrence without enabling verbose buffer
+        // lifetime tracing for the entire run. The bounded table below keeps
+        // repeated failures from flooding the log.
+        if (!self.trace_resource_failures and bindings.stage == .compute) return;
         for (&self.reported_resource_failures) |*entry| {
             if (entry.*) |known| {
                 if (known.program == bindings.program_address and known.pc == inst.pc) return;

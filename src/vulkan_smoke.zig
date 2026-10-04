@@ -652,11 +652,13 @@ fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator, compact: bool, e
 }
 
 fn runSampledStorageRefreshProbe(allocator: std.mem.Allocator) !void {
-    for ([_]bool{ false, true }) |buffer_writer| try runSampledStorageRefreshCase(allocator, buffer_writer);
+    for ([_]bool{ false, true }) |timeline| {
+        for ([_]bool{ false, true }) |buffer_writer| try runSampledStorageRefreshCase(allocator, buffer_writer, timeline);
+    }
 }
 
-fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: bool) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{});
+fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: bool, timeline: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = timeline });
     defer renderer.deinit();
     const guest = try allocator.create(SizedGuestMemory(524288));
     defer allocator.destroy(guest);
@@ -666,6 +668,8 @@ fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: boo
     const output = 0x50000;
     const consumer_program = 0x1400;
     const producer_program = 0x1800;
+    const readonly_program = 0x1c00;
+    const readonly_output = output + 64;
     const consumer_code = [_]u32{
         vop1(1, 0, 255), @bitCast(@as(f32, 32.5 / 64.0)),
         vop1(1, 1, 255), @bitCast(@as(f32, 32.5 / 64.0)),
@@ -687,9 +691,16 @@ fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: boo
         mubuf(0x1c, 0, 4, 0, 0)[1],
         0xbf81_0000,
     };
+    const readonly_code = [_]u32{
+        vop1(1, 0, 160), vop1(1, 1, 144), // same texel as the image writer
+        0xf000_0108, 0x0000_0400, // image_load R32_UINT, T#s0
+        0xe070_0000, 0x8002_0400, // buffer_store_dword v4, V#s8
+        0xbf81_0000,
+    };
     const producer_code = if (buffer_writer) &buffer_code else &image_code;
     for (consumer_code, 0..) |word, i| guest.word(consumer_program + i * 4, word);
     for (producer_code, 0..) |word, i| guest.word(producer_program + i * 4, word);
+    for (readonly_code, 0..) |word, i| guest.word(readonly_program + i * 4, word);
     const compute = gpu.resources.ShaderStage.compute;
     var consumer = gpu.State{};
     var producer = gpu.State{};
@@ -709,9 +720,14 @@ fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: boo
     }
     for (0..4) |i| try consumer.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(i)), 0);
     for ([_]u32{ output, 4 << 16, 4, 0 }, 0..) |word, i| try consumer.writeRegister(.shader, compute.userDataBase() + 12 + @as(u32, @intCast(i)), word);
+    var readonly = producer;
+    try readonly.writeRegister(.shader, compute.programRegisterBase(), readonly_program >> 8);
+    try readonly.writeRegister(.shader, 0x213, 12 << 1);
+    for ([_]u32{ readonly_output, 4 << 16, 1, 0 }, 0..) |word, i| try readonly.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(i)), word);
     const stream = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
     var reader = gpu.DcbExecutor{ .state = &consumer, .backend = backend, .allocator = allocator };
     var writer = gpu.DcbExecutor{ .state = &producer, .backend = backend, .allocator = allocator };
+    var image_reader = gpu.DcbExecutor{ .state = &readonly, .backend = backend, .allocator = allocator };
     for ([_]u32{ 0, 0x80c0_6020, 0xff19_73e1 }, 0..) |packed_value, phase| {
         if (phase != 0) {
             try producer.writeRegister(.shader, compute.userDataBase() + 8, packed_value);
@@ -726,10 +742,17 @@ fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: boo
         }
         for (0..2) |repeat| {
             const misses_before = renderer.texture_cache_misses;
-            if (buffer_writer and repeat != 0 and phase != 0) {
-                // Binding the unchanged allocation as an SSBO reader does
-                // not produce a new texture content epoch.
-                _ = try renderer.stageGuestStorageBufferAt(31, source, 65536 * 4);
+            if (repeat != 0 and phase != 0) {
+                // Reading the unchanged allocation must not invalidate its
+                // sampled snapshot, for either SSBOs or storage images.
+                if (buffer_writer) {
+                    _ = try renderer.stageGuestStorageBufferAt(31, source, 65536 * 4);
+                } else {
+                    _ = try image_reader.execute(&stream);
+                    var loaded: [4]u8 = undefined;
+                    try renderer.readbackGuestStorageBuffer(readonly_output, &loaded);
+                    try std.testing.expectEqual(packed_value, std.mem.readInt(u32, &loaded, .little));
+                }
             }
             _ = try reader.execute(&stream);
             var data: [16]u8 = undefined;
@@ -742,13 +765,20 @@ fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: boo
             if (repeat != 0) try std.testing.expectEqual(misses_before, renderer.texture_cache_misses);
         }
     }
-    if (buffer_writer) {
+    {
         // Native CPU stores can bypass the command-processor write callback.
-        // A later SSBO upload observes this changed byte outside the texture's
-        // sparse probe and must invalidate the sampled view in this frame.
+        // A later storage upload observes this changed byte outside the
+        // texture's sparse probe and must invalidate the sampled view.
         const cpu_value: u32 = 0xff80_c040;
         guest.word(source + 8320, cpu_value);
-        _ = try renderer.stageGuestStorageBufferAt(31, source, 65536 * 4);
+        if (buffer_writer) {
+            _ = try renderer.stageGuestStorageBufferAt(31, source, 65536 * 4);
+        } else {
+            _ = try image_reader.execute(&stream);
+            var loaded: [4]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(readonly_output, &loaded);
+            try std.testing.expectEqual(cpu_value, std.mem.readInt(u32, &loaded, .little));
+        }
         _ = try reader.execute(&stream);
         var data: [16]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(output, &data);
@@ -758,7 +788,7 @@ fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: boo
             try std.testing.expectApproxEqAbs(expected, value, 0.0001);
         }
     }
-    std.debug.print("sampled storage refresh passed: {s} writer, cached UNORM view, pending/published writes, sampler change, unchanged-view reuse and CPU upload\n", .{if (buffer_writer) "buffer" else "image"});
+    std.debug.print("sampled storage refresh passed: {s} writer, timeline={}, cached UNORM view, pending/published writes, sampler change, read-only reuse and CPU upload\n", .{ if (buffer_writer) "buffer" else "image", timeline });
 }
 
 fn runPredicatedImageLoadProbe(allocator: std.mem.Allocator) !void {
