@@ -446,6 +446,8 @@ pub const Options = struct {
     /// Fragment EXP MRT0..7 bits. A program without color exports declares
     /// no color outputs; storage-only fragment programs are valid Vulkan.
     color_export_mask: u8 = 0,
+    /// Vulkan location for each compact EXP MRT index; 0xff is not routed.
+    color_export_locations: [8]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7 },
     /// Inferred from EXP.VM. Its EXEC snapshot controls fragment coverage at
     /// shader completion, including null exports after an alpha-test reject.
     uses_fragment_valid_mask: bool = false,
@@ -1289,8 +1291,15 @@ const Builder = struct {
                 try self.emit(&self.declarations, 32, &.{ output_pointer, 3, self.vector4_type }); // ptr Output
                 var output_pointers = [3]u32{ output_pointer, 0, 0 };
                 const color_mask = options.color_export_mask;
+                var routed_locations: u8 = 0;
                 for (0..self.color_outputs.len) |slot| {
                     if (color_mask & (@as(u8, 1) << @intCast(slot)) == 0) continue;
+                    const location = options.color_export_locations[slot];
+                    if (location == 0xff) continue;
+                    if (location >= 8) return Error.InvalidStageInterface;
+                    const location_bit = @as(u8, 1) << @intCast(location);
+                    if (routed_locations & location_bit != 0) return Error.InvalidStageInterface;
+                    routed_locations |= location_bit;
                     const type_index: usize = switch (options.color_export_types[slot]) {
                         .float32 => 0,
                         .uint32, .r11g11b10_unorm => 1,
@@ -1303,7 +1312,7 @@ const Builder = struct {
                     }
                     const variable = self.id();
                     self.color_outputs[slot] = variable;
-                    try self.emit(&self.annotations, 71, &.{ variable, 30, @intCast(slot) }); // Location
+                    try self.emit(&self.annotations, 71, &.{ variable, 30, location }); // Location
                     try self.emit(&self.declarations, 59, &.{ output_pointers[type_index], variable, 3 }); // OpVariable
                 }
                 // FragCoord for UV fallback (BuiltIn 15).

@@ -8290,6 +8290,60 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     try state.writeRegister(.context, 0x31c, 10 << 2);
     std.debug.print("packed UNORM attachment passed: FP16 export quantized to exact 11/11/10 guest bits\n", .{});
 
+    // CB_TARGET_MASK can retain a blended packed surface even when the pixel
+    // program disables that slot through CB_SHADER_MASK. Other MRTs still
+    // write, and the disabled surface must retain both pixels and its epoch.
+    try state.writeRegister(.context, 0x31c, 6 << 2);
+    try state.writeRegister(.context, 0x1e0, (1 << 30) | 4 | (5 << 8));
+    try state.writeRegister(.context, 0x08f, 0xf310);
+    var masked_packed_index: ?usize = null;
+    for (renderer.render_targets.items, 0..) |entry, index| {
+        if (entry.target.descriptor.address == 0x2000 and entry.target.descriptor.format == 6) masked_packed_index = index;
+    }
+    const packed_before = guest.bytes[0x2000 + pixel * 4 ..][0..4].*;
+    const packed_epoch = renderer.render_targets.items[masked_packed_index.?].content_generation;
+    var masked_packed_fragment = fragment;
+    masked_packed_fragment[5] = 0x9abc_def0;
+    for (masked_packed_fragment, 0..) |word, index| guest.word(0xe00 + index * 4, word);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 14);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqualSlices(u8, &packed_before, guest.bytes[0x2000 + pixel * 4 ..][0..4]);
+    try std.testing.expectEqual(packed_epoch, renderer.render_targets.items[masked_packed_index.?].content_generation);
+    try std.testing.expectEqual(@as(u32, 0x9abc_def0), std.mem.readInt(u32, guest.bytes[0x5000 + pixel * 4 ..][0..4], .little));
+
+    // Re-enabling the packed output must still reject unsupported blending.
+    try state.writeRegister(.context, 0x08f, 0xf31f);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    try std.testing.expectEqual(error.UnsupportedColorTarget, renderer.last_draw_error.?);
+    renderer.last_draw_error = null;
+    try state.writeRegister(.context, 0x1e0, 0);
+    try state.writeRegister(.context, 0x31c, 10 << 2);
+
+    // Mask individual channels with a full target mask, then disable every
+    // color export. A later shader-mask change must not reuse the wrong PSO.
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 13);
+    try state.writeRegister(.context, 0x08f, 0xf312);
+    try state.writeRegister(.context, 0x318, 0x120);
+    for (0..32 * 32) |word| guest.word(0x12000 + word * 4, 0x6655_4433);
+    const partial_before = guest.bytes[0x12000 + pixel * 4 ..][0..4].*;
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    const partial_after = guest.bytes[0x12000 + pixel * 4 ..][0..4].*;
+    try std.testing.expectEqual(@as(u8, 0), partial_after[1]);
+    for ([_]usize{ 0, 2, 3 }) |channel| try std.testing.expectEqual(partial_before[channel], partial_after[channel]);
+    try state.writeRegister(.context, 0x08f, 0);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 9);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqualSlices(u8, &partial_after, guest.bytes[0x12000 + pixel * 4 ..][0..4]);
+    try state.writeRegister(.context, 0x08f, 0xffff_ffff);
+    try state.writeRegister(.context, 0x318, 0x20);
+    std.debug.print("shader color mask passed: disabled packed blend, partial channels, explicit zero, preserved pixels and epoch\n", .{});
+
     // A later Yotei pass renders directly into a two-channel signed-normalized
     // attachment before sampling it as RG16_SNORM. Keep both signs intact.
     var signed_fragment = fragment;
@@ -8321,6 +8375,50 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     try state.writeRegister(.context, 0x33a, 5 << 2);
     try state.writeRegister(.context, 0x1c5, 0x6514);
     std.debug.print("RG32F attachment passed: positive/negative exports, target reuse and guest readback\n", .{});
+
+    // Two compact exports feed physical slots 0 and 2. The second format is
+    // UNORM16, and must follow export 1 even though its target is slot 2.
+    const routed_fragment = [_]u32{
+        vop1(1, 0, 255), 0x3800_3400, vop1(1, 1, 255), 0x3c00_3a00,
+        vop1(1, 2, 255), 0xc000_4000, 0xf800_140f,     0x0100,
+        0xf800_0c13,     0x0002,      0xbf81_0000,
+    };
+    for (routed_fragment, 0..) |word, index| guest.word(0x1100 + index * 4, word);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 0x11);
+    try state.writeRegister(.context, 0x1c5, 0x54);
+    try state.writeRegister(.context, 0x08f, 0x030f);
+    const untouched_integer = guest.bytes[0x5000 + pixel * 4 ..][0..4].*;
+    const untouched_half = guest.bytes[0xb000 + pixel * 8 ..][0..8].*;
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    for ([_]u8{ 64, 128, 191, 255 }, guest.bytes[0x2000 + pixel * 4 ..][0..4]) |expected, actual|
+        try std.testing.expect(@abs(@as(i16, actual) - expected) <= 1);
+    try std.testing.expectEqual(@as(u32, 0xc000_4000), std.mem.readInt(u32, guest.bytes[0x8000 + pixel * 4 ..][0..4], .little));
+    try std.testing.expectEqualSlices(u8, &untouched_integer, guest.bytes[0x5000 + pixel * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &untouched_half, guest.bytes[0xb000 + pixel * 8 ..][0..8]);
+
+    // Move the same export to a different float attachment using only the
+    // shader mask, then restore the prior mapping and reuse its pipeline.
+    try state.writeRegister(.context, 0x08f, 0xf00f);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    for ([_]f32{ 16384.0 / 65535.0, 49152.0 / 65535.0 }, 0..) |expected, channel| {
+        const actual: f16 = @bitCast(std.mem.readInt(u16, guest.bytes[0xb000 + pixel * 8 + channel * 2 ..][0..2], .little));
+        try std.testing.expectApproxEqAbs(expected, @as(f32, actual), 0.001);
+    }
+    const routed_misses = renderer.graphics_pipeline_cache_misses;
+    try state.writeRegister(.context, 0x08f, 0x030f);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqual(routed_misses, renderer.graphics_pipeline_cache_misses);
+    try std.testing.expectEqual(@as(u32, 0xc000_4000), std.mem.readInt(u32, guest.bytes[0x8000 + pixel * 4 ..][0..4], .little));
+    try state.writeRegister(.context, 0x08f, 0xffff_ffff);
+    try state.writeRegister(.context, 0x1c5, 0x6514);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 9);
+    std.debug.print("compact color exports passed: MRT holes, packed format routing, retained disabled targets and changed-mask pipeline reuse\n", .{});
 
     // AGC attributes name s0:s3 at a later fetch. They must not replace the
     // NGG wave-count input in s3 before the guest loads that descriptor.
@@ -13290,7 +13388,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });
     defer renderer.deinit();
-    if (args.len == 3 and (std.mem.eql(u8, args[1], "--probe-spv") or std.mem.eql(u8, args[1], "--probe-spv-cached"))) {
+    if (args.len == 3 and (std.mem.eql(u8, args[1], "--probe-spv") or std.mem.eql(u8, args[1], "--probe-spv-cached") or std.mem.eql(u8, args[1], "--probe-spv-no-opt"))) {
         const bytes = try std.Io.Dir.cwd().readFileAllocOptions(
             init.io,
             args[2],
@@ -13302,17 +13400,19 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(bytes);
         if (bytes.len % @sizeOf(u32) != 0) return error.MisalignedSpirv;
         const cached = std.mem.eql(u8, args[1], "--probe-spv-cached");
+        const disable_optimization = std.mem.eql(u8, args[1], "--probe-spv-no-opt");
         const started = std.Io.Clock.awake.now(init.io);
         if (cached) {
             try renderer.probeCachedComputeSpirv(std.mem.bytesAsSlice(u32, bytes));
         } else {
-            try renderer.probeComputeSpirv(std.mem.bytesAsSlice(u32, bytes));
+            try renderer.probeComputeSpirvCompilation(std.mem.bytesAsSlice(u32, bytes), disable_optimization);
         }
         const elapsed_ns = std.Io.Clock.awake.now(init.io).nanoseconds - started.nanoseconds;
-        std.debug.print("compute SPIR-V pipeline compiled: {s} ({d} words, cache={s}, compile_ms={d})\n", .{
+        std.debug.print("compute SPIR-V pipeline compiled: {s} ({d} words, cache={s}, disable_optimization={any}, compile_ms={d})\n", .{
             args[2],
             bytes.len / @sizeOf(u32),
             if (cached) "loaded" else "none",
+            disable_optimization,
             @divTrunc(elapsed_ns, std.time.ns_per_ms),
         });
         return;

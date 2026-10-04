@@ -471,7 +471,7 @@ pub const RenderState = struct {
     color_count: u8 = 0,
     active_color_count: u8 = 0,
     target_mask: u32 = 0x0000_000f,
-    shader_mask: u32 = 0,
+    shader_mask: u32 = 0xffff_ffff,
     depth_control: DepthControl,
     stencil: StencilState = .{},
     depth_target: ?DepthTarget,
@@ -641,7 +641,9 @@ pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
     // explicit zero disables every colour channel, even with live targets
     // and pixel exports (for example, a fullscreen depth reconstruction).
     const target_mask = state.readRegister(.context, 0x08e) orelse 0x0000_000f;
-    const shader_mask = state.readRegister(.context, 0x08f) orelse 0;
+    // An unwritten register retains the synthetic/legacy draw default. An
+    // explicit zero means that the shader exports no color channels.
+    const shader_mask = state.readRegister(.context, 0x08f) orelse 0xffff_ffff;
     var result = RenderState{
         .target_mask = target_mask,
         .shader_mask = shader_mask,
@@ -662,6 +664,32 @@ pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
         if (target.isActive()) result.active_color_count += 1;
     }
     return result;
+}
+
+/// EXP MRT numbers and SPI_SHADER_COL_FORMAT are compact, while CB_SHADER_MASK
+/// retains physical attachment slots. Match the enabled entries in order.
+/// Legacy/synthetic command streams with incomplete interface registers keep
+/// their direct mapping instead of guessing a compact interface.
+pub fn colorExportLocations(shader_mask: u32, export_formats: u32) [8]u8 {
+    var exports: [8]u8 = undefined;
+    var slots: [8]u8 = undefined;
+    var export_count: usize = 0;
+    var slot_count: usize = 0;
+    for (0..8) |slot| {
+        const shift: u5 = @intCast(slot * 4);
+        if ((export_formats >> shift) & 15 != 0) {
+            exports[export_count] = @intCast(slot);
+            export_count += 1;
+        }
+        if ((shader_mask >> shift) & 15 != 0) {
+            slots[slot_count] = @intCast(slot);
+            slot_count += 1;
+        }
+    }
+    if (export_count == 0 or export_count != slot_count) return .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    var locations: [8]u8 = @splat(0xff);
+    for (exports[0..export_count], slots[0..slot_count]) |source, target| locations[source] = target;
+    return locations;
 }
 
 pub fn decodeViewport(state: *const gpu_state.State, index: u8) ?ViewportTransform {

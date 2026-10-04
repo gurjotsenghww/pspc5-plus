@@ -12725,6 +12725,12 @@ pub const Renderer = struct {
     /// dump a module at the point of failure and vulkan-smoke can then exercise
     /// precisely that vkCreateComputePipelines call without replaying a title.
     pub fn probeComputeSpirv(self: *Renderer, words: []const u32) Error!void {
+        return self.probeComputeSpirvCompilation(words, false);
+    }
+
+    /// Compare driver compiler cost only; this does not change runtime
+    /// pipelines or dispatch the captured module.
+    pub fn probeComputeSpirvCompilation(self: *Renderer, words: []const u32, disable_optimization: bool) Error!void {
         const shader = try self.createShader(words);
         defer self.destroyShaderModule(shader);
 
@@ -12734,6 +12740,7 @@ pub const Renderer = struct {
             .name = "main",
         };
         const pipeline_info = vk.ComputePipelineCreateInfo{
+            .flags = if (disable_optimization) vk.pipeline_create_disable_optimization_bit else 0,
             .stage = stage,
             .layout = self.compute_pipeline_layout,
         };
@@ -13267,7 +13274,7 @@ pub const Renderer = struct {
                 render.target_mask,
             ))
                 mapColorWriteMask(
-                    color.descriptor.write_mask,
+                    color.descriptor.write_mask & @as(u8, @truncate(render.shader_mask >> @as(u5, @intCast(slot * 4)))),
                     colorTargetExportMapping(color.descriptor),
                 )
             else
@@ -21539,6 +21546,7 @@ pub const Renderer = struct {
         var color_export_types: [gpu.resources.color_target_count]rdna2.spirv.ColorExportType = @splat(.float32);
         var packed_color_exports: [gpu.resources.color_target_count]rdna2.spirv.PackedColorExport = @splat(.float16);
         const shader_color_format = state.readRegister(.context, 0x1c5) orelse 0;
+        const color_export_locations = gpu.resources.colorExportLocations(render_state.shader_mask, shader_color_format);
         for (&packed_color_exports, 0..) |*format, slot| {
             format.* = switch ((shader_color_format >> @as(u5, @intCast(slot * 4))) & 0xf) {
                 5 => .unorm16,
@@ -21546,11 +21554,12 @@ pub const Renderer = struct {
                 else => .float16,
             };
         }
-        color_export_mappings[target.descriptor.slot] = colorTargetExportMapping(target.descriptor);
-        color_export_types[target.descriptor.slot] = colorTargetExportType(target.descriptor);
-        for (extra_colors) |extra| {
-            color_export_mappings[extra.descriptor.slot] = colorTargetExportMapping(extra.descriptor);
-            color_export_types[extra.descriptor.slot] = colorTargetExportType(extra.descriptor);
+        for (color_export_locations, 0..) |location, export_index| {
+            for (bound_colors[0..bound_color_count]) |color| {
+                if (location != color.descriptor.slot) continue;
+                color_export_mappings[export_index] = colorTargetExportMapping(color.descriptor);
+                color_export_types[export_index] = colorTargetExportType(color.descriptor);
+            }
         }
 
         const fragment_translate_started = self.resourceTimestampNs();
@@ -21585,6 +21594,7 @@ pub const Renderer = struct {
             },
             .infer_fragment_parameter_mask = false,
             .color_export_mappings = color_export_mappings,
+            .color_export_locations = color_export_locations,
             .color_export_types = color_export_types,
             .packed_color_exports = packed_color_exports,
             .descriptor_array_length = maximum_storage_descriptors,
@@ -31177,6 +31187,9 @@ pub const Renderer = struct {
         std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
         if (err != Error.UnsupportedColorTarget) return;
         const rejected_state = gpu.resources.decodeRenderState(state);
+        std.debug.print("[vulkan dcb] rejected color state ps={?x} target_mask=0x{x} shader_mask=0x{x} export_format={?x}\n", .{
+            gpu.resources.ShaderStage.pixel.programAddress(state), rejected_state.target_mask, rejected_state.shader_mask, state.readRegister(.context, 0x1c5),
+        });
         for (rejected_state.color_targets) |candidate| {
             const target = candidate orelse continue;
             if (!target.isActive()) continue;
@@ -33203,6 +33216,12 @@ fn drawReuseInputKey(state: *const gpu.State, pipeline: GraphicsPipelineState, s
     std.hash.autoHash(&hasher, pipeline.pipelineKey());
     std.hash.autoHash(&hasher, stage);
     std.hash.autoHash(&hasher, primitive);
+    // Export routing/packing can change without changing the shader program
+    // or Vulkan attachment formats (for example, an MRT hole moves).
+    std.hash.autoHash(&hasher, state.readRegister(.context, 0x08f));
+    std.hash.autoHash(&hasher, state.readRegister(.context, 0x1c5));
+    for (0..gpu.resources.color_target_count) |slot|
+        std.hash.autoHash(&hasher, state.readRegister(.context, 0x31c + @as(u32, @intCast(slot)) * 15));
     // The analysis owns immutable decoded instructions; changed programs are
     // assigned a new analysis before this lookup.
     std.hash.autoHash(&hasher, @intFromPtr(vertex.program.instructions.items.ptr));

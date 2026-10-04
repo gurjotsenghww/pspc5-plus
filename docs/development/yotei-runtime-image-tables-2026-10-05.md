@@ -100,3 +100,16 @@ a frame-rate gain. Bright vertical tree streaks remain. The subsequent transitio
 is being investigated separately from this steady menu measurement.
 
 ![Medium difficulty menu with runtime texture lookups; bright tree streaks remain](../images/yotei-runtime-texture-tree-2026-10-05.png)
+
+The separate repeat passed brightness, Medium difficulty and Standard experience
+selection, then entered the cinematic transition. It again reported unsupported
+packed-color blending. The brief first diagnostic window did not capture a
+second rejected draw while the driver was compiling, so no claim is made about
+the failing fragment shader's exports from that capture.
+
+At 01:01:38 the memory guard stopped the run after 1,688.549 seconds. System
+commit was 58,902,728,704 of 59,294,818,304 bytes, leaving about 374 MiB. Unlike
+the preceding stop, this repeat had no concurrent build or separate GPU probe.
+The latest sampled state was flip 1512 with 1090 presented frames. This was an
+intentional diagnostic stop, not a spontaneous crash. Character control remains
+unconfirmed; the installed build does not resolve the later memory limit.

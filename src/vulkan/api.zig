@@ -863,6 +863,8 @@ pub const ComputePipelineCreateInfo = extern struct {
     base_pipeline_index: i32 = -1,
 };
 
+pub const pipeline_create_disable_optimization_bit: Flags = 0x0000_0001;
+
 pub const PipelineVertexInputStateCreateInfo = extern struct {
     s_type: u32 = structure_type_pipeline_vertex_input_state_create_info,
     p_next: ?*const anyopaque = null,
