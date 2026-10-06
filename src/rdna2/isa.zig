@@ -675,6 +675,16 @@ pub const Opcode = enum {
     ds_append,
     ds_consume,
     ds_ordered_count,
+    ds_inc_u32,
+    ds_inc_rtn_u32,
+    ds_dec_u32,
+    ds_dec_rtn_u32,
+    ds_mskor_b32,
+    ds_write_b8_d16_hi,
+    ds_write_b16_d16_hi,
+    ds_read_u16_d16_hi,
+    ds_permute_b32,
+    ds_bpermute_b32,
 
     // Images and exports.
     image_load,

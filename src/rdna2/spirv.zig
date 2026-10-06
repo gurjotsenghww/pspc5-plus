@@ -7402,6 +7402,18 @@ const Builder = struct {
         return result;
     }
 
+    fn andIds(self: *Builder, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, result, a, b });
+        return result;
+    }
+
+    fn selectBits(self: *Builder, condition: u32, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, result, condition, a, b });
+        return result;
+    }
+
     fn workgroupByteAddress(self: *Builder, inst: instruction.Instruction, offset: u32) Error!u32 {
         if (inst.gds or inst.src0.kind != .vgpr or inst.memory_offset < 0) {
             return Error.UnsupportedBufferAddressing;
@@ -7923,7 +7935,7 @@ const Builder = struct {
         return self.andBits(shifted, 0xff);
     }
 
-    fn dsReadSubword(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!void {
+    fn dsLoadSubword(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!u32 {
         const base_offset: u32 = @intCast(inst.memory_offset);
         var result = try self.loadDsByte(inst, base_offset);
         if (width == 16) {
@@ -7943,7 +7955,102 @@ const Builder = struct {
             try self.emit(&self.body, 195, &.{ self.signed_type, extended, as_signed, try self.constant(.sint32, amount) });
             result = try self.convert(.{ .id = extended, .value_type = .sint32 }, .bits32);
         }
+        return result;
+    }
+
+    fn dsReadSubword(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!void {
+        const result = try self.dsLoadSubword(inst, width, signed);
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    /// DS_READ_U16_D16_HI inserts the loaded half into bits [31:16] and keeps
+    /// the low half. A first definition of that register reads as zero.
+    fn dsReadU16D16Hi(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (inst.dst.kind != .vgpr) return Error.UnsupportedDestination;
+        const loaded = try self.andBits(try self.dsLoadSubword(inst, 16, false), 0xffff);
+        const shifted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted, loaded, try self.constant(.bits32, 16) });
+        const previous = try self.registerBits(registerIndex(inst.dst) orelse return Error.UnsupportedDestination, 0);
+        const preserved = try self.andBits(previous, 0xffff);
+        const combined = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, combined, preserved, shifted });
+        try self.destination(inst.dst, .{ .id = combined, .value_type = .bits32 });
+    }
+
+    fn dsByteTarget(self: *Builder, inst: instruction.Instruction, extra: u32) Error!struct { access: WorkgroupAccess, shift: u32 } {
+        if (inst.memory_offset < 0) return Error.UnsupportedBufferAddressing;
+        if (inst.gds) {
+            if (self.stage != .compute or inst.src0.kind != .vgpr) return Error.UnsupportedBufferAddressing;
+            const m0 = try self.source(.{ .kind = .m0 }, .bits32);
+            const base = try self.shiftRightBits(m0, 16);
+            const size = try self.andBits(m0, 0xffff);
+            const address = try self.source(inst.src0, .bits32);
+            const relative = try self.addBits(address, try self.constant(.bits32, @as(u32, @intCast(inst.memory_offset)) + extra));
+            const absolute = try self.addBits(base, relative);
+            var access = try self.gdsAccess(try self.shiftRightBits(absolute, 2));
+            const inside = self.id();
+            try self.emit(&self.body, 176, &.{ self.bool_type, inside, relative, size }); // OpULessThan
+            const no_wrap = self.id();
+            try self.emit(&self.body, 174, &.{ self.bool_type, no_wrap, relative, address }); // OpUGreaterThanEqual
+            access.in_range = try self.logicalAndValue(access.in_range, try self.logicalAndValue(inside, no_wrap));
+            return .{ .access = access, .shift = try self.subwordShift(absolute) };
+        }
+        const byte_address = try self.workgroupByteAddress(inst, @as(u32, @intCast(inst.memory_offset)) + extra);
+        const access = if (self.stage == .compute)
+            try self.workgroupAccess(byte_address)
+        else
+            try self.privateAccess(byte_address);
+        return .{ .access = access, .shift = try self.subwordShift(byte_address) };
+    }
+
+    /// Inserts the low 8 bits of `value` at a byte address. Compute and GDS
+    /// use a masked atomic pair so neighboring lanes keep their own bytes.
+    fn storeDsMaskedByte(self: *Builder, inst: instruction.Instruction, extra: u32, value: u32) Error!void {
+        const target = try self.dsByteTarget(inst, extra);
+        const shifted_mask = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted_mask, try self.constant(.bits32, 0xff), target.shift });
+        const inverse = self.id();
+        try self.emit(&self.body, 200, &.{ self.bits_type, inverse, shifted_mask }); // OpNot
+        const inserted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, inserted, try self.andBits(value, 0xff), target.shift });
+        const predicate = try self.writePredicate(target.access.in_range);
+        if (self.stage == .compute) {
+            const scope = try self.constant(.bits32, if (inst.gds) 1 else 2);
+            const semantics = try self.constant(.bits32, 0);
+            const merge = self.id();
+            if (predicate) |enabled| {
+                const taken = self.id();
+                try self.emit(&self.body, 247, &.{ merge, 0 });
+                try self.emit(&self.body, 250, &.{ enabled, taken, merge });
+                try self.emit(&self.body, 248, &.{taken});
+            }
+            try self.emit(&self.body, 240, &.{ self.bits_type, self.id(), target.access.pointer, scope, semantics, inverse }); // OpAtomicAnd
+            try self.emit(&self.body, 241, &.{ self.bits_type, self.id(), target.access.pointer, scope, semantics, inserted }); // OpAtomicOr
+            if (predicate != null) {
+                try self.emit(&self.body, 249, &.{merge});
+                try self.emit(&self.body, 248, &.{merge});
+            }
+            return;
+        }
+        const loaded = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, loaded, target.access.pointer });
+        const cleared = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, cleared, loaded, inverse });
+        const merged = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, merged, cleared, inserted });
+        if (predicate) |enabled| {
+            try self.guardedStore(enabled, target.access.pointer, merged);
+        } else {
+            try self.emit(&self.body, 62, &.{ target.access.pointer, merged });
+        }
+    }
+
+    /// D16_HI stores take the written bits from the high half of DATA0.
+    /// B8 uses bits [23:16]; B16 uses bits [31:16].
+    fn dsWriteD16Hi(self: *Builder, inst: instruction.Instruction, width: u8) Error!void {
+        const high = try self.shiftRightBits(try self.source(inst.src1, .bits32), 16);
+        try self.storeDsMaskedByte(inst, 0, high);
+        if (width == 16) try self.storeDsMaskedByte(inst, 1, try self.shiftRightBits(high, 8));
     }
 
     fn dsAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
@@ -8164,6 +8271,220 @@ const Builder = struct {
         }); // OpAtomicIAdd
         try self.emit(&self.body, 249, &.{merge});
         try self.emit(&self.body, 248, &.{merge});
+    }
+
+    /// DS_INC, DS_DEC and DS_MSKOR have no single SPIR-V integer atomic.
+    /// Compute retries a compare-exchange. Graphics LDS is private memory,
+    /// where an atomic is illegal, so that path is a load/modify/store.
+    fn dsAtomicUpdate(self: *Builder, inst: instruction.Instruction) Error!void {
+        const returns_value = switch (inst.opcode) {
+            .ds_inc_rtn_u32, .ds_dec_rtn_u32 => true,
+            .ds_inc_u32, .ds_dec_u32, .ds_mskor_b32 => false,
+            else => return Error.UnsupportedOpcode,
+        };
+        if (self.stage != .compute) {
+            if (inst.gds) return Error.UnsupportedBufferAddressing;
+            const access = try self.privateAccess(try self.workgroupByteAddress(inst, @intCast(inst.memory_offset)));
+            const loaded = self.id();
+            try self.emit(&self.body, 61, &.{ self.bits_type, loaded, access.pointer });
+            const old = try self.selectBits(access.in_range, loaded, try self.constant(.bits32, 0));
+            const updated = try self.dsUpdateBits(inst, old);
+            const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
+            try self.guardedStore(predicate, access.pointer, updated);
+            if (returns_value) try self.destination(inst.dst, .{ .id = old, .value_type = .bits32 });
+            return;
+        }
+
+        const access = if (inst.gds)
+            try self.indexedGdsAccess(inst)
+        else
+            try self.workgroupAccess(try self.workgroupByteAddress(inst, @intCast(inst.memory_offset)));
+        const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
+        const taken = self.id();
+        const merge = self.id();
+        const skipped = if (returns_value) self.id() else merge;
+        try self.emit(&self.body, 247, &.{ merge, 0 });
+        try self.emit(&self.body, 250, &.{ predicate, taken, skipped });
+        try self.emit(&self.body, 248, &.{taken});
+
+        const scope = try self.constant(.bits32, if (inst.gds) 1 else 2);
+        const semantics = try self.constant(.bits32, 0);
+        const original = self.id();
+        try self.emit(&self.body, 227, &.{ self.bits_type, original, access.pointer, scope, semantics });
+        const head = self.id();
+        const body = self.id();
+        const retry = self.id();
+        const done = self.id();
+        const expected = self.id();
+        const observed = self.id();
+        try self.emit(&self.body, 249, &.{head});
+        try self.emit(&self.body, 248, &.{head});
+        try self.emit(&self.body, 245, &.{ self.bits_type, expected, original, taken, observed, retry });
+        try self.emit(&self.body, 246, &.{ done, retry, 0 });
+        try self.emit(&self.body, 249, &.{body});
+        try self.emit(&self.body, 248, &.{body});
+        const desired = try self.dsUpdateBits(inst, expected);
+        try self.emit(&self.body, 230, &.{
+            self.bits_type,
+            observed,
+            access.pointer,
+            scope,
+            semantics,
+            semantics,
+            desired,
+            expected,
+        });
+        const exchanged = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, exchanged, observed, expected });
+        try self.emit(&self.body, 250, &.{ exchanged, done, retry });
+        try self.emit(&self.body, 248, &.{retry});
+        try self.emit(&self.body, 249, &.{head});
+        try self.emit(&self.body, 248, &.{done});
+        try self.emit(&self.body, 249, &.{merge});
+        if (returns_value) {
+            try self.emit(&self.body, 248, &.{skipped});
+            try self.emit(&self.body, 249, &.{merge});
+        }
+        try self.emit(&self.body, 248, &.{merge});
+        if (returns_value) {
+            const previous = self.id();
+            try self.emit(&self.body, 245, &.{ self.bits_type, previous, observed, done, try self.constant(.bits32, 0), skipped });
+            try self.destination(inst.dst, .{ .id = previous, .value_type = .bits32 });
+        }
+    }
+
+    fn dsUpdateBits(self: *Builder, inst: instruction.Instruction, old: u32) Error!u32 {
+        switch (inst.opcode) {
+            .ds_inc_u32, .ds_inc_rtn_u32 => {
+                // old >= limit ? 0 : old + 1, unsigned.
+                const limit = try self.source(inst.src1, .bits32);
+                const wrap = self.id();
+                try self.emit(&self.body, 174, &.{ self.bool_type, wrap, old, limit });
+                const next = try self.addBits(old, try self.constant(.bits32, 1));
+                return self.selectBits(wrap, try self.constant(.bits32, 0), next);
+            },
+            .ds_dec_u32, .ds_dec_rtn_u32 => {
+                // old == 0 || old > limit ? limit : old - 1, unsigned.
+                const limit = try self.source(inst.src1, .bits32);
+                const at_zero = self.id();
+                try self.emit(&self.body, 170, &.{ self.bool_type, at_zero, old, try self.constant(.bits32, 0) });
+                const above = self.id();
+                try self.emit(&self.body, 172, &.{ self.bool_type, above, old, limit });
+                const wrap = self.id();
+                try self.emit(&self.body, 166, &.{ self.bool_type, wrap, at_zero, above });
+                const next = self.id();
+                try self.emit(&self.body, 130, &.{ self.bits_type, next, old, try self.constant(.bits32, 1) });
+                return self.selectBits(wrap, limit, next);
+            },
+            .ds_mskor_b32 => {
+                // (old & ~DATA0) | DATA1. Not an atomic OR: DATA0 is a clear mask.
+                const keep = self.id();
+                try self.emit(&self.body, 200, &.{ self.bits_type, keep, try self.source(inst.src1, .bits32) });
+                const cleared = self.id();
+                try self.emit(&self.body, 199, &.{ self.bits_type, cleared, old, keep });
+                const result = self.id();
+                try self.emit(&self.body, 197, &.{ self.bits_type, result, cleared, try self.source(inst.src2, .bits32) });
+                return result;
+            },
+            else => return Error.UnsupportedOpcode,
+        }
+    }
+
+    /// One 32-lane half of a ballot. Wave64 cannot use a 32-wide subgroup op,
+    /// so it ballots through the guest wave scratch. Every lane must reach
+    /// that ballot: it is not legal inside a divergent branch.
+    fn ballotHalf(self: *Builder, predicate: u32, lane: u32) Error!u32 {
+        const half = try self.shiftRightBits(lane, 5);
+        if (self.wave64_workgroup) {
+            const mask = try self.waveBallot(predicate);
+            return self.selectBits(try self.isNonZero(half), mask[1], mask[0]);
+        }
+        const ballot_type = try self.ensureVec4(.bits32);
+        const ballot = self.id();
+        try self.emit(&self.body, 339, &.{ ballot_type, ballot, try self.constant(.bits32, 3), predicate });
+        const word = self.id();
+        try self.emit(&self.body, 77, &.{ self.bits_type, word, ballot, half }); // OpVectorExtractDynamic
+        return word;
+    }
+
+    fn shuffleLaneBits(self: *Builder, value: u32, source_lane: u32) Error!u32 {
+        if (self.wave64_workgroup) return self.waveShuffle(value, source_lane);
+        const result = self.id();
+        try self.emit(&self.body, 345, &.{
+            self.bits_type,
+            result,
+            try self.constant(.bits32, 3),
+            value,
+            source_lane,
+        });
+        return result;
+    }
+
+    /// DS_PERMUTE / DS_BPERMUTE move a VGPR between lanes of one 32-lane half.
+    /// They do not address LDS. GDS forms are a different opcode.
+    fn dsPermute(self: *Builder, inst: instruction.Instruction, backward: bool) Error!void {
+        if (inst.gds or inst.memory_offset < 0) return Error.UnsupportedBufferAddressing;
+        const data = try self.source(inst.src1, .bits32);
+        var address = try self.source(inst.src0, .bits32);
+        if (inst.memory_offset != 0) {
+            address = try self.addBits(address, try self.constant(.bits32, @intCast(inst.memory_offset)));
+        }
+        const lane = if (self.wave64_workgroup) try self.currentLaneId() else try self.subgroupLocalInvocationId();
+        // Read EXEC before any shuffle. A wave barrier invalidates a predicate
+        // created on the far side of it, and an inactive source lane returns 0.
+        const enabled = try self.laneEnabled();
+        const local = try self.andBits(lane, 31);
+        const base = try self.andBits(lane, ~@as(u32, 31));
+        if (backward) {
+            const index = try self.andBits(try self.shiftRightBits(address, 2), 31);
+            const target = self.id();
+            try self.emit(&self.body, 197, &.{ self.bits_type, target, base, index });
+            var active_bits: ?u32 = null;
+            if (enabled) |predicate| {
+                const bits = self.id();
+                try self.emit(&self.body, 169, &.{
+                    self.bits_type,
+                    bits,
+                    predicate,
+                    try self.constant(.bits32, 1),
+                    try self.constant(.bits32, 0),
+                });
+                active_bits = bits;
+            }
+            const shuffled = try self.shuffleLaneBits(data, target);
+            const result = if (active_bits) |bits| blk: {
+                const source_bits = try self.shuffleLaneBits(bits, target);
+                const live = try self.isNonZero(source_bits);
+                break :blk try self.selectBits(live, shuffled, try self.constant(.bits32, 0));
+            } else shuffled;
+            try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+            return;
+        }
+
+        var writers = if (enabled) |predicate|
+            try self.ballotHalf(predicate, lane)
+        else
+            try self.constant(.bits32, 0xffff_ffff);
+        inline for (0..5) |bit| {
+            const address_bit = try self.andBits(address, @as(u32, 1) << (bit + 2));
+            const mask = try self.ballotHalf(try self.isNonZero(address_bit), lane);
+            const complement = self.id();
+            try self.emit(&self.body, 200, &.{ self.bits_type, complement, mask });
+            // Match this lane's bit inside the 32-lane half, not the full id.
+            const lane_bit = try self.andBits(local, @as(u32, 1) << bit);
+            const selected = try self.selectBits(try self.isNonZero(lane_bit), mask, complement);
+            writers = try self.andIds(writers, selected);
+        }
+        const active = try self.isNonZero(writers);
+        const msb = self.id();
+        try self.emit(&self.body, 12, &.{ self.bits_type, msb, self.ensureGlslStd450(), 75, writers }); // FindUMsb
+        const indexed = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, indexed, base, try self.andBits(msb, 31) });
+        // FindUMsb(0) is all-ones. Shuffle from this lane instead, then drop it.
+        const chosen = try self.selectBits(active, indexed, lane);
+        const shuffled = try self.shuffleLaneBits(data, chosen);
+        const result = try self.selectBits(active, shuffled, try self.constant(.bits32, 0));
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
     fn controlBarrier(self: *Builder) Error!void {
@@ -10414,7 +10735,7 @@ const Builder = struct {
         }
         if (self.synchronize_wave64_lds and source_inst.family == .ds and !source_inst.gds) {
             switch (source_inst.opcode) {
-                .ds_swizzle_b32, .ds_append, .ds_consume => {},
+                .ds_swizzle_b32, .ds_append, .ds_consume, .ds_permute_b32, .ds_bpermute_b32 => {},
                 else => try self.controlBarrier(),
             }
         }
@@ -10881,6 +11202,12 @@ const Builder = struct {
             .ds_read2st64_b32 => try self.dsReadPair(inst),
             .ds_consume => try self.dsAppendConsume(inst, false),
             .ds_ordered_count => try self.dsOrderedCount(inst),
+            .ds_inc_u32, .ds_inc_rtn_u32, .ds_dec_u32, .ds_dec_rtn_u32, .ds_mskor_b32 => try self.dsAtomicUpdate(inst),
+            .ds_write_b8_d16_hi => try self.dsWriteD16Hi(inst, 8),
+            .ds_write_b16_d16_hi => try self.dsWriteD16Hi(inst, 16),
+            .ds_read_u16_d16_hi => try self.dsReadU16D16Hi(inst),
+            .ds_permute_b32 => try self.dsPermute(inst, false),
+            .ds_bpermute_b32 => try self.dsPermute(inst, true),
             .flat_load_ubyte => try self.flatLoadSubword(inst, 8, false),
             .flat_load_sbyte => try self.flatLoadSubword(inst, 8, true),
             .flat_load_ushort => try self.flatLoadSubword(inst, 16, false),
@@ -12400,6 +12727,13 @@ fn opcodeUsesWritePredicate(opcode: isa.Opcode) bool {
         .ds_append,
         .ds_consume,
         .ds_ordered_count,
+        .ds_inc_u32,
+        .ds_inc_rtn_u32,
+        .ds_dec_u32,
+        .ds_dec_rtn_u32,
+        .ds_mskor_b32,
+        .ds_write_b8_d16_hi,
+        .ds_write_b16_d16_hi,
         .ds_add_u32,
         .ds_add_u64,
         .ds_sub_u32,
@@ -12454,6 +12788,7 @@ fn translateInstructions(
     var uses_gds = false;
     var scans_wave_mask = false;
     var uses_lds = false;
+    var uses_wave_permute = false;
     for (effective.ngg_lds_exports) |ngg_export| {
         if (effective.stage == .vertex and effective.vertex_parameter_sources.len == 0 and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
             effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
@@ -12466,8 +12801,10 @@ fn translateInstructions(
             if (constantWaveLane(candidate.src1)) |lane| cross_half_read = cross_half_read or lane >= 32;
         }
         uses_gds = uses_gds or candidate.gds;
+        const lane_permute = candidate.opcode == .ds_permute_b32 or candidate.opcode == .ds_bpermute_b32;
+        uses_wave_permute = uses_wave_permute or lane_permute;
         uses_lds = uses_lds or (candidate.family == .ds and !candidate.gds and
-            candidate.opcode != .ds_swizzle_b32);
+            candidate.opcode != .ds_swizzle_b32 and !lane_permute);
         scans_wave_mask = scans_wave_mask or candidate.opcode == .s_bcnt1_i32_b64 or
             candidate.opcode == .s_ff1_i32_b64;
         if (candidate.dst.kind == .exec_lo or candidate.dst.kind == .exec_hi or
@@ -12487,6 +12824,8 @@ fn translateInstructions(
             candidate.opcode == .v_permlane16_b32 or candidate.opcode == .v_permlanex16_b32 or
             candidate.opcode == .v_mbcnt_lo_u32_b32 or candidate.opcode == .v_mbcnt_hi_u32_b32 or
             candidate.opcode == .ds_swizzle_b32 or
+            candidate.opcode == .ds_permute_b32 or
+            candidate.opcode == .ds_bpermute_b32 or
             candidate.src0.dpp or candidate.src1.dpp or candidate.src2.dpp)
         {
             effective.uses_lane_identity = true;
@@ -12504,12 +12843,12 @@ fn translateInstructions(
         // reference implementation, so a legitimate DS access is not rejected
         // before the shader can run.
         if (effective.stage == .compute and effective.workgroup_memory_size_bytes == 0 and
-            candidate.family == .ds and !candidate.gds)
+            candidate.family == .ds and !candidate.gds and !lane_permute)
         {
             effective.workgroup_memory_size_bytes = 4096;
         }
         if (effective.stage != .compute and effective.private_memory_size_bytes == 0 and
-            candidate.family == .ds and !candidate.gds)
+            candidate.family == .ds and !candidate.gds and !lane_permute)
         {
             // Graphics stages cannot expose SPIR-V Workgroup storage, but
             // compiler-generated spill/fill and mesh staging still use the DS
@@ -12563,7 +12902,7 @@ fn translateInstructions(
     // boundary. Keep scalar branches uniform across the complete guest wave
     // so every invocation reaches the rendezvous before each LDS access.
     const single_wave_lds = invocation_count == 64 and uses_lds;
-    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and (cross_half_read or uses_gds or single_wave_mask_scan or single_wave_lds) and (!uses_gds or invocation_count == 64)) {
+    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and (cross_half_read or uses_gds or single_wave_mask_scan or single_wave_lds or uses_wave_permute) and (!uses_gds or invocation_count == 64)) {
         effective.wave64_workgroup = true;
         effective.uses_lane_identity = true;
         effective.uses_execution_mask = true;
@@ -15842,6 +16181,176 @@ test "compute DS ordered count elects one lane for an add or swap and rejects mu
         .stage = .compute,
         .gds_storage = true,
     }));
+}
+
+test "compute DS increment decrement and masked or retry a compare exchange" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .ds,
+        .opcode = .ds_inc_u32,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src_count = 2,
+        .memory_offset = 4,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .ds,
+        .opcode = .ds_dec_rtn_u32,
+        .dst = .{ .kind = .vgpr, .reg = 2 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src_count = 2,
+        .memory_offset = 8,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 16,
+        .family = .ds,
+        .opcode = .ds_mskor_b32,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src2 = .{ .kind = .vgpr, .reg = 3 },
+        .src_count = 3,
+        .memory_offset = 12,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 24, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 230)); // OpAtomicCompareExchange
+    try std.testing.expect(containsOpcode(module.words, 246)); // OpLoopMerge
+    try std.testing.expect(containsOpcode(module.words, 174)); // unsigned increment wrap
+    try std.testing.expect(containsOpcode(module.words, 172)); // unsigned decrement wrap
+    try std.testing.expect(containsOpcode(module.words, 200)); // mask complement
+    try std.testing.expect(containsOpcode(module.words, 245)); // returned old value
+}
+
+test "graphics DS increment uses a private load modify store" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .ds,
+        .opcode = .ds_inc_u32,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src_count = 2,
+        .memory_offset = 4,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+    try std.testing.expect(containsOpcode(module.words, 174)); // OpUGreaterThanEqual
+    try std.testing.expect(!containsOpcode(module.words, 227)); // no OpAtomicLoad
+    try std.testing.expect(!containsOpcode(module.words, 230)); // no OpAtomicCompareExchange
+    try std.testing.expect(!containsOpcode(module.words, 234)); // no OpAtomicIAdd
+}
+
+test "DS permute shuffles a lane and rejects GDS" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .ds,
+        .opcode = .ds_permute_b32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .vgpr, .reg = 2 },
+        .src1 = .{ .kind = .vgpr, .reg = 3 },
+        .src_count = 2,
+        .memory_offset = 4,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 345)); // OpGroupNonUniformShuffle
+    try std.testing.expect(containsOpcode(module.words, 339)); // OpGroupNonUniformBallot
+    try std.testing.expect(containsOpcode(module.words, 12)); // FindUMsb
+
+    program.instructions.items[0].gds = true;
+    try std.testing.expectError(error.UnsupportedBufferAddressing, translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .gds_storage = true,
+    }));
+}
+
+test "64-thread DS permute uses the guest wave instead of a 32-lane shuffle" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .ds,
+        .opcode = .ds_bpermute_b32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .vgpr, .reg = 2 },
+        .src1 = .{ .kind = .vgpr, .reg = 3 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .local_size = .{ 64, 1, 1 },
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 224)); // OpControlBarrier
+    try std.testing.expect(!containsOpcode(module.words, 345)); // no 32-lane subgroup shuffle
+}
+
+test "DS D16 high read keeps the low half and the high write is a masked byte store" {
+    var read_program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer read_program.deinit(std.testing.allocator);
+    try read_program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .literal_constant, .value = 0x00aa_00bb },
+        .src_count = 1,
+    });
+    try read_program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .ds,
+        .opcode = .ds_read_u16_d16_hi,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src_count = 1,
+        .memory_offset = 8,
+    });
+    try read_program.instructions.append(std.testing.allocator, .{ .pc = 16, .opcode = .s_endpgm });
+    var read_module = try translate(std.testing.allocator, &read_program, .{ .stage = .fragment });
+    defer read_module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(read_module.words, 199)); // preserve low 16
+    try std.testing.expect(containsOpcode(read_module.words, 196)); // shift the loaded half
+    try std.testing.expect(std.mem.indexOfScalar(u32, read_module.words, 0xffff) != null);
+
+    var write_program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer write_program.deinit(std.testing.allocator);
+    try write_program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .ds,
+        .opcode = .ds_write_b16_d16_hi,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src_count = 2,
+        .memory_offset = 4,
+    });
+    try write_program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    var compute_write = try translate(std.testing.allocator, &write_program, .{ .stage = .compute });
+    defer compute_write.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(compute_write.words, 240)); // OpAtomicAnd
+    try std.testing.expect(containsOpcode(compute_write.words, 241)); // OpAtomicOr
+
+    var graphics_write = try translate(std.testing.allocator, &write_program, .{ .stage = .fragment });
+    defer graphics_write.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(graphics_write.words, 61)); // OpLoad
+    try std.testing.expect(containsOpcode(graphics_write.words, 197)); // OpBitwiseOr
+    try std.testing.expect(containsOpcode(graphics_write.words, 62)); // OpStore
+    try std.testing.expect(!containsOpcode(graphics_write.words, 241)); // no atomic on Private
 }
 
 test "compute DS access gets the hardware default LDS window when RSRC2 size is zero" {

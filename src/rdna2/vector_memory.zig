@@ -204,6 +204,8 @@ fn dsInfo(id: u32) ?MemoryInfo {
     return switch (id) {
         0x00 => .{ .opcode = .ds_add_u32 },
         0x01 => .{ .opcode = .ds_sub_u32 },
+        0x03 => .{ .opcode = .ds_inc_u32 },
+        0x04 => .{ .opcode = .ds_dec_u32 },
         0x05 => .{ .opcode = .ds_min_i32 },
         0x06 => .{ .opcode = .ds_max_i32 },
         0x07 => .{ .opcode = .ds_min_u32 },
@@ -211,6 +213,7 @@ fn dsInfo(id: u32) ?MemoryInfo {
         0x09 => .{ .opcode = .ds_and_b32 },
         0x0a => .{ .opcode = .ds_or_b32 },
         0x0b => .{ .opcode = .ds_xor_b32 },
+        0x0c => .{ .opcode = .ds_mskor_b32 },
         0x0d => .{ .opcode = .ds_write_b32 },
         0x0e => .{ .opcode = .ds_write2_b32, .words = 2 },
         0x0f => .{ .opcode = .ds_write2st64_b32, .words = 2 },
@@ -220,6 +223,8 @@ fn dsInfo(id: u32) ?MemoryInfo {
         0x1f => .{ .opcode = .ds_write_b16, .bits = 16 },
         0x20 => .{ .opcode = .ds_add_rtn_u32 },
         0x21 => .{ .opcode = .ds_sub_rtn_u32 },
+        0x23 => .{ .opcode = .ds_inc_rtn_u32 },
+        0x24 => .{ .opcode = .ds_dec_rtn_u32 },
         0x25 => .{ .opcode = .ds_min_rtn_i32 },
         0x26 => .{ .opcode = .ds_max_rtn_i32 },
         0x27 => .{ .opcode = .ds_min_rtn_u32 },
@@ -247,9 +252,14 @@ fn dsInfo(id: u32) ?MemoryInfo {
         0x76 => .{ .opcode = .ds_read_b64, .words = 2 },
         0x77 => .{ .opcode = .ds_read2_b64, .words = 4 },
         0x78 => .{ .opcode = .ds_read2st64_b64, .words = 4 },
+        0xa0 => .{ .opcode = .ds_write_b8_d16_hi, .bits = 8 },
+        0xa1 => .{ .opcode = .ds_write_b16_d16_hi, .bits = 16 },
         0xa6 => .{ .opcode = .ds_read_u16_d16, .bits = 16 },
+        0xa7 => .{ .opcode = .ds_read_u16_d16_hi, .bits = 16 },
         0xb0 => .{ .opcode = .ds_write_addtid_b32 },
         0xb1 => .{ .opcode = .ds_read_addtid_b32 },
+        0xb2 => .{ .opcode = .ds_permute_b32 },
+        0xb3 => .{ .opcode = .ds_bpermute_b32 },
         0xde => .{ .opcode = .ds_write_b96, .words = 3 },
         0xdf => .{ .opcode = .ds_write_b128, .words = 4 },
         0xfe => .{ .opcode = .ds_read_b96, .words = 3 },
@@ -297,8 +307,8 @@ pub fn decodeDs(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
     inst.src1 = try operand.decodeVectorGpr((word1 >> 8) & 0xff);
     inst.src2 = try operand.decodeVectorGpr((word1 >> 16) & 0xff);
     inst.src_count = switch (id) {
-        0x0e, 0x0f, 0x4e, 0x4f => 3,
-        0x0d, 0x00, 0x01, 0x05...0x0b, 0x12, 0x13, 0x1e, 0x1f, 0x20, 0x21, 0x25...0x2b, 0x2d, 0x40, 0x4a => 2,
+        0x0c, 0x0e, 0x0f, 0x4e, 0x4f => 3,
+        0x0d, 0x00, 0x01, 0x03, 0x04, 0x05...0x0b, 0x12, 0x13, 0x1e, 0x1f, 0x20, 0x21, 0x23, 0x24, 0x25...0x2b, 0x2d, 0x40, 0x4a, 0xa0, 0xa1, 0xb2, 0xb3 => 2,
         0xb0 => 1,
         0xb1, 0x3d, 0x3e => 0,
         else => 1,
@@ -701,6 +711,25 @@ test "DS swizzle consume and 64-bit pair encodings decode" {
     try std.testing.expectEqual(@as(u32, 2), ordered.src0.reg);
     try std.testing.expectEqual(@as(u32, 1), ordered.src_count);
     try std.testing.expectEqual(@as(u32, 3), ordered.dst.reg);
+    const inc = try decodeDs(0, &.{ (@as(u32, 0x03) << 18) | 0x20, 0x0100_0402 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_inc_u32, inc.opcode);
+    try std.testing.expectEqual(@as(u32, 2), inc.src_count);
+    try std.testing.expectEqual(@as(u32, 2), inc.src0.reg);
+    try std.testing.expectEqual(@as(u32, 4), inc.src1.reg);
+    const mskor = try decodeDs(0, &.{ (@as(u32, 0x0c) << 18), 0x0006_0503 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_mskor_b32, mskor.opcode);
+    try std.testing.expectEqual(@as(u32, 3), mskor.src_count);
+    try std.testing.expectEqual(@as(u32, 6), mskor.src2.reg);
+    const read_hi = try decodeDs(0, &.{ (@as(u32, 0xa7) << 18) | 8, 0x0900_0001 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_read_u16_d16_hi, read_hi.opcode);
+    try std.testing.expectEqual(@as(i32, 8), read_hi.memory_offset);
+    try std.testing.expectEqual(@as(u32, 1), read_hi.src_count);
+    const permute = try decodeDs(0, &.{ (@as(u32, 0xb2) << 18) | 4, 0x0200_0705 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_permute_b32, permute.opcode);
+    try std.testing.expectEqual(@as(u32, 2), permute.src_count);
+    try std.testing.expectEqual(@as(u32, 5), permute.src0.reg);
+    try std.testing.expectEqual(@as(u32, 7), permute.src1.reg);
+    try std.testing.expectEqual(@as(i32, 4), permute.memory_offset);
     const write2st = try decodeDs(0, &.{ (@as(u32, 0x0f) << 18) | (@as(u32, 2) << 8) | 1, 0x0002_0104 }, 0);
     try std.testing.expectEqual(isa.Opcode.ds_write2st64_b32, write2st.opcode);
     try std.testing.expectEqual(@as(i32, 256), write2st.memory_offset);
