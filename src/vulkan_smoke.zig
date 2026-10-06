@@ -7365,6 +7365,146 @@ fn runGdsWave64AppendProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("GDS wave64 append passed: dynamic sparse masks, high-only/empty EXEC, compact ranks and shared append/consume return values\n", .{});
 }
 
+fn runGdsOrderedCountProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    const Case = struct {
+        offset1: u32,
+        mask: u64,
+        counter: u32 = 0x104,
+        // The value written to active lanes, and the counter afterwards.
+        returned: u32,
+        after: u32,
+    };
+    // M0 = 0x0103_0003: GDS base 0x100 (the low two bits are dropped), wave
+    // ID 3. OFFSET0 = 7 names dword 1, so the counter lives at 0x104. Each
+    // update uses ADDR = lane + 1 from the first active lane; DATA0 holds a
+    // marker that must not be counted.
+    const cases = [_]Case{
+        .{ .offset1 = 0x00, .mask = ~@as(u64, 0), .returned = 0, .after = 1 },
+        .{ .offset1 = 0x00, .mask = @as(u64, 1) << 40, .returned = 1, .after = 42 },
+        .{ .offset1 = 0x00, .mask = 0, .returned = 42, .after = 42 },
+        .{ .offset1 = 0x10, .mask = 0xffff_ffff_0000_0000, .returned = 42, .after = 33 },
+        .{ .offset1 = 0x13, .mask = 0, .returned = 33, .after = 33 },
+        .{ .offset1 = 0x00, .mask = (@as(u64, 1) << 3) | (@as(u64, 1) << 50), .returned = 33, .after = 37 },
+        // Shader type 1 (pixel) banks the counter by the packer in M0[3:0].
+        .{ .offset1 = 0x04, .mask = ~@as(u64, 0), .counter = 0x110, .returned = 0, .after = 1 },
+    };
+    const marker: u32 = 0xdead_beef;
+    var counters = [_]u32{ 0, 0 };
+    for (cases, 0..) |case, case_index| {
+        // COMPUTE_PGM_LO holds the address in 256-byte units.
+        const program: u32 = 0x1000 + @as(u32, @intCast(case_index)) * 0x100;
+        const code = [_]u32{
+            0xbefc_0300, // s_mov_b32 m0, s0
+            vop1(1, 3, 1), // v3 = marker, kept by lanes outside EXEC
+            vop2Source(0x25, 2, 129, 0), // v2 = lane + 1
+            0xbefe_0402, // EXEC = s2:s3
+            0xd8fe_0000 | (case.offset1 << 8) | 7, 0x0300_0302, // ds_ordered_count v3, v2 gds
+            0xbefe_04c1, // EXEC = all lanes, to store every lane's v3
+            0xe070_2000, 0x8001_0300, // buffer_store_dword v3, v0 idxen, s[4:7]
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(program + @as(u32, @intCast(index)) * 4, word);
+        try state.writeRegister(.shader, compute.programRegisterBase(), program >> 8);
+        const destination: u32 = 0x10000 + @as(u32, @intCast(case_index)) * 0x1000;
+        for (0..64) |word| guest.word(destination + @as(u32, @intCast(word)) * 4, 0xcccc_cccc);
+        for ([_]u32{ 0x0103_0003, marker, @truncate(case.mask), @truncate(case.mask >> 32), destination, 4 << 16, 64, 0 }, 0..) |word, index| {
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        }
+        const report = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expect(report.spirv_words != 0);
+
+        var output: [256]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(destination, &output);
+        for (0..64) |lane| {
+            const active = case.mask & (@as(u64, 1) << @intCast(lane)) != 0;
+            const expected = if (active) case.returned else marker;
+            const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
+            if (actual != expected) std.debug.print("ordered count case={d} lane={d}: expected={x} actual={x}\n", .{ case_index, lane, expected, actual });
+            try std.testing.expectEqual(expected, actual);
+        }
+        counters[if (case.counter == 0x104) 0 else 1] = case.after;
+        const gds = try renderer.readbackGdsStorage();
+        for (0..gds.len / 4) |index| {
+            const expected: u32 = switch (index * 4) {
+                0x104 => counters[0],
+                0x110 => counters[1],
+                else => 0,
+            };
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, gds[index * 4 ..][0..4], .little));
+        }
+    }
+    try runGdsOrderedCountWave32(allocator);
+    std.debug.print("GDS ordered count passed: one add/swap per wave32/wave64 from the first active lane's ADDR, full/high/sparse/empty EXEC, inactive lanes kept, pixel packer bank\n", .{});
+}
+
+/// The same updates from a guest wave32, which lowers through one host
+/// subgroup ballot instead of the wave64 pair. Only DISPATCH_DIRECT carries
+/// the initiator's CS_W32_EN bit.
+fn runGdsOrderedCountWave32(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const Case = struct { offset1: u32, mask: u32, returned: u32, after: u32 };
+    const cases = [_]Case{
+        .{ .offset1 = 0x00, .mask = 0xffff_ffff, .returned = 0, .after = 1 },
+        .{ .offset1 = 0x00, .mask = 1 << 20, .returned = 1, .after = 22 },
+        .{ .offset1 = 0x00, .mask = 0, .returned = 22, .after = 22 },
+        .{ .offset1 = 0x10, .mask = 0xffff_0000, .returned = 22, .after = 17 },
+        .{ .offset1 = 0x00, .mask = (1 << 3) | (1 << 29), .returned = 17, .after = 21 },
+    };
+    const marker: u32 = 0xdead_beef;
+    for (cases, 0..) |case, case_index| {
+        const program: u32 = 0x1000 + @as(u32, @intCast(case_index)) * 0x100;
+        const code = [_]u32{
+            0xbefc_0300, // s_mov_b32 m0, s0
+            vop1(1, 3, 1), // v3 = marker
+            vop2Source(0x25, 2, 129, 0), // v2 = lane + 1
+            0xbefe_0402, // EXEC = s2:s3 (EXEC_LO in wave32)
+            0xd8fe_0000 | (case.offset1 << 8) | 7, 0x0300_0302, // ds_ordered_count v3, v2 gds
+            0xbefe_04c1, // EXEC = all lanes
+            0xe070_2000, 0x8001_0300, // buffer_store_dword v3, v0 idxen, s[4:7]
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(program + @as(u32, @intCast(index)) * 4, word);
+        const destination: u32 = 0x10000 + @as(u32, @intCast(case_index)) * 0x1000;
+        for (0..32) |word| guest.word(destination + @as(u32, @intCast(word)) * 4, 0xcccc_cccc);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, program >> 8);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x207, 32);
+        try state.writeRegister(.shader, 0x208, 1);
+        try state.writeRegister(.shader, 0x209, 1);
+        try state.writeRegister(.shader, 0x213, 8 << 1);
+        for ([_]u32{ 0x0103_0003, marker, case.mask, 0, destination, 4 << 16, 32, 0 }, 0..) |word, index| {
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        }
+        const packet_words = [_]u32{ 0xc003_1502, 1, 1, 1, 0x8041 };
+        var walker = gpu.pm4.Walker.init(&packet_words);
+        try std.testing.expect(backend.vtable.dispatch.?(backend.context, &state, (try walker.next()).?));
+        if (renderer.last_dispatch_error) |err| return err;
+
+        var output: [128]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(destination, &output);
+        for (0..32) |lane| {
+            const active = case.mask & (@as(u32, 1) << @intCast(lane)) != 0;
+            const expected = if (active) case.returned else marker;
+            const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
+            if (actual != expected) std.debug.print("ordered count wave32 case={d} lane={d}: expected={x} actual={x}\n", .{ case_index, lane, expected, actual });
+            try std.testing.expectEqual(expected, actual);
+        }
+        try std.testing.expectEqual(case.after, std.mem.readInt(u32, (try renderer.readbackGdsStorage())[0x104..][0..4], .little));
+    }
+}
+
 fn runGdsResidentProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -13361,6 +13501,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds")) {
         try runGdsAtomicProbe(allocator);
         try runGdsWave64AppendProbe(allocator);
+        try runGdsOrderedCountProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-memory")) {

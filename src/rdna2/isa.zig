@@ -674,6 +674,7 @@ pub const Opcode = enum {
     ds_read_addtid_b32,
     ds_append,
     ds_consume,
+    ds_ordered_count,
 
     // Images and exports.
     image_load,

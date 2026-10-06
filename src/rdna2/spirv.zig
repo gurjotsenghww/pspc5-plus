@@ -7704,6 +7704,103 @@ const Builder = struct {
         }); // OpMemoryBarrier
     }
 
+    /// DS_ORDERED_COUNT adds to or swaps one GDS ordered-count counter once
+    /// per guest wave and returns its previous value. The operand is the first
+    /// active lane's ADDR register, not DATA0. M0[31:16] is the GDS base and
+    /// OFFSET0 the counter's dword; unlike APPEND, M0[15:0] is the wave's
+    /// ordered ID rather than a segment size. OFFSET1 holds WAVE_RELEASE and
+    /// WAVE_DONE [1:0], the shader type [3:2], the operation [5:4] and, on
+    /// GFX10, the dword count minus one [7:6].
+    ///
+    /// Hardware also applies the updates in wave-launch order. That ordering
+    /// is not modelled: concurrent waves receive disjoint but unordered
+    /// results, as DS_APPEND gives them.
+    fn dsOrderedCount(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (self.stage != .compute or !inst.gds or inst.memory_offset < 0) {
+            return Error.UnsupportedBufferAddressing;
+        }
+        const offset: u32 = @intCast(inst.memory_offset);
+        const offset1 = (offset >> 8) & 0xff;
+        const operation = (offset1 >> 4) & 3;
+        if (operation > 1 or offset1 >> 6 != 0) return Error.UnsupportedOpcode;
+
+        const m0 = try self.source(.{ .kind = .m0 }, .bits32);
+        var byte_address = try self.addBits(
+            try self.andBits(try self.shiftRightBits(m0, 16), 0xfffc),
+            try self.constant(.bits32, offset & 0xfc),
+        );
+        if ((offset1 >> 2) & 3 == 1) {
+            // Pixel-shader counters are banked per packer, named by M0[3:0].
+            const packer = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, packer, try self.andBits(m0, 0xf), try self.constant(.bits32, 2) }); // OpShiftLeftLogical
+            byte_address = try self.addBits(byte_address, packer);
+        }
+        const access = try self.gdsAccess(try self.shiftRightBits(byte_address, 2));
+        const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
+
+        const scope = try self.constant(.bits32, 3); // ScopeSubgroup
+        var first_lane: u32 = undefined;
+        if (self.wave64_workgroup) {
+            // One update for the whole guest wave, not one per host wave32.
+            const mask = try self.waveBallot(predicate);
+            const low_first = try self.waveFirstBit(mask[0]);
+            const high_first = try self.addBits(try self.waveFirstBit(mask[1]), try self.constant(.bits32, 32));
+            first_lane = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, first_lane, try self.isNonZero(mask[0]), low_first, high_first });
+        } else {
+            const ballot_type = try self.ensureVec4(.bits32);
+            const ballot = self.id();
+            try self.emit(&self.body, 339, &.{ ballot_type, ballot, scope, predicate }); // OpGroupNonUniformBallot
+            first_lane = self.id();
+            try self.emit(&self.body, 343, &.{ self.bits_type, first_lane, scope, ballot }); // FindLSB
+        }
+        const lane = if (self.wave64_workgroup) try self.currentLaneId() else try self.subgroupLocalInvocationId();
+        const lane_is_first = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, lane_is_first, lane, first_lane }); // OpIEqual
+        const elected = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, elected, predicate, lane_is_first }); // OpLogicalAnd
+        const value = try self.source(inst.src0, .bits32);
+
+        // Unlike APPEND's add of zero from the other lanes, a swap must not
+        // run in them at all, so only the elected lane enters the atomic.
+        const taken = self.id();
+        const skipped = self.id();
+        const merge = self.id();
+        try self.emit(&self.body, 247, &.{ merge, 0 }); // OpSelectionMerge
+        try self.emit(&self.body, 250, &.{ elected, taken, skipped }); // OpBranchConditional
+        try self.emit(&self.body, 248, &.{taken});
+        const updated = self.id();
+        try self.emit(&self.body, if (operation == 1) 229 else 234, &.{
+            self.bits_type,
+            updated,
+            access.pointer,
+            try self.constant(.bits32, 1), // ScopeDevice
+            try self.constant(.bits32, 0), // MemorySemanticsNone
+            value,
+        }); // OpAtomicExchange / OpAtomicIAdd
+        try self.emit(&self.body, 249, &.{merge});
+        try self.emit(&self.body, 248, &.{skipped});
+        try self.emit(&self.body, 249, &.{merge});
+        try self.emit(&self.body, 248, &.{merge});
+        const previous = self.id();
+        try self.emit(&self.body, 245, &.{ self.bits_type, previous, updated, taken, try self.constant(.bits32, 0), skipped }); // OpPhi
+
+        const wave_value = if (self.wave64_workgroup)
+            try self.waveShuffle(previous, first_lane)
+        else shuffle: {
+            const result = self.id();
+            try self.emit(&self.body, 345, &.{ self.bits_type, result, scope, previous, first_lane });
+            break :shuffle result;
+        };
+        // An empty EXEC elects no lane: the counter is untouched and, as for
+        // any DS return, only active lanes are written.
+        try self.destination(inst.dst, .{ .id = wave_value, .value_type = .bits32 });
+        try self.emit(&self.body, 225, &.{
+            try self.constant(.bits32, 1),
+            try self.constant(.bits32, 0x48),
+        }); // OpMemoryBarrier
+    }
+
     fn loadWorkgroupWord(self: *Builder, byte_address: u32) Error!u32 {
         const access = try self.workgroupAccess(byte_address);
         const loaded = self.id();
@@ -10783,6 +10880,7 @@ const Builder = struct {
             .ds_write2st64_b32 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWritePair(inst),
             .ds_read2st64_b32 => try self.dsReadPair(inst),
             .ds_consume => try self.dsAppendConsume(inst, false),
+            .ds_ordered_count => try self.dsOrderedCount(inst),
             .flat_load_ubyte => try self.flatLoadSubword(inst, 8, false),
             .flat_load_sbyte => try self.flatLoadSubword(inst, 8, true),
             .flat_load_ushort => try self.flatLoadSubword(inst, 16, false),
@@ -12301,6 +12399,7 @@ fn opcodeUsesWritePredicate(opcode: isa.Opcode) bool {
         .ds_write_addtid_b32,
         .ds_append,
         .ds_consume,
+        .ds_ordered_count,
         .ds_add_u32,
         .ds_add_u64,
         .ds_sub_u32,
@@ -15684,6 +15783,65 @@ test "compute DS append and consume reserve one persistent GDS range per subgrou
         }
         word_index += word_count;
     } else return error.TestExpectedEqual;
+}
+
+test "compute DS ordered count elects one lane for an add or swap and rejects multi-dword updates" {
+    const Case = struct { offset1: u32, atomic: u16 };
+    for ([_]Case{
+        .{ .offset1 = 0x00, .atomic = 234 }, // add: OpAtomicIAdd
+        .{ .offset1 = 0x13, .atomic = 229 }, // swap with release/done: OpAtomicExchange
+    }) |case| {
+        var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+        defer program.deinit(std.testing.allocator);
+        try program.instructions.append(std.testing.allocator, .{
+            .pc = 0,
+            .opcode = .s_mov_b32,
+            .dst = .{ .kind = .m0 },
+            .src0 = .{ .kind = .literal_constant, .value = 0x0100_0003 }, // base 0x100, wave ID 3
+            .src_count = 1,
+        });
+        try program.instructions.append(std.testing.allocator, .{
+            .pc = 8,
+            .family = .ds,
+            .opcode = .ds_ordered_count,
+            .dst = .{ .kind = .vgpr, .reg = 3 },
+            .src0 = .{ .kind = .vgpr, .reg = 2 },
+            .src_count = 1,
+            .memory_offset = @intCast((case.offset1 << 8) | 4),
+            .gds = true,
+        });
+        try program.instructions.append(std.testing.allocator, .{ .pc = 16, .opcode = .s_endpgm });
+
+        var module = try translate(std.testing.allocator, &program, .{
+            .stage = .compute,
+            .gds_storage = true,
+        });
+        defer module.deinit(std.testing.allocator);
+        try std.testing.expect(containsOpcode(module.words, case.atomic));
+        try std.testing.expect(containsOpcode(module.words, 339)); // OpGroupNonUniformBallot
+        try std.testing.expect(containsOpcode(module.words, 343)); // OpGroupNonUniformBallotFindLSB
+        try std.testing.expect(containsOpcode(module.words, 250)); // only the elected lane branches in
+        try std.testing.expect(containsOpcode(module.words, 245)); // OpPhi of the returned value
+        try std.testing.expect(containsOpcode(module.words, 345)); // OpGroupNonUniformShuffle
+    }
+
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .ds,
+        .opcode = .ds_ordered_count,
+        .dst = .{ .kind = .vgpr, .reg = 3 },
+        .src0 = .{ .kind = .vgpr, .reg = 2 },
+        .src_count = 1,
+        .memory_offset = (0x40 << 8) | 4, // two dwords
+        .gds = true,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    try std.testing.expectError(error.UnsupportedOpcode, translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .gds_storage = true,
+    }));
 }
 
 test "compute DS access gets the hardware default LDS window when RSRC2 size is zero" {

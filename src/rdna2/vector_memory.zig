@@ -238,6 +238,7 @@ fn dsInfo(id: u32) ?MemoryInfo {
         0x3c => .{ .opcode = .ds_read_ushort, .bits = 16 },
         0x3d => .{ .opcode = .ds_consume },
         0x3e => .{ .opcode = .ds_append },
+        0x3f => .{ .opcode = .ds_ordered_count },
         0x40 => .{ .opcode = .ds_add_u64, .words = 2 },
         0x4a => .{ .opcode = .ds_or_b64, .words = 2 },
         0x4d => .{ .opcode = .ds_write_b64, .words = 2 },
@@ -691,6 +692,15 @@ test "DS swizzle consume and 64-bit pair encodings decode" {
     try std.testing.expectEqual(isa.Opcode.ds_swizzle_b32, swizzle.opcode);
     const consume = try decodeDs(0, &.{ (@as(u32, 0x3d) << 18), 0x0800_0000 }, 0);
     try std.testing.expectEqual(isa.Opcode.ds_consume, consume.opcode);
+    // ds_ordered_count v3, v2 offset0:7 offset1:0x10 gds: the count comes from
+    // ADDR, and both offset bytes stay packed for the translator.
+    const ordered = try decodeDs(0, &.{ (@as(u32, 0x3f) << 18) | (1 << 17) | 0x1007, 0x0300_0902 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_ordered_count, ordered.opcode);
+    try std.testing.expect(ordered.gds);
+    try std.testing.expectEqual(@as(i32, 0x1007), ordered.memory_offset);
+    try std.testing.expectEqual(@as(u32, 2), ordered.src0.reg);
+    try std.testing.expectEqual(@as(u32, 1), ordered.src_count);
+    try std.testing.expectEqual(@as(u32, 3), ordered.dst.reg);
     const write2st = try decodeDs(0, &.{ (@as(u32, 0x0f) << 18) | (@as(u32, 2) << 8) | 1, 0x0002_0104 }, 0);
     try std.testing.expectEqual(isa.Opcode.ds_write2st64_b32, write2st.opcode);
     try std.testing.expectEqual(@as(i32, 256), write2st.memory_offset);

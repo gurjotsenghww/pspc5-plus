@@ -371,6 +371,7 @@ fn classify(inst: instruction.Instruction) struct { Operation, ValueType } {
         .ds_swizzle_b32,
         .ds_consume,
         .ds_append,
+        .ds_ordered_count,
         .ds_write_addtid_b32,
         .ds_read_addtid_b32,
         .s_load_dword,
