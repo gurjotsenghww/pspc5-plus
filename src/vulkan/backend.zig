@@ -2997,6 +2997,10 @@ const FrameProfile = struct {
     compute_tail_ns: u64 = 0,
     failed_draws: u64 = 0,
     failed_dispatches: u64 = 0,
+    /// Largest colour target this frame that is not the 3840×2160 display resource.
+    scene_target_width: u32 = 0,
+    scene_target_height: u32 = 0,
+    display_target_uses: u32 = 0,
     unsupported_compute_programs: u64 = 0,
     unresolved_storage_resources: u64 = 0,
     null_storage_resources: u64 = 0,
@@ -15958,7 +15962,23 @@ pub const Renderer = struct {
         _ = self.image_aliases.markWrite(cached.alias_token);
     }
 
+    fn noteSceneColorSize(self: *Renderer, width: u32, height: u32) void {
+        if (width == 0 or height == 0) return;
+        // Display buffers stay 3840×2160 after the output class is chosen.
+        // The next-smaller target is the scene resolution the title actually drew.
+        if (width >= 3840 and height >= 2160) {
+            self.frame_profile.display_target_uses +|= 1;
+            return;
+        }
+        const area = @as(u64, width) * @as(u64, height);
+        const current = @as(u64, self.frame_profile.scene_target_width) * @as(u64, self.frame_profile.scene_target_height);
+        if (area <= current) return;
+        self.frame_profile.scene_target_width = width;
+        self.frame_profile.scene_target_height = height;
+    }
+
     fn acquireRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!usize {
+        self.noteSceneColorSize(target.layout.width, target.layout.height);
         var candidates = self.render_target_address_index.candidatesBy(self.render_targets.items, target.descriptor.address, CachedRenderTarget.address);
         while (candidates.next()) |index| {
             const cached_snapshot = self.render_targets.items[index];
@@ -30346,6 +30366,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu gaps] flip={d} draw_failures={d} dispatch_failures={d} unsupported_compute={d} storage_unresolved={d} storage_null={d} storage_rejected={d}\n",
                 .{ self.flip_callbacks, profile.failed_draws, profile.failed_dispatches, profile.unsupported_compute_programs, profile.unresolved_storage_resources, profile.null_storage_resources, profile.rejected_storage_resources },
+            );
+            std.debug.print(
+                "[gpu scene] flip={d} largest_internal={d}x{d} display_binds={d}\n",
+                .{ self.flip_callbacks, profile.scene_target_width, profile.scene_target_height, profile.display_target_uses },
             );
             if (profile.feedback_snapshots != 0) std.debug.print(
                 "[gpu feedback] flip={d} snapshots={d} copy_kib={d}\n",

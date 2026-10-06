@@ -722,4 +722,13 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&tests.step);
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
+
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
+    const hle_tests = b.addTest(.{
+        .root_module = hle,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
+    });
+    const run_hle_tests = b.addRunArtifact(hle_tests);
+    const test_hle_step = b.step("test-hle", "Run firmware library tests");
+    test_hle_step.dependOn(&run_hle_tests.step);
 }

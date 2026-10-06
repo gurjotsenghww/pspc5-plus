@@ -1217,10 +1217,20 @@ const VideoOutFlipStatus = extern struct {
     reserved3: [7]u64 = [_]u64{0} ** 7,
 };
 
+const video_out_error_unsupported_output_mode: i32 = @bitCast(@as(u32, 0x8029_0016));
+const video_out_error_unavailable_output_mode: i32 = @bitCast(@as(u32, 0x8029_0019));
+// SCE_VIDEO_OUT_OUTPUT_MODE_*. Anything else is an unsupported mode, not a
+// higher resolution or a ray-tracing display.
+const video_out_output_mode_default: u64 = 1;
+const video_out_output_mode_119_88hz: u64 = 0xF;
+// SCE_VIDEO_OUT_REFRESH_RATE_* codes. The status field is not a frequency.
+const video_out_refresh_59_94hz: u64 = 3;
+const video_out_output_options_bytes: usize = 64;
+
 const VideoOutOutputStatus = extern struct {
     resolution: u32 = 1,
     dynamic_range: u32 = 1,
-    refresh_rate: u64 = 60_000,
+    refresh_rate: u64 = video_out_refresh_59_94hz,
     flags: u64 = 0,
     reserved: [3]u64 = .{ 0, 0, 0 },
 };
@@ -1447,15 +1457,115 @@ fn videoOutGetEventData(event: ?*const kernel_event_queue.Event, out_data: ?*u64
     return errno.ok;
 }
 
+var output_status_logged = false;
+var logged_output_modes: [8]u64 = @splat(0xffff_ffff_ffff_ffff);
+var logged_output_mode_count: usize = 0;
+
+fn rememberOutputMode(mode: u64, result: i32) void {
+    for (logged_output_modes[0..logged_output_mode_count]) |seen| {
+        if (seen == mode) return;
+    }
+    if (logged_output_mode_count == logged_output_modes.len) return;
+    logged_output_modes[logged_output_mode_count] = mode;
+    logged_output_mode_count += 1;
+    std.debug.print("[video out] mode 0x{x} supported={d}\n", .{ mode, result });
+}
+
 fn videoOutGetOutputStatus(handle: i32, status: ?*VideoOutOutputStatus) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
     const output = status orelse return video_out_error_invalid_address;
-    output.* = .{ .resolution = video_out.outputResolutionClass() };
+    // Class 1 is HD. Refresh code 3 is 59.94 Hz, dynamic range 1 is SDR, and
+    // flags stay clear so a title does not treat the display as 120 Hz or HDR.
+    output.* = .{
+        .resolution = video_out.outputResolutionClass(),
+        .dynamic_range = 1,
+        .refresh_rate = video_out_refresh_59_94hz,
+        .flags = 0,
+    };
+    if (!output_status_logged) {
+        output_status_logged = true;
+        std.debug.print(
+            "[video out] status class={d} range={d} refresh={d} flags={d}\n",
+            .{ output.resolution, output.dynamic_range, output.refresh_rate, output.flags },
+        );
+    }
     return errno.ok;
 }
 
-fn videoOutIsOutputSupported(handle: i32, _: u64, _: ?*const anyopaque, _: ?*anyopaque, _: u64) callconv(abi.guest) i32 {
-    return if (validVideoHandle(handle)) 1 else video_out_error_invalid_handle;
+fn outputOptionsAreClear(options: ?*const anyopaque) bool {
+    const pointer = options orelse return true;
+    const bytes: [*]const u8 = @ptrCast(pointer);
+    for (bytes[0..video_out_output_options_bytes]) |byte| {
+        if (byte != 0) return false;
+    }
+    return true;
+}
+
+/// `true` is available, `false` is a known mode this display does not offer,
+/// and `null` is a mode the firmware does not recognize.
+fn outputModeAvailable(mode: u64) ?bool {
+    if (mode == video_out_output_mode_default) return true;
+    // 119.88 Hz is how titles discover 120 Hz, VRR and the higher-rate graphics
+    // modes. The reported output stays 1080p60, so that mode is recognized
+    // and unavailable rather than advertised.
+    if (mode == video_out_output_mode_119_88hz) return false;
+    return null;
+}
+
+fn videoOutIsOutputSupported(handle: i32, mode: u64, options: ?*const anyopaque, reserved_pointer: ?*anyopaque, reserved: u64) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    if (reserved_pointer != null or reserved != 0) return video_out_error_invalid_value;
+    if (!outputOptionsAreClear(options)) return video_out_error_invalid_option;
+    const available = outputModeAvailable(mode) orelse {
+        rememberOutputMode(mode, video_out_error_unsupported_output_mode);
+        return video_out_error_unsupported_output_mode;
+    };
+    const result: i32 = if (available) 1 else 0;
+    rememberOutputMode(mode, result);
+    return result;
+}
+
+fn videoOutConfigureOutput(handle: i32, mode: u64, options: ?*const anyopaque, reserved_pointer: ?*anyopaque, reserved: u64) callconv(abi.guest) i32 {
+    const supported = videoOutIsOutputSupported(handle, mode, options, reserved_pointer, reserved);
+    if (supported < 0) return supported;
+    if (supported == 0) return video_out_error_unavailable_output_mode;
+    return errno.ok;
+}
+
+test "1080p output is SDR 59.94 Hz and does not advertise 120 Hz or unknown modes" {
+    video_out.reset();
+    defer video_out.reset();
+    try std.testing.expect(video_out.open(0));
+
+    var status: VideoOutOutputStatus = undefined;
+    try std.testing.expectEqual(errno.ok, videoOutGetOutputStatus(video_out.primary_handle, &status));
+    try std.testing.expectEqual(@as(u32, 1), status.resolution);
+    try std.testing.expectEqual(@as(u32, 1), status.dynamic_range);
+    try std.testing.expectEqual(video_out_refresh_59_94hz, status.refresh_rate);
+    try std.testing.expectEqual(@as(u64, 0), status.flags);
+
+    video_out.configureOutputResolution(3840, 2160);
+    try std.testing.expectEqual(errno.ok, videoOutGetOutputStatus(video_out.primary_handle, &status));
+    try std.testing.expectEqual(@as(u32, 2), status.resolution);
+    try std.testing.expectEqual(video_out_refresh_59_94hz, status.refresh_rate);
+    video_out.configureOutputResolution(1920, 1080);
+
+    try std.testing.expectEqual(@as(i32, 1), videoOutIsOutputSupported(video_out.primary_handle, video_out_output_mode_default, null, null, 0));
+    try std.testing.expectEqual(@as(i32, 0), videoOutIsOutputSupported(video_out.primary_handle, video_out_output_mode_119_88hz, null, null, 0));
+    try std.testing.expectEqual(video_out_error_unsupported_output_mode, videoOutIsOutputSupported(video_out.primary_handle, 2, null, null, 0));
+    try std.testing.expectEqual(video_out_error_unsupported_output_mode, videoOutIsOutputSupported(video_out.primary_handle, 4, null, null, 0));
+    try std.testing.expectEqual(video_out_error_invalid_value, videoOutIsOutputSupported(video_out.primary_handle, video_out_output_mode_default, null, @ptrFromInt(1), 0));
+    try std.testing.expectEqual(video_out_error_invalid_value, videoOutIsOutputSupported(video_out.primary_handle, video_out_output_mode_default, null, null, 1));
+    try std.testing.expectEqual(video_out_error_invalid_handle, videoOutIsOutputSupported(0, video_out_output_mode_default, null, null, 0));
+
+    var options = [_]u8{0} ** video_out_output_options_bytes;
+    try std.testing.expectEqual(@as(i32, 1), videoOutIsOutputSupported(video_out.primary_handle, video_out_output_mode_default, &options, null, 0));
+    options[3] = 1;
+    try std.testing.expectEqual(video_out_error_invalid_option, videoOutIsOutputSupported(video_out.primary_handle, video_out_output_mode_default, &options, null, 0));
+
+    try std.testing.expectEqual(errno.ok, videoOutConfigureOutput(video_out.primary_handle, video_out_output_mode_default, null, null, 0));
+    try std.testing.expectEqual(video_out_error_unavailable_output_mode, videoOutConfigureOutput(video_out.primary_handle, video_out_output_mode_119_88hz, null, null, 0));
+    try std.testing.expectEqual(video_out_error_unsupported_output_mode, videoOutConfigureOutput(video_out.primary_handle, 4, null, null, 0));
 }
 
 fn videoOutGetEventId(event: ?*const @import("kernel_event_queue.zig").Event) callconv(abi.guest) i32 {
@@ -1624,7 +1734,7 @@ const video_out_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutGetEventData", .function = trace.wrap("sceVideoOutGetEventData", &videoOutGetEventData), .expect_id = "rWUTcKdkUzQ" },
     .{ .name = "sceVideoOutGetOutputStatus", .function = trace.wrap("sceVideoOutGetOutputStatus", &videoOutGetOutputStatus), .expect_id = "utPrVdxio-8" },
     .{ .name = "sceVideoOutIsOutputSupported", .function = trace.wrap("sceVideoOutIsOutputSupported", &videoOutIsOutputSupported), .expect_id = "Nv8c-Kb+DUM" },
-    .{ .name = "sceVideoOutConfigureOutput", .function = trace.wrap("sceVideoOutConfigureOutput", &videoHandleOption), .expect_id = "w0hLuNarQxY" },
+    .{ .name = "sceVideoOutConfigureOutput", .function = trace.wrap("sceVideoOutConfigureOutput", &videoOutConfigureOutput), .expect_id = "w0hLuNarQxY" },
     .{ .name = "sceVideoOutSetWindowModeMargins", .function = trace.wrap("sceVideoOutSetWindowModeMargins", &videoHandleOption), .expect_id = "MTxxrOCeSig" },
     .{ .name = "sceVideoOutVrrPegToFixedRate", .function = trace.wrap("sceVideoOutVrrPegToFixedRate", &videoHandleOption), .expect_id = "5tRaBjtdTzY" },
     .{ .name = "sceVideoOutVrrUnpegFromFixedRate", .function = trace.wrap("sceVideoOutVrrUnpegFromFixedRate", &videoHandleOption), .expect_id = "T4ucGB8CsnM" },

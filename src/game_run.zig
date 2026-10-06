@@ -347,9 +347,12 @@ fn run(init: std.process.Init) !bool {
             try stderr.flush();
             break :mode user_service.GamePresetPriority.game_default;
         };
-    } else |_| user_service.GamePresetPriority.game_default;
+    } else |_| user_service.GamePresetPriority.performance;
     user_service.configureGamePreset(game_preset);
-    try out.print("  Output  {d}x{d}, VideoOut class {d}; internal rendering is game-controlled\n", .{
+    // Unset PS5_GAME_PRESET matches the launcher: priority 1. Yotei stores
+    // that as internal mode 2, the 1080p preference without ray tracing.
+    // Output status reports HD, SDR and 59.94 Hz, and does not offer 120 Hz.
+    try out.print("  Output  {d}x{d}, VideoOut class {d}, SDR 59.94 Hz; 120 Hz modes are not offered\n", .{
         output_mode.width(), output_mode.height(), runtime.firmware.video_out.outputResolutionClass(),
     });
     try out.print("  Preset  {s}\n", .{render_preset.label()});
