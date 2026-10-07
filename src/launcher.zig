@@ -127,6 +127,12 @@ const Phrase = enum {
     status_log_copied,
     status_runner_missing,
     status_launch_failed,
+    launch_hint_policy,
+    launch_hint_antivirus,
+    launch_hint_access,
+    launch_hint_damaged,
+    launch_hint_generic,
+    launch_windows_error,
     status_launched,
     status_game_removed,
 };
@@ -337,6 +343,12 @@ fn tr(phrase: Phrase) []const u8 {
             .status_log_copied => "Log copied to the clipboard",
             .status_runner_missing => "game-run.exe was not found · run zig build first",
             .status_launch_failed => "Could not start game-run.exe",
+            .launch_hint_policy => "Windows Smart App Control or an application control policy blocked game-run.exe. Antivirus exclusions do not apply to it. To allow the emulator, open Windows Security → App & browser control → Smart App Control settings and turn it off. On some Windows versions it cannot be turned back on without reinstalling Windows.",
+            .launch_hint_antivirus => "Security software blocked or removed game-run.exe. Restore it from quarantine or extract the release archive again, and add the emulator folder to the exclusions of every security program installed, not only Windows Defender.",
+            .launch_hint_access => "Windows denied access to game-run.exe. This is usually security software other than Windows Defender, or a folder whose permissions block running programs. Try moving the emulator folder to another drive or to your Documents folder.",
+            .launch_hint_damaged => "game-run.exe is damaged or incomplete. Download the release again and extract the whole archive into an empty folder.",
+            .launch_hint_generic => "Windows could not start game-run.exe. Include this message and the error number in your bug report.",
+            .launch_windows_error => "Windows error",
             .status_launched => "Game launched in a separate process",
             .status_game_removed => "Game removed from the library",
         },
@@ -434,6 +446,12 @@ fn tr(phrase: Phrase) []const u8 {
             .status_log_copied => "日志已复制到剪贴板",
             .status_runner_missing => "未找到 game-run.exe · 请先运行 zig build",
             .status_launch_failed => "无法启动 game-run.exe",
+            .launch_hint_policy => "Windows 的智能应用控制（Smart App Control）或应用程序控制策略阻止了 game-run.exe。防病毒排除项对它无效。要允许模拟器，请打开“Windows 安全中心”→“应用和浏览器控制”→“智能应用控制设置”并将其关闭。在某些 Windows 版本中，关闭后只能通过重新安装 Windows 再次开启。",
+            .launch_hint_antivirus => "安全软件阻止或删除了 game-run.exe。请从隔离区恢复它或重新解压发布包，并将模拟器文件夹添加到所有已安装安全软件的排除项中，而不仅是 Windows Defender。",
+            .launch_hint_access => "Windows 拒绝访问 game-run.exe。这通常是 Windows Defender 以外的安全软件，或者文件夹权限禁止运行程序。请尝试将模拟器文件夹移动到其他磁盘或“文档”文件夹。",
+            .launch_hint_damaged => "game-run.exe 已损坏或不完整。请重新下载发布包，并将整个压缩包解压到一个空文件夹。",
+            .launch_hint_generic => "Windows 无法启动 game-run.exe。请在错误报告中附上此消息及错误编号。",
+            .launch_windows_error => "Windows 错误",
             .status_launched => "游戏已在独立进程中启动",
             .status_game_removed => "游戏已从游戏库移除",
         },
@@ -531,6 +549,12 @@ fn tr(phrase: Phrase) []const u8 {
             .status_log_copied => "Registro copiado al portapapeles",
             .status_runner_missing => "No se encontró game-run.exe · ejecuta zig build primero",
             .status_launch_failed => "No se pudo iniciar game-run.exe",
+            .launch_hint_policy => "Windows bloqueó game-run.exe con el Control inteligente de aplicaciones (Smart App Control) o una directiva de control de aplicaciones. Las exclusiones del antivirus no se aplican. Para permitir el emulador, abre Seguridad de Windows → Control de aplicaciones y navegador → Configuración del Control inteligente de aplicaciones y desactívalo. En algunas versiones de Windows solo puede volver a activarse reinstalando Windows.",
+            .launch_hint_antivirus => "Un programa de seguridad bloqueó o eliminó game-run.exe. Restáuralo desde la cuarentena o vuelve a extraer el archivo de la versión, y añade la carpeta del emulador a las exclusiones de todos los programas de seguridad instalados, no solo de Windows Defender.",
+            .launch_hint_access => "Windows denegó el acceso a game-run.exe. Normalmente se debe a un programa de seguridad distinto de Windows Defender o a una carpeta cuyos permisos impiden ejecutar programas. Prueba a mover la carpeta del emulador a otra unidad o a Documentos.",
+            .launch_hint_damaged => "game-run.exe está dañado o incompleto. Vuelve a descargar la versión y extrae todo el archivo en una carpeta vacía.",
+            .launch_hint_generic => "Windows no pudo iniciar game-run.exe. Incluye este mensaje y el número de error en tu informe.",
+            .launch_windows_error => "Error de Windows",
             .status_launched => "Juego iniciado en un proceso independiente",
             .status_game_removed => "Juego eliminado de la biblioteca",
         },
@@ -628,6 +652,12 @@ fn tr(phrase: Phrase) []const u8 {
             .status_log_copied => "تم نسخ السجل إلى الحافظة",
             .status_runner_missing => "لم يتم العثور على game-run.exe · شغّل zig build أولًا",
             .status_launch_failed => "تعذّر تشغيل game-run.exe",
+            .launch_hint_policy => "حظر Windows الملف game-run.exe عبر التحكم الذكي في التطبيقات (Smart App Control) أو نهج للتحكم في التطبيقات. استثناءات مكافحة الفيروسات لا تنطبق عليه. للسماح بالمحاكي، افتح أمان Windows ← التحكم في التطبيقات والمستعرض ← إعدادات التحكم الذكي في التطبيقات وأوقف تشغيله. في بعض إصدارات Windows لا يمكن إعادة تشغيله إلا بإعادة تثبيت Windows.",
+            .launch_hint_antivirus => "حظر برنامج أمان الملف game-run.exe أو حذفه. استعده من العزل أو استخرج أرشيف الإصدار من جديد، وأضف مجلد المحاكي إلى استثناءات كل برامج الأمان المثبتة، وليس Windows Defender فقط.",
+            .launch_hint_access => "رفض Windows الوصول إلى game-run.exe. السبب عادةً برنامج أمان غير Windows Defender أو مجلد تمنع أذوناته تشغيل البرامج. جرّب نقل مجلد المحاكي إلى قرص آخر أو إلى مجلد المستندات.",
+            .launch_hint_damaged => "الملف game-run.exe تالف أو غير مكتمل. نزّل الإصدار من جديد واستخرج الأرشيف كاملاً في مجلد فارغ.",
+            .launch_hint_generic => "تعذّر على Windows تشغيل game-run.exe. أرفق هذه الرسالة ورقم الخطأ في بلاغ المشكلة.",
+            .launch_windows_error => "خطأ Windows",
             .status_launched => "تم تشغيل اللعبة في عملية منفصلة",
             .status_game_removed => "تمت إزالة اللعبة من المكتبة",
         },
@@ -725,6 +755,12 @@ fn tr(phrase: Phrase) []const u8 {
             .status_log_copied => "Log copiado para a área de transferência",
             .status_runner_missing => "game-run.exe não foi encontrado · execute zig build primeiro",
             .status_launch_failed => "Não foi possível iniciar game-run.exe",
+            .launch_hint_policy => "O Windows bloqueou o game-run.exe com o Controle Inteligente de Aplicativos (Smart App Control) ou uma política de controle de aplicativos. As exclusões do antivírus não se aplicam a ele. Para permitir o emulador, abra Segurança do Windows → Controle de aplicativos e do navegador → Configurações do Controle Inteligente de Aplicativos e desative-o. Em algumas versões do Windows, ele só pode ser reativado reinstalando o Windows.",
+            .launch_hint_antivirus => "Um software de segurança bloqueou ou removeu o game-run.exe. Restaure-o da quarentena ou extraia o arquivo da versão novamente, e adicione a pasta do emulador às exclusões de todos os programas de segurança instalados, não apenas do Windows Defender.",
+            .launch_hint_access => "O Windows negou acesso ao game-run.exe. Normalmente isso é causado por um software de segurança diferente do Windows Defender ou por uma pasta cujas permissões impedem a execução de programas. Tente mover a pasta do emulador para outra unidade ou para Documentos.",
+            .launch_hint_damaged => "O game-run.exe está danificado ou incompleto. Baixe a versão novamente e extraia o arquivo inteiro em uma pasta vazia.",
+            .launch_hint_generic => "O Windows não conseguiu iniciar o game-run.exe. Inclua esta mensagem e o número do erro no seu relatório.",
+            .launch_windows_error => "Erro do Windows",
             .status_launched => "Jogo iniciado em um processo separado",
             .status_game_removed => "Jogo removido da biblioteca",
         },
@@ -822,6 +858,12 @@ fn tr(phrase: Phrase) []const u8 {
             .status_log_copied => "Лог скопирован в буфер обмена",
             .status_runner_missing => "Не найден game-run.exe · сначала выполните zig build",
             .status_launch_failed => "Не удалось запустить game-run.exe",
+            .launch_hint_policy => "Windows заблокировала game-run.exe через интеллектуальное управление приложениями (Smart App Control) или политику управления приложениями. Исключения антивируса на неё не действуют. Чтобы разрешить эмулятор, откройте «Безопасность Windows» → «Управление приложениями/браузером» → «Параметры интеллектуального управления приложениями» и выключите его. В некоторых версиях Windows включить его обратно можно только переустановкой Windows.",
+            .launch_hint_antivirus => "Защитная программа заблокировала или удалила game-run.exe. Восстановите файл из карантина или распакуйте архив релиза заново и добавьте папку эмулятора в исключения всех установленных защитных программ, а не только Защитника Windows.",
+            .launch_hint_access => "Windows отказала в доступе к game-run.exe. Обычно это защитная программа, отличная от Защитника Windows, или папка, права которой запрещают запуск программ. Попробуйте перенести папку эмулятора на другой диск или в «Документы».",
+            .launch_hint_damaged => "game-run.exe повреждён или распакован не полностью. Скачайте релиз заново и распакуйте весь архив в пустую папку.",
+            .launch_hint_generic => "Windows не смогла запустить game-run.exe. Приложите это сообщение и номер ошибки к отчёту о проблеме.",
+            .launch_windows_error => "Ошибка Windows",
             .status_launched => "Игра запущена в отдельном процессе",
             .status_game_removed => "Игра удалена из библиотеки",
         },
@@ -919,6 +961,12 @@ fn tr(phrase: Phrase) []const u8 {
             .status_log_copied => "Log in die Zwischenablage kopiert",
             .status_runner_missing => "game-run.exe fehlt · zuerst zig build ausführen",
             .status_launch_failed => "game-run.exe konnte nicht gestartet werden",
+            .launch_hint_policy => "Windows hat game-run.exe mit dem intelligenten App-Steuerelement (Smart App Control) oder einer Anwendungssteuerungsrichtlinie blockiert. Virenschutz-Ausnahmen gelten dafür nicht. Um den Emulator zuzulassen, öffnen Sie Windows-Sicherheit → App- & Browsersteuerung → Einstellungen für intelligentes App-Steuerelement und schalten Sie es aus. In manchen Windows-Versionen lässt es sich danach nur durch eine Neuinstallation von Windows wieder einschalten.",
+            .launch_hint_antivirus => "Eine Sicherheitssoftware hat game-run.exe blockiert oder entfernt. Stellen Sie die Datei aus der Quarantäne wieder her oder entpacken Sie das Release-Archiv erneut, und fügen Sie den Emulatorordner den Ausnahmen jedes installierten Sicherheitsprogramms hinzu, nicht nur von Windows Defender.",
+            .launch_hint_access => "Windows hat den Zugriff auf game-run.exe verweigert. Meist liegt das an einer anderen Sicherheitssoftware als Windows Defender oder an einem Ordner, dessen Berechtigungen das Ausführen von Programmen verhindern. Verschieben Sie den Emulatorordner auf ein anderes Laufwerk oder in „Dokumente“.",
+            .launch_hint_damaged => "game-run.exe ist beschädigt oder unvollständig. Laden Sie das Release erneut herunter und entpacken Sie das gesamte Archiv in einen leeren Ordner.",
+            .launch_hint_generic => "Windows konnte game-run.exe nicht starten. Fügen Sie diese Meldung und die Fehlernummer Ihrem Fehlerbericht bei.",
+            .launch_windows_error => "Windows-Fehler",
             .status_launched => "Spiel in einem separaten Prozess gestartet",
             .status_game_removed => "Spiel aus der Bibliothek entfernt",
         },
@@ -1016,6 +1064,12 @@ fn tr(phrase: Phrase) []const u8 {
             .status_log_copied => "Journal copié dans le presse-papiers",
             .status_runner_missing => "game-run.exe est introuvable · exécutez d'abord zig build",
             .status_launch_failed => "Impossible de lancer game-run.exe",
+            .launch_hint_policy => "Windows a bloqué game-run.exe avec le contrôle intelligent des applications (Smart App Control) ou une stratégie de contrôle des applications. Les exclusions de l'antivirus ne s'y appliquent pas. Pour autoriser l'émulateur, ouvrez Sécurité Windows → Contrôle des applications et du navigateur → Paramètres du contrôle intelligent des applications et désactivez-le. Sur certaines versions de Windows, il ne peut être réactivé qu'en réinstallant Windows.",
+            .launch_hint_antivirus => "Un logiciel de sécurité a bloqué ou supprimé game-run.exe. Restaurez-le depuis la quarantaine ou extrayez à nouveau l'archive de la version, puis ajoutez le dossier de l'émulateur aux exclusions de chaque logiciel de sécurité installé, pas seulement de Windows Defender.",
+            .launch_hint_access => "Windows a refusé l'accès à game-run.exe. C'est généralement un logiciel de sécurité autre que Windows Defender, ou un dossier dont les autorisations empêchent l'exécution de programmes. Essayez de déplacer le dossier de l'émulateur sur un autre disque ou dans Documents.",
+            .launch_hint_damaged => "game-run.exe est endommagé ou incomplet. Téléchargez de nouveau la version et extrayez toute l'archive dans un dossier vide.",
+            .launch_hint_generic => "Windows n'a pas pu lancer game-run.exe. Joignez ce message et le numéro d'erreur à votre rapport de bogue.",
+            .launch_windows_error => "Erreur Windows",
             .status_launched => "Jeu lancé dans un processus séparé",
             .status_game_removed => "Jeu retiré de la bibliothèque",
         },
@@ -2023,11 +2077,15 @@ fn saveRootDirectoryPath(output: *[1024]u16) usize {
     return length;
 }
 
-/// The directory the launcher itself lives in.
+/// The directory the launcher itself lives in, terminated after its
+/// trailing separator. Without the terminator the buffer still read as the
+/// launcher's own path, and CreateProcessW rejected that file as the
+/// runner's working directory (ERROR_DIRECTORY) outside `zig-out\bin`.
 fn siblingDirectory(output: *[1024]u16) usize {
     var length = Win32.GetModuleFileNameW(null, output, output.len);
     if (length == 0 or length >= output.len) return 0;
     while (length > 0 and output[length - 1] != '\\') : (length -= 1) {}
+    output[length] = 0;
     return length;
 }
 
@@ -2996,7 +3054,7 @@ fn launchGame(owner: Win32.Window) void {
         &startup,
         &process,
     ) == 0) {
-        setStatusPhrase(.status_launch_failed, true);
+        reportLaunchFailure(owner, Win32.GetLastError());
         return;
     }
     _ = Win32.CloseHandle(process.thread);
@@ -3004,6 +3062,68 @@ fn launchGame(owner: Win32.Window) void {
     rememberGameFolder(game_folder[0..game_folder_length], true);
     setStatusPhrase(.status_launched, false);
     _ = Win32.ShowWindow(owner, Win32.show_minimized);
+}
+
+/// What a player can do about a refused process creation. The code is the
+/// one Windows returned from CreateProcessW; nothing of the emulator has run.
+fn launchFailureHint(code: u32) Phrase {
+    return switch (code) {
+        // ERROR_SYSTEM_INTEGRITY_* is Smart App Control and other code
+        // integrity policies; 786 and 1260 are Software Restriction and
+        // AppLocker style group policies.
+        4550...4560, 786, 1260 => .launch_hint_policy,
+        225, 226 => .launch_hint_antivirus, // ERROR_VIRUS_INFECTED / _DELETED
+        5 => .launch_hint_access,
+        11, 193, 216, 1392 => .launch_hint_damaged, // bad format, wrong machine, corrupt
+        else => .launch_hint_generic,
+    };
+}
+
+/// Tells the player why Windows refused to start game-run.exe. The status
+/// line alone gave no reason, and the people who meet this are the least
+/// likely to try the runner from a command prompt. Windows supplies its own
+/// explanation in the user's language; the hint says what to do about it.
+fn reportLaunchFailure(owner: Win32.Window, code: u32) void {
+    var status: [160]u8 = undefined;
+    const summary = std.fmt.bufPrint(&status, "{s} · {s} {d}", .{ tr(.status_launch_failed), tr(.launch_windows_error), code }) catch tr(.status_launch_failed);
+    setStatus(summary, true);
+    _ = Win32.InvalidateRect(owner, null, 0);
+
+    var message: [4096]u16 = @splat(0);
+    var length: usize = 0;
+    appendUtf8(&message, &length, tr(launchFailureHint(code)));
+    appendUtf8(&message, &length, "\n\n");
+    var system: [1024]u16 = @splat(0);
+    var system_length: usize = Win32.FormatMessageW(
+        Win32.format_message_from_system | Win32.format_message_ignore_inserts,
+        null,
+        code,
+        0,
+        &system,
+        system.len,
+        null,
+    );
+    while (system_length > 0 and (system[system_length - 1] == '\r' or system[system_length - 1] == '\n' or system[system_length - 1] == ' ')) : (system_length -= 1) {}
+    if (system_length != 0) {
+        appendWideSlice(&message, &length, system[0..system_length]);
+        appendUtf8(&message, &length, "\n");
+    }
+    var number: [64]u8 = undefined;
+    appendUtf8(&message, &length, std.fmt.bufPrint(&number, "{s} {d} (0x{X})", .{ tr(.launch_windows_error), code, code }) catch "");
+    message[@min(length, message.len - 1)] = 0;
+
+    var title: [128]u16 = @splat(0);
+    var title_length: usize = 0;
+    appendUtf8(&title, &title_length, tr(.status_launch_failed));
+    title[@min(title_length, title.len - 1)] = 0;
+    const direction: u32 = if (language == .arabic) Win32.mb_right | Win32.mb_rtl_reading else 0;
+    _ = Win32.MessageBoxW(owner, @ptrCast(&message), @ptrCast(&title), Win32.mb_ok | Win32.mb_icon_error | direction);
+}
+
+fn appendUtf8(output: []u16, length: *usize, value: []const u8) void {
+    if (length.* >= output.len) return;
+    const written = std.unicode.utf8ToUtf16Le(output[length.*..], value) catch return;
+    length.* += written;
 }
 
 fn findGameExecutable(output: *[1024]u16) bool {
@@ -3541,6 +3661,12 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const startf_use_std_handles: u32 = 0x0000_0100;
     const handle_flag_inherit: u32 = 0x0000_0001;
     const wm_app: u32 = 0x8000;
+    const format_message_from_system: u32 = 0x0000_1000;
+    const format_message_ignore_inserts: u32 = 0x0000_0200;
+    const mb_ok: u32 = 0x0000_0000;
+    const mb_icon_error: u32 = 0x0000_0010;
+    const mb_right: u32 = 0x0008_0000;
+    const mb_rtl_reading: u32 = 0x0010_0000;
     const gmem_moveable: u32 = 0x0002;
     const cf_unicode_text: u32 = 13;
     const ofn_explorer: u32 = 0x0008_0000;
@@ -3568,6 +3694,8 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) callconv(.winapi) i32;
     extern "kernel32" fn TerminateProcess(handle: Handle, exit_code: u32) callconv(.winapi) i32;
     extern "user32" fn PostMessageW(Window, u32, usize, isize) callconv(.winapi) i32;
+    extern "user32" fn MessageBoxW(Window, [*:0]const u16, [*:0]const u16, u32) callconv(.winapi) i32;
+    extern "kernel32" fn FormatMessageW(flags: u32, source: ?*const anyopaque, message: u32, language: u32, output: [*]u16, size: u32, arguments: ?*anyopaque) callconv(.winapi) u32;
     extern "user32" fn OpenClipboard(Window) callconv(.winapi) i32;
     extern "user32" fn EmptyClipboard() callconv(.winapi) i32;
     extern "user32" fn SetClipboardData(u32, Handle) callconv(.winapi) Handle;
