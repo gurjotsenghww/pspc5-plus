@@ -8453,13 +8453,22 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(packed_epoch, renderer.render_targets.items[masked_packed_index.?].content_generation);
     try std.testing.expectEqual(@as(u32, 0x9abc_def0), std.mem.readInt(u32, guest.bytes[0x5000 + pixel * 4 ..][0..4], .little));
 
-    // Re-enabling the packed output must still reject unsupported blending.
+    // Source (1, 1, 1, 0.5) against the preserved 512/1024/767 word. Alpha 1
+    // would make src-alpha identical to a replace, so this export uses 0.5.
+    var blended_fragment = fragment;
+    blended_fragment[1] = 0x3c00_3c00;
+    blended_fragment[3] = 0x3800_3c00;
+    for (blended_fragment, 0..) |word, index| guest.word(0xf00 + index * 4, word);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 15);
     try state.writeRegister(.context, 0x08f, 0xf31f);
     _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
-    try std.testing.expectEqual(error.UnsupportedColorTarget, renderer.last_draw_error.?);
-    renderer.last_draw_error = null;
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    const expected_blend: u32 = 1280 | (1536 << 11) | (895 << 22);
+    try std.testing.expectEqual(expected_blend, std.mem.readInt(u32, guest.bytes[0x2000 + pixel * 4 ..][0..4], .little));
     try state.writeRegister(.context, 0x1e0, 0);
     try state.writeRegister(.context, 0x31c, 10 << 2);
+    std.debug.print("packed UNORM blend passed: feedback buffer word=0x{x}\n", .{expected_blend});
 
     // Mask individual channels with a full target mask, then disable every
     // color export. A later shader-mask change must not reuse the wrong PSO.

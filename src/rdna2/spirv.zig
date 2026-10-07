@@ -140,6 +140,27 @@ pub const sampled_image_cube_descriptor_binding: u32 = 4 + maximum_storage_image
 pub const sampled_image_2d_array_descriptor_binding: u32 = 5 + maximum_storage_images;
 pub const gds_descriptor_binding: u32 = 6 + maximum_storage_images;
 pub const sampled_image_comparison_2d_descriptor_binding: u32 = gds_descriptor_binding + 1;
+/// Packed 11/11/10 UNORM feedback. One storage buffer, not a subpass input:
+/// the host copies each blended attachment before the render pass.
+pub const packed_unorm_feedback_descriptor_binding: u32 = sampled_image_comparison_2d_descriptor_binding + 1;
+
+/// Guest blend equation for one packed 11/11/10 UNORM export.
+/// Bit 0 is active. The remaining fields use guest CB_BLEND_CONTROL codes,
+/// not the Vulkan remap, because the equation runs in the fragment shader.
+pub const PackedUnormBlend = struct {
+    pub fn encode(source_factor: u32, operation: u32, destination_factor: u32, channel_mask: u32, location: u32) u32 {
+        return 1 |
+            (source_factor << 1) |
+            (operation << 6) |
+            (destination_factor << 9) |
+            (channel_mask << 14) |
+            (location << 17);
+    }
+
+    pub fn active(word: u32) bool {
+        return word & 1 != 0;
+    }
+};
 
 fn sampledImageDimensionIndex(dimension: SampledImageDimension) usize {
     return switch (dimension) {
@@ -459,6 +480,9 @@ pub const Options = struct {
     color_export_mappings: [8]u8 = @splat(0xe4),
     color_export_types: [8]ColorExportType = @splat(.float32),
     packed_color_exports: [8]PackedColorExport = @splat(.float16),
+    /// Indexed by EXP target. A non-zero word reads that CB slot's packed
+    /// UNORM word, blends in the shader, and packs the result back.
+    packed_unorm_blend: [8]u32 = @splat(0),
     scalar_registers: []const ScalarRegister = &.{},
     dynamic_scalar_binding: ?DynamicScalarBinding = null,
     compute_inputs: ?ComputeInputs = null,
@@ -937,6 +961,9 @@ const Builder = struct {
     color_export_mappings: [8]u8,
     color_export_types: [8]ColorExportType,
     packed_color_exports: [8]PackedColorExport,
+    packed_unorm_blend: [8]u32 = @splat(0),
+    packed_feedback_buffer: u32 = 0,
+    packed_feedback_word_pointer: u32 = 0,
     parameter_variables: [32]u32 = @splat(0),
     fragment_per_vertex_mask: u32 = 0,
     fragment_custom_interpolation_mask: u32 = 0,
@@ -1106,6 +1133,7 @@ const Builder = struct {
             .color_export_mappings = options.color_export_mappings,
             .color_export_types = options.color_export_types,
             .packed_color_exports = options.packed_color_exports,
+            .packed_unorm_blend = options.packed_unorm_blend,
             .storage_bindings = options.storage_buffers,
             .scalar_memory_bindings = options.scalar_memories,
             .flat_memory_bindings = options.flat_memories,
@@ -1315,6 +1343,9 @@ const Builder = struct {
                     try self.emit(&self.annotations, 71, &.{ variable, 30, location }); // Location
                     try self.emit(&self.declarations, 59, &.{ output_pointers[type_index], variable, 3 }); // OpVariable
                 }
+                var blend_active = false;
+                for (options.packed_unorm_blend) |word| blend_active = blend_active or word & 1 != 0;
+                if (blend_active) try self.declarePackedUnormFeedback();
                 // FragCoord for UV fallback (BuiltIn 15).
                 const frag_ptr = self.id();
                 self.frag_coord_input = self.id();
@@ -5725,6 +5756,11 @@ const Builder = struct {
         }
         const output_vector_type = if (packed_unorm) try self.ensureVec4(.bits32) else self.vector4_type;
         if (packed_unorm) {
+            const blend_word = if (inst.export_target < self.packed_unorm_blend.len)
+                self.packed_unorm_blend[inst.export_target]
+            else
+                0;
+            if (blend_word & 1 != 0) try self.blendPackedUnormRgb(&components, blend_word);
             const packed_word = try self.packR11G11B10Unorm(components);
             const bits_zero = try self.constant(.bits32, 0);
             components = .{ packed_word, bits_zero, bits_zero, bits_zero };
@@ -5754,6 +5790,130 @@ const Builder = struct {
                     try self.emit(&self.body, 62, &.{ variable, exported });
             }
         }
+    }
+
+    fn declarePackedUnormFeedback(self: *Builder) Error!void {
+        const runtime_words = self.id();
+        const block = self.id();
+        const block_pointer = self.id();
+        self.packed_feedback_word_pointer = self.id();
+        self.packed_feedback_buffer = self.id();
+        // Words 0..7 are pitches, 8..15 are base word offsets, pixels follow.
+        // Pitch and base stay in the buffer so one shader covers every size.
+        try self.emit(&self.annotations, 71, &.{ runtime_words, 6, 4 }); // ArrayStride 4
+        try self.emit(&self.annotations, 72, &.{ block, 0, 35, 0 }); // member Offset 0
+        try self.emit(&self.annotations, 71, &.{ block, 2 }); // Block
+        try self.emit(&self.annotations, 71, &.{ self.packed_feedback_buffer, 34, 0 }); // DescriptorSet
+        try self.emit(&self.annotations, 71, &.{ self.packed_feedback_buffer, 33, packed_unorm_feedback_descriptor_binding });
+        try self.emit(&self.declarations, 29, &.{ runtime_words, self.bits_type }); // OpTypeRuntimeArray
+        try self.emit(&self.declarations, 30, &.{ block, runtime_words }); // OpTypeStruct
+        try self.emit(&self.declarations, 32, &.{ block_pointer, 12, block }); // ptr StorageBuffer
+        try self.emit(&self.declarations, 32, &.{ self.packed_feedback_word_pointer, 12, self.bits_type });
+        try self.emit(&self.declarations, 59, &.{ block_pointer, self.packed_feedback_buffer, 12 }); // OpVariable
+    }
+
+    fn loadPackedFeedbackWord(self: *Builder, index: u32) Error!u32 {
+        const pointer = self.id();
+        try self.emit(&self.body, 65, &.{
+            self.packed_feedback_word_pointer,
+            pointer,
+            self.packed_feedback_buffer,
+            try self.constant(.bits32, 0),
+            index,
+        }); // OpAccessChain member 0, word
+        const loaded = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, loaded, pointer }); // OpLoad
+        return loaded;
+    }
+
+    /// Guest CB_BLEND_CONTROL factors 0..9. Packed UNORM stores no alpha, so
+    /// the destination alpha is the unpack constant 1 and source alpha is the
+    /// exported W. Colour factors are the matching RGB channel.
+    fn guestRgbBlendFactor(
+        self: *Builder,
+        factor: u32,
+        src_color: u32,
+        src_alpha: u32,
+        dst_color: u32,
+        dst_alpha: u32,
+    ) Error!u32 {
+        const one = try self.constant(.float32, @bitCast(@as(f32, 1)));
+        return switch (factor) {
+            0 => try self.constant(.float32, 0),
+            1 => one,
+            2 => src_color,
+            3 => try self.subtractFloat(one, src_color),
+            4 => src_alpha,
+            5 => try self.subtractFloat(one, src_alpha),
+            6 => dst_alpha,
+            7 => try self.subtractFloat(one, dst_alpha),
+            8 => dst_color,
+            9 => try self.subtractFloat(one, dst_color),
+            else => Error.UnsupportedOpcode,
+        };
+    }
+
+    fn subtractFloat(self: *Builder, left: u32, right: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 131, &.{ self.float_type, result, left, right }); // OpFSub
+        return result;
+    }
+
+    fn blendPackedUnormRgb(self: *Builder, components: *[4]u32, blend_word: u32) Error!void {
+        if (self.packed_feedback_buffer == 0 or self.frag_coord_input == 0) return Error.UnsupportedOpcode;
+        const slot = (blend_word >> 17) & 7;
+        const channel_mask = (blend_word >> 14) & 7;
+        const guest_source = (blend_word >> 1) & 0x1f;
+        const guest_operation = (blend_word >> 6) & 7;
+        const guest_destination = (blend_word >> 9) & 0x1f;
+        // FragCoord is the pixel centre. Truncation selects that pixel's word.
+        const coord = self.id();
+        try self.emit(&self.body, 61, &.{ self.vector4_type, coord, self.frag_coord_input }); // OpLoad
+        const coord_x = self.id();
+        const coord_y = self.id();
+        try self.emit(&self.body, 81, &.{ self.float_type, coord_x, coord, 0 }); // OpCompositeExtract
+        try self.emit(&self.body, 81, &.{ self.float_type, coord_y, coord, 1 });
+        const pixel_x = self.id();
+        const pixel_y = self.id();
+        try self.emit(&self.body, 109, &.{ self.bits_type, pixel_x, coord_x }); // OpConvertFToU
+        try self.emit(&self.body, 109, &.{ self.bits_type, pixel_y, coord_y });
+        const pitch = try self.loadPackedFeedbackWord(try self.constant(.bits32, slot));
+        const base = try self.loadPackedFeedbackWord(try self.constant(.bits32, 8 + slot));
+        const row = self.id();
+        try self.emit(&self.body, 132, &.{ self.bits_type, row, pixel_y, pitch }); // OpIMul
+        const pixel = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, pixel, row, pixel_x }); // OpIAdd
+        const index = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, index, base, pixel });
+        const word = try self.loadPackedFeedbackWord(index);
+        const texel = self.id();
+        const bits_zero = try self.constant(.bits32, 0);
+        try self.emit(&self.body, 80, &.{ try self.ensureVec4(.bits32), texel, word, bits_zero, bits_zero, bits_zero });
+        const stored = try self.unpackR11G11B10Unorm(texel);
+        const src_alpha = components[3];
+        var blended: [3]u32 = undefined;
+        for (0..3) |component| {
+            if (channel_mask & (@as(u32, 1) << @intCast(component)) == 0) {
+                blended[component] = stored[component];
+                continue;
+            }
+            const src_factor = try self.guestRgbBlendFactor(guest_source, components[component], src_alpha, stored[component], stored[3]);
+            const dst_factor = try self.guestRgbBlendFactor(guest_destination, components[component], src_alpha, stored[component], stored[3]);
+            const src_term = self.id();
+            try self.emit(&self.body, 133, &.{ self.float_type, src_term, components[component], src_factor });
+            const dst_term = self.id();
+            try self.emit(&self.body, 133, &.{ self.float_type, dst_term, stored[component], dst_factor });
+            blended[component] = self.id();
+            switch (guest_operation) {
+                0 => try self.emit(&self.body, 129, &.{ self.float_type, blended[component], src_term, dst_term }),
+                1 => try self.emit(&self.body, 131, &.{ self.float_type, blended[component], src_term, dst_term }),
+                4 => try self.emit(&self.body, 131, &.{ self.float_type, blended[component], dst_term, src_term }),
+                else => return Error.UnsupportedOpcode,
+            }
+        }
+        components[0] = blended[0];
+        components[1] = blended[1];
+        components[2] = blended[2];
     }
 
     /// Vulkan has no normalized 11/11/10 image. Its R32_UINT backing keeps
@@ -12533,6 +12693,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         0,
     });
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
+
     if (builder.layer_variable != 0) {
         try appendInstruction(allocator, &words, 17, &.{if (options.stage == .vertex) @as(u32, 5254) else 2});
     }
@@ -12666,6 +12827,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     for (builder.color_outputs) |color_output| {
         if (color_output != 0) try entry_point.append(allocator, color_output);
     }
+    if (builder.packed_feedback_buffer != 0) try entry_point.append(allocator, builder.packed_feedback_buffer);
     for (builder.parameter_variables) |variable| {
         if (variable != 0) try entry_point.append(allocator, variable);
     }
@@ -13016,6 +13178,18 @@ fn instructionStreamContainsOpcode(words: []const u32, wanted: u16) bool {
         const count = first >> 16;
         if (count == 0) return false;
         index += count;
+    }
+    return false;
+}
+
+fn containsDecoration(words: []const u32, decoration: u32, literal: u32) bool {
+    var index: usize = 5;
+    while (index < words.len) {
+        const first = words[index];
+        const word_count: usize = first >> 16;
+        if (word_count < 2 or index + word_count > words.len) return false;
+        if (@as(u16, @truncate(first)) == 71 and word_count >= 4 and words[index + 2] == decoration and words[index + 3] == literal) return true;
+        index += word_count;
     }
     return false;
 }
@@ -17271,6 +17445,41 @@ test "unmapped flat loads require an explicit zero fallback" {
     });
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "packed UNORM color export blends through a feedback buffer" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .exp,
+        .export_target = 0,
+        .export_enable = 0xf,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 0 },
+        .src2 = .{ .kind = .vgpr, .reg = 0 },
+        .src3 = .{ .kind = .vgpr, .reg = 0 },
+        .src_count = 4,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+    var export_types = [_]ColorExportType{.float32} ** 8;
+    export_types[0] = .r11g11b10_unorm;
+    var blend_words = [_]u32{0} ** 8;
+    blend_words[0] = PackedUnormBlend.encode(4, 0, 5, 7, 2);
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .color_export_types = export_types,
+        .packed_unorm_blend = blend_words,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsDecoration(module.words, 33, packed_unorm_feedback_descriptor_binding));
+    try std.testing.expect(!containsOpcode(module.words, 98)); // no OpImageRead
+    try std.testing.expect(!containsOpcodeWithFirstOperand(module.words, 17, 40)); // no InputAttachment
 }
 
 test "fragment color export mapping selects logical channels for physical storage" {

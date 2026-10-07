@@ -213,6 +213,7 @@ pub const structure_type_physical_device_descriptor_indexing_features: u32 = 1_0
 pub const structure_type_physical_device_timeline_semaphore_features: u32 = 1_000_207_000;
 pub const structure_type_physical_device_shader_atomic_float_2_features_ext: u32 = 1_000_273_000;
 pub const structure_type_physical_device_fragment_shader_barycentric_features_khr: u32 = 1_000_203_000;
+pub const structure_type_physical_device_rasterization_order_attachment_access_features_ext: u32 = 1_000_342_000;
 pub const structure_type_semaphore_type_create_info: u32 = 1_000_207_002;
 pub const structure_type_timeline_semaphore_submit_info: u32 = 1_000_207_003;
 pub const structure_type_semaphore_wait_info: u32 = 1_000_207_004;
@@ -238,6 +239,7 @@ pub const image_usage_color_attachment_bit: Flags = 0x0000_0010;
 pub const image_usage_depth_stencil_attachment_bit: Flags = 0x0000_0020;
 pub const image_usage_sampled_bit: Flags = 0x0000_0004;
 pub const image_usage_storage_bit: Flags = 0x0000_0008;
+pub const image_usage_input_attachment_bit: Flags = 0x0000_0080;
 pub const sharing_mode_exclusive: u32 = 0;
 
 pub const memory_property_host_visible_bit: Flags = 0x0000_0002;
@@ -271,6 +273,8 @@ pub const access_transfer_read_bit: Flags = 0x0000_0800;
 pub const access_transfer_write_bit: Flags = 0x0000_1000;
 pub const access_color_attachment_write_bit: Flags = 0x0000_0100;
 pub const access_color_attachment_read_bit: Flags = 0x0000_0080;
+pub const access_input_attachment_read_bit: Flags = 0x0000_0010;
+pub const dependency_by_region_bit: Flags = 0x0000_0001;
 pub const access_depth_stencil_attachment_read_bit: Flags = 0x0000_0200;
 pub const access_depth_stencil_attachment_write_bit: Flags = 0x0000_0400;
 pub const access_host_read_bit: Flags = 0x0000_2000;
@@ -285,6 +289,11 @@ pub const physical_device_type_discrete_gpu: u32 = 2;
 pub const descriptor_type_storage_buffer: u32 = 7;
 pub const descriptor_type_combined_image_sampler: u32 = 1;
 pub const descriptor_type_storage_image: u32 = 3;
+pub const descriptor_type_input_attachment: u32 = 10;
+/// Subpass and pipeline flags from VK_EXT_rasterization_order_attachment_access.
+/// Only the colour bit is enabled: packed UNORM feedback never reads depth.
+pub const subpass_description_rasterization_order_attachment_color_access_bit: Flags = 0x0000_0010;
+pub const pipeline_color_blend_rasterization_order_attachment_access_bit: Flags = 0x0000_0001;
 
 pub const format_r8_unorm: u32 = 9;
 pub const format_r8_snorm: u32 = 10;
@@ -524,6 +533,14 @@ pub const PhysicalDeviceFragmentShaderBarycentricFeaturesKHR = extern struct {
     s_type: u32 = structure_type_physical_device_fragment_shader_barycentric_features_khr,
     p_next: ?*anyopaque = null,
     fragment_shader_barycentric: Bool32 = 0,
+};
+
+pub const PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT = extern struct {
+    s_type: u32 = structure_type_physical_device_rasterization_order_attachment_access_features_ext,
+    p_next: ?*anyopaque = null,
+    rasterization_order_color_attachment_access: Bool32 = 0,
+    rasterization_order_depth_attachment_access: Bool32 = 0,
+    rasterization_order_stencil_attachment_access: Bool32 = 0,
 };
 
 pub const PhysicalDeviceShaderAtomicFloat2FeaturesEXT = extern struct {
@@ -1112,6 +1129,16 @@ pub const SubpassDescription = extern struct {
     preserve_attachments: ?[*]const u32 = null,
 };
 
+pub const SubpassDependency = extern struct {
+    source_subpass: u32,
+    destination_subpass: u32,
+    source_stage_mask: Flags,
+    destination_stage_mask: Flags,
+    source_access_mask: Flags,
+    destination_access_mask: Flags,
+    dependency_flags: Flags,
+};
+
 pub const RenderPassCreateInfo = extern struct {
     s_type: u32 = structure_type_render_pass_create_info,
     p_next: ?*const anyopaque = null,
@@ -1326,6 +1353,7 @@ pub const PfnCmdDraw = *const fn (CommandBuffer, u32, u32, u32, u32) callconv(ca
 pub const PfnCmdDrawIndexed = *const fn (CommandBuffer, u32, u32, u32, i32, u32) callconv(call) void;
 pub const PfnCmdBindIndexBuffer = *const fn (CommandBuffer, Buffer, DeviceSize, u32) callconv(call) void;
 pub const PfnCmdFillBuffer = *const fn (CommandBuffer, Buffer, DeviceSize, DeviceSize, u32) callconv(call) void;
+pub const PfnCmdUpdateBuffer = *const fn (CommandBuffer, Buffer, DeviceSize, DeviceSize, *const anyopaque) callconv(call) void;
 pub const PfnCmdClearColorImage = *const fn (CommandBuffer, Image, u32, *const ClearColorValue, u32, [*]const ImageSubresourceRange) callconv(call) void;
 pub const PfnCmdClearDepthStencilImage = *const fn (CommandBuffer, Image, u32, *const ClearDepthStencilValue, u32, [*]const ImageSubresourceRange) callconv(call) void;
 pub const PfnCmdCopyBuffer = *const fn (CommandBuffer, Buffer, Buffer, u32, [*]const BufferCopy) callconv(call) void;

@@ -696,6 +696,7 @@ const DeviceFunctions = struct {
     cmd_clear_depth_stencil_image: vk.PfnCmdClearDepthStencilImage,
     cmd_copy_buffer: vk.PfnCmdCopyBuffer,
     cmd_fill_buffer: vk.PfnCmdFillBuffer,
+    cmd_update_buffer: vk.PfnCmdUpdateBuffer,
     cmd_copy_image_to_buffer: vk.PfnCmdCopyImageToBuffer,
     cmd_copy_image: vk.PfnCmdCopyImage,
     cmd_copy_buffer_to_image: vk.PfnCmdCopyBufferToImage,
@@ -782,6 +783,7 @@ const DeviceFunctions = struct {
             .cmd_clear_depth_stencil_image = try deviceProc(get_proc, device, vk.PfnCmdClearDepthStencilImage, "vkCmdClearDepthStencilImage"),
             .cmd_copy_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyBuffer, "vkCmdCopyBuffer"),
             .cmd_fill_buffer = try deviceProc(get_proc, device, vk.PfnCmdFillBuffer, "vkCmdFillBuffer"),
+            .cmd_update_buffer = try deviceProc(get_proc, device, vk.PfnCmdUpdateBuffer, "vkCmdUpdateBuffer"),
             .cmd_copy_image_to_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer"),
             .cmd_copy_image = try deviceProc(get_proc, device, vk.PfnCmdCopyImage, "vkCmdCopyImage"),
             .cmd_copy_buffer_to_image = try deviceProc(get_proc, device, vk.PfnCmdCopyBufferToImage, "vkCmdCopyBufferToImage"),
@@ -948,8 +950,10 @@ const sampled_image_cube_descriptor_binding = dynamic_scalar_descriptor_binding 
 const sampled_image_2d_array_descriptor_binding = dynamic_scalar_descriptor_binding + 3;
 const gds_descriptor_binding = sampled_image_2d_array_descriptor_binding + 1;
 const sampled_image_comparison_2d_descriptor_binding = gds_descriptor_binding + 1;
+const packed_unorm_feedback_descriptor_binding = sampled_image_comparison_2d_descriptor_binding + 1;
 comptime {
     std.debug.assert(sampled_image_comparison_2d_descriptor_binding == rdna2.spirv.sampled_image_comparison_2d_descriptor_binding);
+    std.debug.assert(packed_unorm_feedback_descriptor_binding == rdna2.spirv.packed_unorm_feedback_descriptor_binding);
 }
 const dynamic_scalar_words_per_stage = gpu.scalar_provenance.maximum_scalar_specializations;
 const dynamic_scalar_buffer_words = dynamic_scalar_words_per_stage * 2;
@@ -1186,6 +1190,33 @@ test "graphics pipeline lease identity preserves content verification and owners
     try std.testing.expect(!entries[0].vertex_module.?.sameModule(vertex));
 }
 
+test "packed unorm blend reads single-sample layers through a feedback buffer" {
+    const blended = gpu.resources.BlendControl{
+        .enabled = true,
+        .color_source = 4,
+        .color_destination = 5,
+        .color_operation = 0,
+    };
+    switch (Renderer.decidePackedUnormBlend(blended, 7, 0, 1, 2)) {
+        .read_modify => |word| try std.testing.expectEqual(rdna2.spirv.PackedUnormBlend.encode(4, 0, 5, 7, 2), word),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (Renderer.decidePackedUnormBlend(blended, 3, 0, 1, 2)) {
+        .read_modify => |word| try std.testing.expectEqual(rdna2.spirv.PackedUnormBlend.encode(4, 0, 5, 3, 2), word),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(Renderer.decidePackedUnormBlend(blended, 7, 1, 1, 2) == .replace);
+    try std.testing.expect(Renderer.decidePackedUnormBlend(blended, 7, 0, 2, 2) == .replace);
+    try std.testing.expect(Renderer.decidePackedUnormBlend(blended, 3, 0, 2, 2) == .reject);
+    const disabled = gpu.resources.BlendControl{};
+    try std.testing.expect(Renderer.decidePackedUnormBlend(disabled, 7, 0, 1, 0) == .replace);
+    switch (Renderer.decidePackedUnormBlend(disabled, 1, 0, 1, 1)) {
+        .read_modify => |word| try std.testing.expectEqual(rdna2.spirv.PackedUnormBlend.encode(1, 0, 0, 1, 1), word),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(Renderer.decidePackedUnormBlend(blended, 0, 0, 1, 0) == .replace);
+}
+
 test "graphics pipeline key excludes dynamic draw values and preserves static state" {
     const original = GraphicsPipelineState.default(64, 64);
     var changed = GraphicsPipelineState.default(128, 32);
@@ -1203,7 +1234,7 @@ test "graphics pipeline key excludes dynamic draw values and preserves static st
     changed.stencil_front_reference = 0x35;
     changed.stencil_back_reference = 0xc2;
     try std.testing.expectEqualDeep(original.pipelineKey(), changed.pipelineKey());
-    inline for (.{ "depth_write_enable", "depth_bias_enable", "stencil_test_enable", "stencil_front_compare_mask", "stencil_back_write_mask", "rasterization_samples", "rectangle_completion", "topology" }) |field| {
+    inline for (.{ "depth_write_enable", "depth_bias_enable", "stencil_test_enable", "stencil_front_compare_mask", "stencil_back_write_mask", "rasterization_samples", "rectangle_completion", "topology", "programmable_blend" }) |field| {
         var static_change = original;
         @field(static_change, field) += 1;
         try std.testing.expect(!std.meta.eql(original.pipelineKey(), static_change.pipelineKey()));
@@ -1779,6 +1810,9 @@ const GraphicsPipelineState = extern struct {
     stencil_back_compare_mask: u32,
     stencil_back_write_mask: u32,
     stencil_back_reference: u32,
+    /// Bits name CB slots whose packed 11/11/10 UNORM blend is performed in
+    /// the fragment shader. The equation itself is part of the shader key.
+    programmable_blend: u32 = 0,
 
     /// Render-area extent and dynamic draw values do not affect pipeline
     /// compatibility. Keep the original state for recording each draw, and
@@ -1863,6 +1897,7 @@ const GraphicsPipelineState = extern struct {
             .stencil_back_compare_mask = 0,
             .stencil_back_write_mask = 0,
             .stencil_back_reference = 0,
+            .programmable_blend = 0,
         };
     }
 };
@@ -2676,6 +2711,8 @@ const ColorPass = struct {
     depth_format: u32 = 0,
     render_pass: vk.RenderPass,
     framebuffer: vk.Framebuffer,
+    /// CB slots read as subpass inputs. Zero keeps the pass free of feedback.
+    input_mask: u8 = 0,
     last_used_sequence: u64 = 0,
 };
 
@@ -5032,6 +5069,12 @@ pub const Renderer = struct {
     sampled_image_device_budget_bytes: u64 = 3 * 1024 * 1024 * 1024,
     sampled_image_device_bytes: u64 = 0,
     gds_buffer: ?OwnedBuffer = null,
+    /// Device copy of packed 11/11/10 attachments. One allocation is reused
+    /// and grown; a later submission waits until the previous reader finishes.
+    packed_unorm_feedback: ?OwnedBuffer = null,
+    packed_feedback_tick: u64 = 0,
+    packed_feedback_pending: bool = false,
+    packed_feedback_slot: ?usize = null,
     /// Commands recorded by the current guest frame. Graphics work appends to
     /// this ring and reaches the Vulkan queue as one ordered submission at a
     /// guest release/flip instead of one submit-and-wait per draw.
@@ -5140,6 +5183,10 @@ pub const Renderer = struct {
     shader_float64_available: bool,
     image_float32_atomic_min_max_available: bool,
     fragment_barycentric_available: bool,
+    /// VK_EXT_rasterization_order_attachment_access. Queried, but packed
+    /// UNORM blends use a storage-buffer copy because this GPU does not
+    /// expose the extension.
+    rasterization_order_color: bool = false,
     validation_enabled: bool,
     graphics_probe_enabled: bool,
     capture_first_graphics_frame: bool,
@@ -5722,6 +5769,12 @@ pub const Renderer = struct {
         );
         const shader_layer = physicalDeviceSupportsExtension(allocator, &instance_functions, candidate.physical_device, "VK_EXT_shader_viewport_index_layer");
         const barycentric_extension = physicalDeviceSupportsExtension(allocator, &instance_functions, candidate.physical_device, "VK_KHR_fragment_shader_barycentric");
+        const raster_order_extension = physicalDeviceSupportsExtension(
+            allocator,
+            &instance_functions,
+            candidate.physical_device,
+            "VK_EXT_rasterization_order_attachment_access",
+        );
         var barycentric_support = vk.PhysicalDeviceFragmentShaderBarycentricFeaturesKHR{};
         var shader_atomic_float2_support = vk.PhysicalDeviceShaderAtomicFloat2FeaturesEXT{
             .p_next = if (barycentric_extension) &barycentric_support else null,
@@ -5732,7 +5785,12 @@ pub const Renderer = struct {
         var timeline_support = vk.PhysicalDeviceTimelineSemaphoreFeatures{
             .p_next = &descriptor_indexing_support,
         };
-        var supported_features_2 = vk.PhysicalDeviceFeatures2{ .p_next = &timeline_support };
+        var raster_order_support = vk.PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT{
+            .p_next = &timeline_support,
+        };
+        var supported_features_2 = vk.PhysicalDeviceFeatures2{
+            .p_next = if (raster_order_extension) &raster_order_support else &timeline_support,
+        };
         instance_functions.get_physical_device_features_2(candidate.physical_device, &supported_features_2);
         if (timeline_support.timeline_semaphore == 0) return Error.TimelineSemaphoreUnavailable;
         const descriptor_partially_bound = descriptor_indexing_support.descriptor_binding_partially_bound != 0;
@@ -5742,6 +5800,8 @@ pub const Renderer = struct {
             shader_atomic_float2_support.shader_image_float32_atomic_min_max != 0;
         const supported_features = supported_features_2.features;
         const fragment_barycentric = barycentric_extension and barycentric_support.fragment_shader_barycentric != 0;
+        const rasterization_order_color = raster_order_extension and
+            raster_order_support.rasterization_order_color_attachment_access != 0;
         var enabled_features = vk.PhysicalDeviceFeatures{};
         const cube_arrays = supported_features.values[vk.feature_image_cube_array] != 0;
         if (cube_arrays) enabled_features.values[vk.feature_image_cube_array] = vk.true_value;
@@ -5831,7 +5891,11 @@ pub const Renderer = struct {
             subgroup_properties.supported_operations & 0x4 != 0;
         candidate.info.fragment_subgroup_quad = subgroup_properties.supported_stages & vk.shader_stage_fragment_bit != 0 and
             subgroup_properties.supported_operations & 0x80 != 0;
-        var device_extension_names: [6][*:0]const u8 = undefined;
+        var raster_order_enable = vk.PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT{
+            .p_next = &timeline_enable,
+            .rasterization_order_color_attachment_access = if (rasterization_order_color) vk.true_value else 0,
+        };
+        var device_extension_names: [8][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
         if (shader_layer) {
             device_extension_names[device_extension_count] = "VK_EXT_shader_viewport_index_layer";
@@ -5857,8 +5921,12 @@ pub const Renderer = struct {
             device_extension_names[device_extension_count] = "VK_KHR_fragment_shader_barycentric";
             device_extension_count += 1;
         }
+        if (rasterization_order_color) {
+            device_extension_names[device_extension_count] = "VK_EXT_rasterization_order_attachment_access";
+            device_extension_count += 1;
+        }
         const device_info = vk.DeviceCreateInfo{
-            .p_next = &timeline_enable,
+            .p_next = if (rasterization_order_color) &raster_order_enable else &timeline_enable,
             .queue_create_info_count = 1,
             .queue_create_infos = @ptrCast(&queue_info),
             .enabled_extension_count = device_extension_count,
@@ -5916,7 +5984,7 @@ pub const Renderer = struct {
             .descriptor_count = candidate.info.sampled_image_capacity,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
-        var descriptor_bindings: [8 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
+        var descriptor_bindings: [9 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
         descriptor_bindings[0] = storage_binding;
         descriptor_bindings[1] = sampled_image_binding;
         for (0..maximum_storage_images) |index| {
@@ -5965,6 +6033,12 @@ pub const Renderer = struct {
             .descriptor_count = candidate.info.sampled_image_capacity,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
+        descriptor_bindings[8 + maximum_storage_images] = .{
+            .binding = packed_unorm_feedback_descriptor_binding,
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .descriptor_count = 1,
+            .stage_flags = vk.shader_stage_fragment_bit,
+        };
         var descriptor_binding_flags: [descriptor_bindings.len]vk.Flags = @splat(0);
         if (descriptor_partially_bound) {
             @memset(&descriptor_binding_flags, vk.descriptor_binding_partially_bound_bit);
@@ -5993,7 +6067,7 @@ pub const Renderer = struct {
 
         const pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_storage_buffer,
-            .descriptor_count = (maximum_storage_descriptors + 2) * maximum_frame_descriptor_sets,
+            .descriptor_count = (maximum_storage_descriptors + 3) * maximum_frame_descriptor_sets,
         };
         const image_pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
@@ -6124,6 +6198,7 @@ pub const Renderer = struct {
             .shader_float64_available = shader_float64,
             .image_float32_atomic_min_max_available = image_float32_atomic_min_max,
             .fragment_barycentric_available = fragment_barycentric,
+            .rasterization_order_color = rasterization_order_color,
             .validation_enabled = validation_enabled,
             .graphics_probe_enabled = options.enable_graphics_probe,
             .capture_first_graphics_frame = options.capture_first_graphics_frame,
@@ -6362,6 +6437,7 @@ pub const Renderer = struct {
             self.destroyBuffer(buffer);
         }
         if (self.gds_buffer) |buffer| self.destroyBuffer(buffer);
+        if (self.packed_unorm_feedback) |buffer| self.destroyBuffer(buffer);
         self.gds_storage.deinit(self.allocator);
         // Persist compiled pipelines for the next run before the cache handle
         // is destroyed.
@@ -12927,7 +13003,7 @@ pub const Renderer = struct {
         preserve_color: bool,
         samples: u32,
     ) Error!vk.RenderPass {
-        return self.createColorRenderPass(&.{format}, 0, preserve_color, samples);
+        return self.createColorRenderPass(&.{format}, 0, preserve_color, samples, 0);
     }
 
     /// Colour attachments occupy hardware slots 0..N-1. A zero format is a
@@ -12939,6 +13015,7 @@ pub const Renderer = struct {
         depth_format: u32,
         preserve_color: bool,
         samples: u32,
+        input_mask: u8,
     ) Error!vk.RenderPass {
         if ((color_formats.len == 0 and depth_format == 0) or color_formats.len > gpu.resources.color_target_count) {
             return Error.UnsupportedGraphicsState;
@@ -12997,16 +13074,52 @@ pub const Renderer = struct {
             attachment_count += 1;
         }
         if (attachment_count == 0) return Error.UnsupportedGraphicsState;
-        const subpass = vk.SubpassDescription{
+        var input_refs: [gpu.resources.color_target_count]vk.AttachmentReference = undefined;
+        if (input_mask != 0) {
+            for (0..gpu.resources.color_target_count) |slot| {
+                const used = input_mask & (@as(u8, 1) << @intCast(slot)) != 0 and
+                    slot < color_formats.len and color_formats[slot] != 0;
+                input_refs[slot] = if (used)
+                    color_refs[slot]
+                else
+                    .{
+                        .attachment = vk.attachment_unused,
+                        .layout = vk.image_layout_color_attachment_optimal,
+                    };
+            }
+        }
+        var subpass = vk.SubpassDescription{
             .color_attachment_count = @intCast(color_formats.len),
             .color_attachments = &color_refs,
             .depth_stencil_attachment = if (depth_format != 0) &depth_ref else null,
         };
+        // Each draw is its own render pass, so the value being blended is the
+        // loaded pixel from the previous pass. The external edge makes that
+        // load visible to the fragment read. The self edge covers a later
+        // fragment in the same draw.
+        const feedback = vk.SubpassDependency{
+            .source_stage_mask = vk.pipeline_stage_color_attachment_output_bit,
+            .destination_stage_mask = vk.pipeline_stage_fragment_shader_bit,
+            .source_access_mask = vk.access_color_attachment_write_bit,
+            .destination_access_mask = vk.access_input_attachment_read_bit,
+            .dependency_flags = vk.dependency_by_region_bit,
+            .source_subpass = vk.subpass_external,
+            .destination_subpass = 0,
+        };
+        var dependencies = [2]vk.SubpassDependency{ feedback, feedback };
+        dependencies[1].source_subpass = 0;
+        if (input_mask != 0) {
+            subpass.flags = vk.subpass_description_rasterization_order_attachment_color_access_bit;
+            subpass.input_attachment_count = @intCast(gpu.resources.color_target_count);
+            subpass.input_attachments = &input_refs;
+        }
         const info = vk.RenderPassCreateInfo{
             .attachment_count = attachment_count,
             .attachments = &attachments,
             .subpass_count = 1,
             .subpasses = @ptrCast(&subpass),
+            .dependency_count = if (input_mask != 0) dependencies.len else 0,
+            .dependencies = if (input_mask != 0) &dependencies else null,
         };
         var render_pass: vk.RenderPass = 0;
         if (self.device_functions.create_render_pass(self.device, &info, null, &render_pass) != vk.success) {
@@ -13075,7 +13188,7 @@ pub const Renderer = struct {
         preserve_color: bool,
         samples: u32,
     ) Error!vk.RenderPass {
-        return self.createColorRenderPass(&.{color_format}, depth_format, preserve_color, samples);
+        return self.createColorRenderPass(&.{color_format}, depth_format, preserve_color, samples, 0);
     }
 
     /// The colour target's framebuffer paired with one depth attachment,
@@ -13135,10 +13248,12 @@ pub const Renderer = struct {
         color_count: u8,
         depth_view: vk.ImageView,
         depth_format: u32,
+        input_mask: u8,
     ) bool {
         if (pass.color_count != color_count or
             pass.depth_view != depth_view or
-            pass.depth_format != depth_format)
+            pass.depth_format != depth_format or
+            pass.input_mask != input_mask)
         {
             return false;
         }
@@ -13196,10 +13311,11 @@ pub const Renderer = struct {
         width: u32,
         height: u32,
         layers: u32,
+        input_mask: u8,
     ) anyerror!ColorPass {
         self.color_pass_sequence +%= 1;
         for (self.color_passes.items) |*existing| {
-            if (!colorPassMatches(existing.*, color_views, color_count, depth_view, depth_format)) continue;
+            if (!colorPassMatches(existing.*, color_views, color_count, depth_view, depth_format, input_mask)) continue;
             existing.last_used_sequence = self.color_pass_sequence;
             return existing.*;
         }
@@ -13209,6 +13325,7 @@ pub const Renderer = struct {
             depth_format,
             true,
             samples,
+            input_mask,
         );
         errdefer self.destroyRenderPass(render_pass);
 
@@ -13243,6 +13360,7 @@ pub const Renderer = struct {
             .depth_format = depth_format,
             .render_pass = render_pass,
             .framebuffer = framebuffer,
+            .input_mask = input_mask,
             .last_used_sequence = self.color_pass_sequence,
         };
         if (self.color_passes.items.len >= maximum_color_passes) self.evictColorPass();
@@ -13250,10 +13368,68 @@ pub const Renderer = struct {
         return pass;
     }
 
+    const PackedUnormBlendDecision = union(enum) {
+        replace,
+        reject,
+        read_modify: u32,
+    };
+
+    /// Vulkan has no 11/11/10 UNORM attachment, so the packed word stays
+    /// R32_UINT. A single-sample 2D target is copied into a storage buffer
+    /// and blended in the shader. MSAA and array layers have no defined
+    /// feedback here: a full mask is replaced and a partial mask is rejected.
+    fn decidePackedUnormBlend(
+        blend: gpu.resources.BlendControl,
+        physical_mask: u32,
+        samples_log2: u8,
+        layers: u32,
+        slot: u32,
+    ) PackedUnormBlendDecision {
+        if (physical_mask == 0 or (physical_mask == 7 and !blend.enabled)) return .replace;
+        const can_read = samples_log2 == 0 and layers == 1;
+        if (!can_read) return if (physical_mask == 7) .replace else .reject;
+        if (blend.enabled) {
+            if (blend.color_operation != 0 and blend.color_operation != 1 and blend.color_operation != 4) return .reject;
+            if (blend.color_source > 9 or blend.color_destination > 9) return .reject;
+        }
+        const source_factor: u32 = if (blend.enabled) blend.color_source else 1;
+        const destination_factor: u32 = if (blend.enabled) blend.color_destination else 0;
+        const operation: u32 = if (blend.enabled) blend.color_operation else 0;
+        return .{ .read_modify = rdna2.spirv.PackedUnormBlend.encode(
+            source_factor,
+            operation,
+            destination_factor,
+            physical_mask,
+            slot,
+        ) };
+    }
+
+    fn packedFeedbackColor(slot: u32, target: GuestColorTarget, extra_colors: []const GuestColorTarget) ?GuestColorTarget {
+        if (target.descriptor.slot == slot) return target;
+        for (extra_colors) |extra| if (extra.descriptor.slot == slot) return extra;
+        return null;
+    }
+
+    fn packedUnormFeedbackBytes(mask: u32, target: GuestColorTarget, extra_colors: []const GuestColorTarget) Error!u64 {
+        var cursor: u32 = 16;
+        var bits = mask;
+        while (bits != 0) {
+            const slot = @ctz(bits);
+            bits &= bits - 1;
+            if (slot >= gpu.resources.color_target_count) return Error.UnsupportedColorTarget;
+            const color = packedFeedbackColor(slot, target, extra_colors) orelse return Error.UnsupportedColorTarget;
+            if (color.layout.layers != 1 or color.descriptor.fragments_log2 != 0) return Error.UnsupportedColorTarget;
+            const pixels = std.math.mul(u32, color.descriptor.width, color.descriptor.height) catch return Error.UnsupportedColorTarget;
+            cursor = std.math.add(u32, cursor, pixels) catch return Error.UnsupportedColorTarget;
+        }
+        return @as(u64, cursor) * 4;
+    }
+
     fn applyColorAttachmentState(
         result: *GraphicsPipelineState,
         render: *const gpu.RenderState,
         colors: []const GuestColorTarget,
+        packed_unorm_blend: *[gpu.resources.color_target_count]u32,
     ) Error!void {
         result.color_attachment_count = 1;
         result.color_attachment_formats = @splat(0);
@@ -13265,6 +13441,8 @@ pub const Renderer = struct {
         result.source_alpha_blend_factors = @splat(0);
         result.destination_alpha_blend_factors = @splat(0);
         result.alpha_blend_operations = @splat(0);
+        result.programmable_blend = 0;
+        @memset(packed_unorm_blend, 0);
 
         var highest: u32 = 0;
         for (colors) |color| {
@@ -13286,11 +13464,24 @@ pub const Renderer = struct {
             const blend = render.blends[slot];
             if (colorTargetExportType(color.descriptor) == .r11g11b10_unorm) {
                 const physical_mask = result.color_write_masks[slot] & 7;
-                // One host integer channel contains all three guest channels.
-                // Partial updates and blending require read/modify/write and
-                // cannot silently use integer attachment semantics.
-                if (physical_mask != 0 and (physical_mask != 7 or blend.enabled)) return Error.UnsupportedColorTarget;
-                result.color_write_masks[slot] = if (physical_mask == 0) 0 else 1;
+                switch (decidePackedUnormBlend(
+                    blend,
+                    physical_mask,
+                    color.descriptor.fragments_log2,
+                    color.layout.layers,
+                    slot,
+                )) {
+                    .reject => return Error.UnsupportedColorTarget,
+                    .replace => result.color_write_masks[slot] = if (physical_mask == 0) 0 else 1,
+                    .read_modify => |word| {
+                        result.programmable_blend |= @as(u32, 1) << @intCast(slot);
+                        packed_unorm_blend[slot] = word;
+                        result.color_write_masks[slot] = 1;
+                    },
+                }
+                // Packed slots never reach vulkanBlendFactor. Unsupported
+                // factors are rejected above, before the feedback copy.
+                continue;
             }
             // Integer attachments reject colour blending; Yotei's ID plane is
             // R32_UINT and the G-buffer pass that fills it has blend off already.
@@ -16621,15 +16812,15 @@ pub const Renderer = struct {
         // compatible with, so it has to be resolved before the pipeline is
         // looked up rather than at the point the pass begins.
         const depth_index: ?usize = if (depth) |plane| try self.acquireDepthTarget(plane) else null;
-        const multi_color = pipeline_state.color_attachment_count > 1;
+        const use_shared_color_pass = pipeline_state.color_attachment_count > 1;
+        var color_views: [gpu.resources.color_target_count]vk.ImageView = @splat(0);
         var color_pass: ?ColorPass = null;
-        const depth_pass: ?DepthPass = if (!multi_color) blk: {
+        const depth_pass: ?DepthPass = if (!use_shared_color_pass) blk: {
             break :blk if (depth_index) |index|
                 try self.acquireDepthPass(target_index, index)
             else
                 null;
         } else blk: {
-            var color_views: [gpu.resources.color_target_count]vk.ImageView = @splat(0);
             var color_formats: [gpu.resources.color_target_count]u32 = @splat(0);
             color_views[target.descriptor.slot] = self.render_targets.items[target_index].view;
             color_formats[target.descriptor.slot] = target.format.vulkan;
@@ -16652,6 +16843,7 @@ pub const Renderer = struct {
                 pipeline_state.width,
                 pipeline_state.height,
                 target.layout.layers,
+                0,
             );
             break :blk null;
         };
@@ -16677,6 +16869,10 @@ pub const Renderer = struct {
             modules,
         );
         self.frame_profile.graphics_pipeline_lookup_ns +|= elapsedHostNanoseconds(pipeline_lookup_started);
+        if (pipeline_state.programmable_blend != 0) {
+            const feedback_bytes = try packedUnormFeedbackBytes(pipeline_state.programmable_blend, target, extra_colors);
+            try self.ensurePackedUnormFeedback(feedback_bytes);
+        }
         const scalar_upload_started = self.resourceTimestampNs();
         try self.writeGraphicsScalarValues(vertex_scalars, fragment_scalars);
         self.frame_profile.graphics_scalar_upload_ns +|= elapsedHostNanoseconds(scalar_upload_started);
@@ -16769,6 +16965,16 @@ pub const Renderer = struct {
         if (depth_index) |index| {
             try self.prepareDepthAttachment(command_buffer, index, depth_clear_requested);
         }
+        if (pipeline_state.programmable_blend != 0) {
+            try self.copyPackedUnormFeedback(
+                command_buffer,
+                pipeline_state.programmable_blend,
+                target,
+                target_index,
+                extra_colors,
+                extra_indices[0..extra_colors.len],
+            );
+        }
         const begin_info = vk.RenderPassBeginInfo{
             .render_pass = pass_handle,
             .framebuffer = framebuffer_handle,
@@ -16782,7 +16988,8 @@ pub const Renderer = struct {
         self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
         self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
         self.setGraphicsDynamicState(command_buffer, pipeline_state);
-        if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0) {
+        if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0 or pipeline_state.programmable_blend != 0) {
+            if (pipeline_state.programmable_blend != 0) self.writePackedUnormFeedbackDescriptor();
             self.flushStorageDescriptors();
             self.device_functions.cmd_bind_descriptor_sets(
                 command_buffer,
@@ -16888,11 +17095,13 @@ pub const Renderer = struct {
             depth.width,
             depth.height,
             1,
+            0,
         );
         var state = pipeline_state;
         state.color_attachment_count = 0;
         state.color_attachment_formats = @splat(0);
         state.color_write_masks = @splat(0);
+        state.programmable_blend = 0;
         const pipeline = try self.getGraphicsPipeline(pass.render_pass, state, vertex_words, fragment_words, modules);
         try self.writeGraphicsScalarValues(vertex_scalars, fragment_scalars);
 
@@ -20437,7 +20646,13 @@ pub const Renderer = struct {
         );
         var pipeline_state = try guestGraphicsState(&render_state, descriptor);
         if (!self.honor_guest_culling) pipeline_state.cull_mode = 0;
-        try applyColorAttachmentState(&pipeline_state, &render_state, bound_colors[0..bound_color_count]);
+        var packed_unorm_blend: [gpu.resources.color_target_count]u32 = @splat(0);
+        try applyColorAttachmentState(
+            &pipeline_state,
+            &render_state,
+            bound_colors[0..bound_color_count],
+            &packed_unorm_blend,
+        );
         pipeline_state.topology = guestPrimitiveTopology(render_state.primitive_type, draw);
         if (tessellation) |tess| {
             pipeline_state.tessellation_control_points = tess.config.control_points;
@@ -21565,6 +21780,7 @@ pub const Renderer = struct {
             @splat(color_export_identity);
         var color_export_types: [gpu.resources.color_target_count]rdna2.spirv.ColorExportType = @splat(.float32);
         var packed_color_exports: [gpu.resources.color_target_count]rdna2.spirv.PackedColorExport = @splat(.float16);
+        var packed_unorm_blend_exports: [gpu.resources.color_target_count]u32 = @splat(0);
         const shader_color_format = state.readRegister(.context, 0x1c5) orelse 0;
         const color_export_locations = gpu.resources.colorExportLocations(render_state.shader_mask, shader_color_format);
         for (&packed_color_exports, 0..) |*format, slot| {
@@ -21579,6 +21795,7 @@ pub const Renderer = struct {
                 if (location != color.descriptor.slot) continue;
                 color_export_mappings[export_index] = colorTargetExportMapping(color.descriptor);
                 color_export_types[export_index] = colorTargetExportType(color.descriptor);
+                packed_unorm_blend_exports[export_index] = packed_unorm_blend[color.descriptor.slot];
             }
         }
 
@@ -21617,6 +21834,7 @@ pub const Renderer = struct {
             .color_export_locations = color_export_locations,
             .color_export_types = color_export_types,
             .packed_color_exports = packed_color_exports,
+            .packed_unorm_blend = packed_unorm_blend_exports,
             .descriptor_array_length = maximum_storage_descriptors,
             .scalar_memories = fragment_storage.scalar_memories[0..fragment_storage.scalar_memory_count],
             .flat_memories = fragment_storage.flat_memories[0..fragment_storage.flat_memory_count],
@@ -23648,6 +23866,163 @@ pub const Renderer = struct {
             0,
             null,
         );
+        self.active_descriptor_set = self.descriptor_set;
+    }
+
+    fn ensurePackedUnormFeedback(self: *Renderer, bytes: u64) Error!void {
+        if (self.packed_unorm_feedback) |existing| if (existing.size >= bytes) return;
+        if (self.open_batch_commands or self.pending_command_buffers.items.len != 0) try self.flushQueuedCommands();
+        if (self.recording_command_buffer != null) return Error.CommandBufferEndFailed;
+        try self.refreshGpuProgress();
+        if (self.packed_feedback_tick != 0 and self.packed_feedback_tick > self.completed_tick) try self.waitForTick(self.packed_feedback_tick);
+        if (self.packed_unorm_feedback) |existing| {
+            self.destroyBuffer(existing);
+            self.packed_unorm_feedback = null;
+        }
+        const usage = vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_dst_bit;
+        self.packed_unorm_feedback = self.createBuffer(bytes, usage, vk.memory_property_device_local_bit) catch try self.createBuffer(
+            bytes,
+            usage,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        self.packed_feedback_pending = false;
+        self.packed_feedback_slot = null;
+    }
+
+    /// Returns true when this command buffer already copied the feedback
+    /// buffer and must order the next transfer after that fragment read.
+    fn claimPackedUnormFeedback(self: *Renderer, command_buffer: vk.CommandBuffer) Error!bool {
+        const slot = self.recording_command_slot orelse return Error.CommandBufferBeginFailed;
+        const same = self.packed_feedback_pending and self.packed_feedback_slot == slot and self.recording_command_buffer == command_buffer;
+        if (same) return true;
+        try self.refreshGpuProgress();
+        if (self.packed_feedback_tick != 0 and self.packed_feedback_tick > self.completed_tick) try self.waitForTick(self.packed_feedback_tick);
+        self.packed_feedback_pending = true;
+        self.packed_feedback_slot = slot;
+        return false;
+    }
+
+    fn copyPackedUnormFeedback(
+        self: *Renderer,
+        command_buffer: vk.CommandBuffer,
+        mask: u32,
+        target: GuestColorTarget,
+        target_index: usize,
+        extra_colors: []const GuestColorTarget,
+        extra_indices: []const usize,
+    ) Error!void {
+        const continued = try self.claimPackedUnormFeedback(command_buffer);
+        const buffer = self.packed_unorm_feedback orelse return Error.UnsupportedColorTarget;
+        var header: [16]u32 = @splat(0);
+        var copies: [gpu.resources.color_target_count]vk.BufferImageCopy = undefined;
+        var images: [gpu.resources.color_target_count]vk.Image = undefined;
+        var count: usize = 0;
+        var cursor: u32 = 16;
+        var bits = mask;
+        while (bits != 0) {
+            const slot = @ctz(bits);
+            bits &= bits - 1;
+            if (slot >= gpu.resources.color_target_count) return Error.UnsupportedColorTarget;
+            const color = packedFeedbackColor(slot, target, extra_colors) orelse return Error.UnsupportedColorTarget;
+            if (color.layout.layers != 1) return Error.UnsupportedColorTarget;
+            const image = if (target.descriptor.slot == slot)
+                self.render_targets.items[target_index].image.handle
+            else blk: {
+                var found: ?vk.Image = null;
+                for (extra_colors, extra_indices) |extra, index| {
+                    if (extra.descriptor.slot != slot) continue;
+                    found = self.render_targets.items[index].image.handle;
+                    break;
+                }
+                break :blk found orelse return Error.UnsupportedColorTarget;
+            };
+            const pixels = std.math.mul(u32, color.descriptor.width, color.descriptor.height) catch return Error.UnsupportedColorTarget;
+            const next = std.math.add(u32, cursor, pixels) catch return Error.UnsupportedColorTarget;
+            header[slot] = color.descriptor.width;
+            header[8 + slot] = cursor;
+            copies[count] = .{
+                .buffer_offset = @as(vk.DeviceSize, cursor) * 4,
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .image_extent = .{ .width = color.descriptor.width, .height = color.descriptor.height, .depth = 1 },
+            };
+            images[count] = image;
+            count += 1;
+            cursor = next;
+        }
+        if (continued) {
+            const before = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_shader_read_bit,
+                .destination_access_mask = vk.access_transfer_write_bit,
+                .buffer = buffer.handle,
+                .offset = 0,
+                .size = buffer.size,
+            };
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                vk.pipeline_stage_fragment_shader_bit,
+                vk.pipeline_stage_transfer_bit,
+                0,
+                0,
+                null,
+                1,
+                @ptrCast(&before),
+                0,
+                null,
+            );
+        }
+        self.device_functions.cmd_update_buffer(command_buffer, buffer.handle, 0, header.len * 4, &header);
+        for (images[0..count], copies[0..count]) |image, *region| {
+            const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+            try self.transitionTrackedImage(command_buffer, image, range, image_state.transfer_source_usage);
+            self.device_functions.cmd_copy_image_to_buffer(
+                command_buffer,
+                image,
+                vk.image_layout_transfer_src_optimal,
+                buffer.handle,
+                1,
+                @ptrCast(region),
+            );
+            try self.transitionTrackedImage(command_buffer, image, range, image_state.color_attachment_usage);
+        }
+        const after = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_shader_read_bit,
+            .buffer = buffer.handle,
+            .offset = 0,
+            .size = buffer.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_fragment_shader_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&after),
+            0,
+            null,
+        );
+    }
+
+    fn writePackedUnormFeedbackDescriptor(self: *Renderer) void {
+        const buffer = self.packed_unorm_feedback orelse return;
+        const buffer_info = vk.DescriptorBufferInfo{
+            .buffer = buffer.handle,
+            .offset = 0,
+            .range = buffer.size,
+        };
+        const write = vk.WriteDescriptorSet{
+            .destination_set = self.descriptor_set,
+            .destination_binding = packed_unorm_feedback_descriptor_binding,
+            .destination_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .buffer_info = @ptrCast(&buffer_info),
+        };
+        // Binding 40 is unused by draws recorded earlier in this set. The set
+        // is still recording, so the update is not visible to a previous submit.
+        self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
         self.active_descriptor_set = self.descriptor_set;
     }
 
@@ -27760,6 +28135,11 @@ pub const Renderer = struct {
             return Error.QueueSubmissionFailed;
         }
         self.submitted_tick = signal_tick;
+        if (self.packed_feedback_pending) {
+            self.packed_feedback_tick = signal_tick;
+            self.packed_feedback_pending = false;
+            self.packed_feedback_slot = null;
+        }
         for (self.guest_buffers.items) |*entry| {
             if (entry.last_gpu_use == command_buffer_pending_tick) entry.last_gpu_use = signal_tick;
         }
@@ -33244,6 +33624,17 @@ fn drawReuseInputKey(state: *const gpu.State, pipeline: GraphicsPipelineState, s
     // or Vulkan attachment formats (for example, an MRT hole moves).
     std.hash.autoHash(&hasher, state.readRegister(.context, 0x08f));
     std.hash.autoHash(&hasher, state.readRegister(.context, 0x1c5));
+    // Packed UNORM feedback stores the equation in the shader, not in the
+    // fixed-function blend fields. A factor change must miss draw reuse.
+    if (pipeline.programmable_blend != 0) {
+        var bits = pipeline.programmable_blend;
+        while (bits != 0) {
+            const slot = @ctz(bits);
+            bits &= bits - 1;
+            if (slot >= gpu.resources.color_target_count) continue;
+            std.hash.autoHash(&hasher, state.readRegister(.context, 0x1e0 + @as(u32, @intCast(slot))));
+        }
+    }
     for (0..gpu.resources.color_target_count) |slot|
         std.hash.autoHash(&hasher, state.readRegister(.context, 0x31c + @as(u32, @intCast(slot)) * 15));
     // The analysis owns immutable decoded instructions; changed programs are
