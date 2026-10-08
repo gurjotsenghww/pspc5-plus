@@ -90,6 +90,7 @@ pub const Runtime = struct {
         }
         try hle.registerAll(&self.database, allocator);
         hle.libs.audio.reset();
+        hle.libs.font.reset();
         hle.apr.reset();
         hle.libs.bootstrap_services.reset();
         hle.libs.dialogs.reset();
@@ -120,6 +121,7 @@ pub const Runtime = struct {
         hle.libs.kernel_memory.attachAddressSpace(null);
         hle.libs.kernel_memory.deinit();
         hle.libs.audio.reset();
+        hle.libs.font.reset();
         hle.apr.reset();
         hle.libs.bootstrap_services.reset();
         hle.libs.dialogs.reset();

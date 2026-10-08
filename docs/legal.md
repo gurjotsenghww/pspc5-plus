@@ -27,6 +27,10 @@ and license texts are included in [licenses](licenses/README.md), which is also
 shipped in the Windows packages. Dependency versions and source archives are
 pinned in [build.zig.zon](../build.zig.zon).
 
+Font rendering links FreeType under the FreeType License and embeds Noto Sans
+Regular under the SIL Open Font License 1.1. Their attribution and full license
+texts are also included in [licenses](licenses/README.md).
+
 ## Legal note
 
 This project emulates firmware interfaces. It ships no console firmware, no

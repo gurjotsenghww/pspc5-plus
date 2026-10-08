@@ -81,6 +81,38 @@ interpreted. Such builds fall back to the host default so the tooling still
 compiles, and `abi.can_run_guest_code` records that nothing there is actually
 callable from a guest.
 
+## Font rendering
+
+`libSceFont` uses a statically linked FreeType rasterizer for title-supplied
+TrueType/OpenType outline fonts. System-font requests use the bundled Noto Sans
+substitute (Latin, Greek and Cyrillic); it is not an exact replacement for every
+firmware font. Each font has independent scale, render scale, slant and lifetime.
+Closing a library releases its faces, and runtime teardown clears font state.
+
+The glyph path implements real metrics, horizontal layout, basic pair kerning,
+antialiased coverage output, clipping and render-result descriptors. A bounded
+glyph cache avoids rerasterizing repeated characters; a separate pair cache
+reuses kerning across sizes. Font bytes are copied on open so later unmapping of
+the title's source buffer cannot invalidate the rasterizer. Writes validate CPU
+permissions and invalidate GPU page watches before modifying a texture atlas.
+Valid Unicode codes absent from a face use its `.notdef` outline, including
+control codes encountered while building a complete atlas range. Invalid Unicode
+scalars and out-of-range explicit glyph IDs still return an error.
+
+The current surface path writes coverage to 1–4 byte pixels. Text shaping,
+bidirectional string layout, synthetic weight, CJK system-font substitution,
+collection-face selection and the higher-level FontWriting/String APIs are not
+implemented. A supplied font can contain CJK glyphs. This implementation does
+not affect titles that draw text entirely through their own engine font system.
+
+Focused checks: `zig build test-hle -Dtest-filter=font`.
+
+The following diagnostic was rendered through the registered guest ABI exports
+(library/font creation, scale, kerning and glyph rendering), rather than a host
+text widget. It is a font HLE sample, not a game screenshot.
+
+![Font HLE rendering Latin and Cyrillic at several sizes and with slant](../images/font-hle-preview.png)
+
 ## Implemented libraries
 
 **`libkernel` — virtual and direct memory** ([src/hle/libs/kernel_memory.zig](../../src/hle/libs/kernel_memory.zig))

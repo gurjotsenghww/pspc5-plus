@@ -207,6 +207,15 @@ first in-engine gameplay scene.*
 This earlier development capture precedes the maintainer's full-playability
 confirmation.*
 
+![Jurassic Park first level after the font atlas startup fix](images/jurassic-park-font-fix-gameplay.png)
+
+*October 8, 2026 startup regression check: the new Font HLE rejected `U+007F`
+while the collection built its ImGui atlas, triggering `CalcGlyphInfo`'s
+assertion and terminating `CarbonMainThread`. Other threads kept waiting and
+reported pending AGC commands. Missing characters now use the font's `.notdef`
+glyph; the corrected runner reaches the first level shown above. All 569 HLE
+tests pass, including complete Latin-1 atlas metrics and rendering coverage.*
+
 ![REANIMAL partial title menu rendered by PS5PCEM](images/reanimal-menu-partial.png)
 
 *A live REANIMAL title-menu frame produced by the guest Unity render graph. The

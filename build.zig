@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
     const minimp3 = b.dependency("minimp3", .{});
     const faad2 = b.dependency("faad2", .{});
     const libopus = b.dependency("libopus", .{});
+    const freetype = b.dependency("freetype", .{});
 
     // Fixed-address guest virtual memory. Kept below loader and HLE so both can
     // use the same identity-mapped address space without depending on each
@@ -122,6 +123,35 @@ pub fn build(b: *std.Build) void {
     hle.addIncludePath(faad2.path("include"));
     hle.addIncludePath(b.path("src/hle/codecs"));
     hle.addIncludePath(libopus.path("include"));
+
+    // Statically linked: title fonts never depend on an installed host DLL or
+    // host font collection. Keep only the outline formats used by Font HLE.
+    const font_lib = b.addLibrary(.{
+        .name = "freetype",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    font_lib.root_module.addIncludePath(freetype.path("include"));
+    font_lib.root_module.addIncludePath(b.path("src/hle/fonts"));
+    font_lib.root_module.addCMacro("FT2_BUILD_LIBRARY", "1");
+    font_lib.root_module.addCMacro("TT_CONFIG_OPTION_GPOS_KERNING", "1");
+    font_lib.root_module.addCMacro("FT_CONFIG_MODULES_H", "\"ps5pcem_ft_modules.h\"");
+    font_lib.root_module.addCSourceFiles(.{
+        .root = freetype.path("src"),
+        .files = &.{
+            "base/ftbase.c",   "base/ftinit.c",   "base/ftsystem.c",     "base/ftdebug.c",
+            "base/ftbitmap.c", "base/ftglyph.c",  "truetype/truetype.c", "cff/cff.c",
+            "sfnt/sfnt.c",     "psaux/psaux.c",   "psnames/psnames.c",   "pshinter/pshinter.c",
+            "smooth/smooth.c", "raster/raster.c", "gzip/ftgzip.c",       "base/ftmm.c",
+        },
+        .flags = &.{"-std=c99"},
+    });
+    hle.addIncludePath(freetype.path("include"));
+    hle.linkLibrary(font_lib);
 
     const faad_lib = b.addLibrary(.{
         .name = "faad2",

@@ -29,6 +29,7 @@ pub const libs = struct {
     pub const cxx_abi = @import("libs/cxx_abi.zig");
     pub const dialogs = @import("libs/dialogs.zig");
     pub const fiber = @import("libs/fiber.zig");
+    pub const font = @import("libs/font.zig");
     pub const kernel_event_queue = @import("libs/kernel_event_queue.zig");
     pub const kernel_info = @import("libs/kernel_info.zig");
     pub const kernel_ioctl = @import("libs/kernel_ioctl.zig");
@@ -97,6 +98,9 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
 }
 
 test {
+    _ = libs.font;
+    _ = @import("font_rasterizer.zig");
+    _ = @import("font_kerning.zig");
     _ = libs.audio;
     _ = @import("audio_fs.zig");
     _ = libs.bootstrap_services;
@@ -3121,7 +3125,6 @@ const GsShader = struct {
     header: [0x60]u8 align(8) = @splat(0),
     cx: [5]PrimRegister = undefined,
     specials: [8]PrimRegister = @splat(.{ .offset = 0, .value = 0 }),
-
 
     /// A shader with one vertex-attribute slot, one export, and the given
     /// per-subgroup output. Wave32 is selected through the stage bit, which is
