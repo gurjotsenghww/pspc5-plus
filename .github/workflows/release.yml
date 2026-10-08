@@ -1,0 +1,53 @@
+name: Release Packaging
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Package Windows Release
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build Optimized Release Binaries
+        run: |
+          zig build -Doptimize=ReleaseFast build-launcher
+          zig build -Doptimize=ReleaseFast build-game-run
+          zig build -Doptimize=ReleaseFast build-pkgextractor
+
+      - name: Create Portable Release Package
+        shell: pwsh
+        run: |
+          $Version = (Get-Content VERSION).Trim()
+          $PackageName = "pspc5-plus-$Version-windows-x64-portable"
+          New-Item -ItemType Directory -Path $PackageName -Force
+          Copy-Item "zig-out/bin/pspc5-plus.exe" -Destination $PackageName/
+          Copy-Item "zig-out/bin/game-run.exe" -Destination $PackageName/
+          Copy-Item "zig-out/bin/pkgextractor.exe" -Destination $PackageName/
+          Copy-Item "README.md", "LICENSE", "VERSION", "CHANGELOG.md" -Destination $PackageName/
+          Compress-Archive -Path "$PackageName/*" -DestinationPath "$PackageName.zip" -Force
+          Get-FileHash "$PackageName.zip" -Algorithm SHA256 | Out-File "SHA256SUMS.txt"
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            pspc5-plus-*-windows-x64-portable.zip
+            SHA256SUMS.txt
+          draft: false
+          prerelease: false
+          generate_release_notes: true

@@ -636,7 +636,7 @@ pub fn build(b: *std.Build) void {
             std.mem.trim(u8, @embedFile("VERSION"), " \t\r\n"),
         );
         const native_launcher = b.addExecutable(.{
-            .name = "ps5pcem",
+            .name = "pspc5-plus",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/launcher.zig"),
                 .target = target,
@@ -658,16 +658,16 @@ pub fn build(b: *std.Build) void {
         const install_native_launcher = b.addInstallArtifact(native_launcher, .{});
         b.getInstallStep().dependOn(&install_native_launcher.step);
 
-        const build_launcher_step = b.step("build-launcher", "Build only the native PS5PCEM launcher");
+        const build_launcher_step = b.step("build-launcher", "Build only the native PSPC5 Plus launcher");
         build_launcher_step.dependOn(&install_native_launcher.step);
 
         // Run the installed copy: it resolves game-run.exe beside itself. The
         // old addRunArtifact path executed from Zig's cache and depended on the
         // entire install graph, rebuilding unrelated inspection tools.
-        const launcher_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "ps5pcem.exe")});
+        const launcher_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "pspc5-plus.exe")});
         launcher_cmd.step.dependOn(&install_native_launcher.step);
         launcher_cmd.step.dependOn(&install_game_run.step);
-        const launcher_step = b.step("launcher", "Open the PS5PCEM launcher");
+        const launcher_step = b.step("launcher", "Open the PSPC5 Plus launcher");
         launcher_step.dependOn(&launcher_cmd.step);
         launcher = native_launcher;
     }

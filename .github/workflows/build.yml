@@ -1,0 +1,33 @@
+name: Build Verification
+
+on:
+  push:
+    branches: [ main, development ]
+  pull_request:
+    branches: [ main, development ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Windows x64 Build Check
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Verify Zig Version
+        run: zig version
+
+      - name: Compile Modules (zig build check)
+        run: zig build check
+
+      - name: Build Launcher & Game Runner
+        run: |
+          zig build build-launcher
+          zig build build-game-run
+          zig build

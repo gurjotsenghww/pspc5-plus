@@ -19,13 +19,13 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName", "PS5PCEM Project\0"
-            VALUE "FileDescription", "PS5PCEM Game Runner\0"
+            VALUE "CompanyName", "PSPC5 Plus Project\0"
+            VALUE "FileDescription", "PSPC5 Plus Game Runner\0"
             VALUE "FileVersion", "0.3.3\0"
             VALUE "InternalName", "game-run\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 Artur Strazewicz\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Artur Strazewicz / PSPC5 Plus Contributors\0"
             VALUE "OriginalFilename", "game-run.exe\0"
-            VALUE "ProductName", "PS5PCEM\0"
+            VALUE "ProductName", "PSPC5 Plus\0"
             VALUE "ProductVersion", "0.3.3\0"
         END
     END

@@ -21,7 +21,7 @@ comptime {
 }
 
 const site_url = "https://ps5pcem.com";
-const github_url = "https://github.com/iStark/PS5PCEM";
+const github_url = "https://github.com/gurjotsenghww/pspc5-plus";
 const boosty_url = "https://boosty.to/ps5pcem";
 const window_width = 1180;
 const window_height = 760;
@@ -308,8 +308,8 @@ fn tr(phrase: Phrase) []const u8 {
             .preset_graphics => "Graphics",
             .status_preset_saved => "Rendering preset saved for the next launch",
             .compatibility => "Compatibility",
-            .compatibility_text => "PS5PCEM is at an early stage. Not every title boots yet; advanced DualSense features, native PS5 keyboard/mouse and controller-to-keyboard conversion still need more HLE support.",
-            .author => "Author: Artur Strazewicz · GitHub: iStark/PS5PCEM",
+            .compatibility_text => "PSPC5 Plus is at an early stage. Not every title boots yet; advanced DualSense features, native PS5 keyboard/mouse and controller-to-keyboard conversion still need more HLE support.",
+            .author => "PSPC5 Plus · Derived from PS5PCEM (Author: Artur Strazewicz · GitHub: iStark/PS5PCEM)",
             .browse_dialog => "Choose the folder containing a decrypted PS5 game",
             .nav_saves => "Saves",
             .saves_heading => "Saved games",
@@ -1112,7 +1112,7 @@ pub fn main(_: std.process.Init) !void {
         .cursor = Win32.LoadCursorW(null, Win32.arrow_cursor),
         .background = null,
         .menu_name = null,
-        .class_name = w("PS5PCEM_LAUNCHER"),
+        .class_name = w("PSPC5_PLUS_LAUNCHER"),
         .small_icon = application_icon,
     };
     if (Win32.RegisterClassExW(&class) == 0 and Win32.GetLastError() != Win32.error_class_already_exists) {
@@ -1127,8 +1127,8 @@ pub fn main(_: std.process.Init) !void {
     _ = Win32.AdjustWindowRect(&outer, Win32.window_style, 0);
     const window = Win32.CreateWindowExW(
         0,
-        w("PS5PCEM_LAUNCHER"),
-        w("PS5PCEM — Launcher"),
+        w("PSPC5_PLUS_LAUNCHER"),
+        w("PSPC5 Plus — Launcher"),
         Win32.window_style,
         Win32.centered,
         Win32.centered,
@@ -1682,7 +1682,7 @@ fn drawBrand(dc: Win32.DeviceContext) void {
     // The 27-pixel title needs a cell about 36 pixels tall; the old 25-pixel
     // one sliced the bottom off every glyph. Both lines are sized for their
     // font and the pair is centred against the 44-pixel icon beside them.
-    text(dc, w("PS5PCEM"), -1, .{ .left = 80, .top = 26, .right = 216, .bottom = 62 }, 0x00f4f0ea, title_font, Win32.dt_left);
+    text(dc, w("PSPC5 Plus"), -1, .{ .left = 80, .top = 26, .right = 216, .bottom = 62 }, 0x00f4f0ea, title_font, Win32.dt_left);
     // The sidebar leaves 136 pixels beside the icon, which "LAUNCHER ·
     // PREVIEW" overran: it was drawn cut off mid-word. The window title
     // already says this is the launcher, so the line only has to say which
@@ -1700,7 +1700,7 @@ fn drawNavigation(dc: Win32.DeviceContext) void {
     localizedText(dc, .project, .{ .left = 28, .top = 560, .right = 190, .bottom = 580 }, 0x007c716a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     roundFill(dc, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
     localizedText(dc, .support_boosty, .{ .left = 32, .top = 639, .right = 192, .bottom = 660 }, 0x00ffac64, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    text(dc, w("GitHub · iStark  ↗"), -1, .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00b9afa8, regular_font, Win32.dt_left);
+    text(dc, w("GitHub · PSPC5 Plus  ↗"), -1, .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00b9afa8, regular_font, Win32.dt_left);
     text(dc, w("ps5pcem.com  ↗"), -1, .{ .left = 28, .top = 588, .right = 198, .bottom = 612 }, 0x00ffac64, regular_font, Win32.dt_left);
 }
 
@@ -2586,7 +2586,7 @@ fn drawSettings(dc: Win32.DeviceContext) void {
     localizedText(dc, .compatibility_text, .{ .left = 302, .top = 601, .right = 1066, .bottom = 637 }, 0x00aaa098, small_font, Win32.dt_left | Win32.dt_word_break);
 
     card(dc, .{ .left = 282, .top = 650, .right = 1086, .bottom = 714 });
-    text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    text(dc, w("PSPC5 Plus"), -1, .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, medium_font, Win32.dt_left);
     localizedText(dc, .author, .{ .left = 310, .top = 684, .right = 840, .bottom = 708 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 684, .right = 1048, .bottom = 708 }, 0x008b817a, regular_font, Win32.dt_right);
 }
