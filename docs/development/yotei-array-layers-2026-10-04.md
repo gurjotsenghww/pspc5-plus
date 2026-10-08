@@ -1,0 +1,872 @@
+# Yotei array-layer coherence investigation
+
+The October 4 investigation continues toward the scene after the tree and the
+following cinematic. Controllable gameplay has not yet been confirmed.
+
+## Control run
+
+The October 3 candidate (`8b375c2139e23e47b27a667bba0271541d851368bb073b779864494a9c441e12`)
+was launched with the default renderer cache budgets, 1920×1080 output, Speed,
+and the Performance game preference. Original-culling diagnostic switches were
+not enabled. A 30.046-second interval during the tree transition presented 31
+frames: **1.032 FPS**. This is an animated setup transition, not gameplay FPS.
+Vertical artifacts and missing/dark scene detail remain visible.
+
+The run passes brightness, difficulty and experience selection. During the next
+loading transition, Windows commit reaches 59,753,652,224 bytes against a
+60,385,345,536-byte limit. The test harness deliberately terminates its process
+after three samples below 768 MiB of commit headroom, at 1,179.629 seconds.
+This is not a spontaneous guest crash. The last compiler inspection shows one
+active foreground job; the 1,026-entry compute warmup had finished without a
+reported failure.
+
+A warmed frame (flip 1443) takes 1,019 ms, uploads 701,610 KiB and reads back
+412,276 KiB. Graphics resource preparation accounts for 389 ms and fence waits
+for 219,699 µs; these categories overlap and must not be added together.
+Neither graphics nor compute pipeline creation misses occur in that frame.
+
+Five sampled RG8 arrays, 2048×2048 with nine or ten layers, account for 376 MiB
+of repeated full uploads. Matching render targets exist for individual slices,
+but cannot serve the complete array view directly.
+
+## Renderer changes under test
+
+Unmipped color-array backing observations and publication previously included
+every preceding slice. Changing a neighboring slice could therefore invalidate
+a resident GPU producer whose own bytes had not changed. Restrict both the
+observation and publication to the selected slices, as already done for mip
+subresources. This also reduces fingerprint and guest-write spans.
+
+A previously uploaded sampled array can now receive compatible dirty render
+target slices by ordered GPU copies. Preserve the other layers from that
+initialized snapshot. Require unchanged tracked CPU backing, matching source
+layout and format, and no unhandled dirty producer. Reject same-batch prepared
+bindings, ambiguous overlapping producers, metadata/compressed surfaces and
+canonical-alias mode. Fall back to normal publication and upload when these
+conditions cannot be proved. Report successful copies in `gpu sampled arrays`.
+
+## Validation
+
+- Eleven ReleaseSafe color-surface tests pass, including a regression for
+  neighboring unmipped slices with linear, 4 KiB and render-target tiling.
+- `vulkan-smoke --sampled-array-refresh` passes with timeline scheduling both
+  disabled and enabled under Khronos validation, without validation errors.
+  It checks two queued color revisions, nonzero untouched layers, CPU-write
+  rejection, prepared-binding protection, and zero extra texture upload/readback.
+- `build-vulkan-smoke` builds probes without running them. Run these probes from
+  a separate working directory so their driver cache cannot replace the game's
+  `vulkan_pipeline_cache.bin`.
+
+## Candidate run
+
+The ReleaseFast candidate is SHA-256
+`3b1e2b38b86d47fdedf6e95fc1273e509f126faa3e241570b99e1b8f62bd3ef4`.
+It starts with the same default renderer cache budgets and game/output presets as
+the control. No cache budgets or original-culling switches have been changed
+through the tree measurement.
+
+| Visible interval | Presented frames | Duration | FPS |
+| --- | ---: | ---: | ---: |
+| Wolf brightness calibration | 37 | 30.046 s | 1.231 |
+| Tree transition into difficulty selection | 37 | 30.046 s | 1.231 |
+
+The tree interval improves over the control run's 1.032 FPS in this pair of
+launches. Cache history and animation phases are not identical, so this is not
+a universal speedup estimate. No profiler, build, input or screenshot capture
+runs during either measurement.
+
+The tree's bark and branches are visible in the candidate, whereas the control
+capture at difficulty selection is largely dark. Bright vertical streaks remain.
+In-game counters confirm array refreshes: for example, flips 846 and 847 each
+copy eight layers into two sampled arrays. Other arrays still use full uploads.
+
+![Candidate tree at difficulty selection; bark is visible but vertical streaks remain](../images/yotei-array-layers-tree-2026-10-04.png)
+
+After experience selection the next loading transition again approaches the
+Windows commit limit. Reducing the live storage-image budget from 2,560 to
+1,536 MiB does not prevent the diagnostic guard from stopping the process:
+58,814,091,264 bytes committed against a 59,294,818,304-byte limit. This budget
+change happens after the reported measurements. The last inventory records
+22,050,426,880 private process bytes; the next scene and character control are
+not confirmed. This is another deliberate diagnostic stop, not a guest crash.
+
+## Shared storage transfer buffer
+
+The tree inventory contains 1,429,907,328 bytes of persistent host transfer
+buffers for storage images, in addition to the GPU images themselves. Ordinary
+batched uploads already use the upload ring. Replace those per-image host
+mirrors with one lazily allocated buffer that grows to the largest transfer.
+Keep the image cache budgets and contents intact.
+
+Readbacks and depth/stencil bridges order their reuse with transfer barriers.
+Growing the buffer defers destruction of the previous allocation until its
+queued users retire. Uploads outside the ring wait before overwriting shared
+host memory, including the initial upload to a newly created image. Readbacks
+still wait for their GPU result before publishing guest bytes.
+
+ReleaseSafe native probes pass with Khronos synchronization validation:
+`--storage-reuse`, `--storage-cpu-reuse`, `--depth-storage`,
+`--color-cube-publication`, and `--sampled-array-refresh`. No validation errors
+are reported; the layer emits a configuration deprecation warning for the
+environment variable used to enable synchronization validation. The storage
+probe verifies 320 resident views without allocating a transfer buffer, 1,152
+queued writes, a four-byte shared readback buffer, dirty-image eviction,
+buffer growth/reuse while copies are queued, and a later CPU upload. These are
+correctness and allocation checks, not game FPS measurements.
+
+The combined ReleaseFast runner is SHA-256
+`9bb91d692ceacf578afc7168ad9085e103492a07743bebfa3445e4dce5b8f5cc`.
+At this checkpoint, `zig-out/bin/game-run.exe` and its PDB were updated to this
+build; the previous installed pair was retained locally for rollback. Public
+release archives are unchanged.
+With unchanged default cache budgets, its tree transition presents **38 frames
+in 30.047 seconds: 1.265 FPS**. The earlier array-only candidate presents 37:
+one extra frame does not establish a meaningful FPS gain. Both show bark and
+branches, with bright vertical streaks still present.
+
+The new tree inventory retains a **72 MiB** shared storage transfer buffer,
+versus approximately **1,364 MiB** of per-image buffers in the array-only tree
+inventory. Private process memory is 14,337,359,872 bytes versus
+15,554,560,000 bytes in those snapshots. Cache contents and animation phases
+differ slightly; the structural removal of per-image buffers is verified, but
+the total process-memory difference is not a controlled benchmark.
+
+![Combined candidate at difficulty selection](../images/yotei-shared-transfer-tree-2026-10-04.png)
+
+## Continuation into the cinematic
+
+The combined build passes the bonus notices, wolf brightness calibration,
+Medium difficulty and Standard experience selection. The camera moves past
+the tree into a very dark cinematic. Opening Options displays `PAUSED` and a
+subtitle toggle, confirming that this is still the cinematic rather than
+controllable gameplay. Resuming removes that overlay, but character control
+has not been established. The owned diagnostic process is deliberately stopped
+after approximately 36 minutes for the next isolated build and native tests.
+
+Flip 1384, before any live cache-budget changes, takes **59,275 ms**. Graphics
+pipeline creation accounts for **35,376 ms across 550 misses**; the frame also
+uploads 6,412,920 KiB and reads back 2,197,188 KiB. Frame categories overlap and
+must not be added together. This is a cold-transition stall, not a stationary
+gameplay FPS sample. A later pipeline inventory contains 1,379 graphics
+pipelines and 1,180 distinct exact shader pairs; trivial render-state
+deduplication alone cannot remove most of that compilation.
+
+Host commit approaches the limit again. To continue diagnosis, the live sampled
+budget is changed from 2,048 to 1,024 MiB and the storage budget from 2,560 to
+1,280 MiB. The sampled budget is subsequently raised to 1,536 and then set to
+1,280 MiB; the render-target limit is reduced from 128 to 64. These changes are
+**diagnostic only**, occur after the reported tree measurements, and are not
+installed defaults. They reduce retained resources but cause substantial churn:
+later frames upload roughly 3.3–3.8 GiB of sampled textures. Even with only
+one or two new graphics pipelines, individual frames still take 8–15 seconds.
+Some of those frames render the pause overlay, so they are not reported as
+gameplay FPS or a controlled comparison against the default budgets.
+
+One pixel-shader resource lookup is unresolved (`s28`, program
+`0x800026ed00`, instruction `0x8b4`), and its draw is rejected. Zero unsupported
+compute-program reports do not establish complete shader or resource coverage.
+Dark rendering, tree streaks, resource churn and character control remain open.
+
+![Very dark post-tree cinematic after resuming from pause; character control is unconfirmed](../images/yotei-post-tree-dark-2026-10-04.png)
+
+## Read-only storage-image reuse
+
+The sampled fallback cache includes the storage producer's eviction sequence
+in its content identity. A read-only storage binding advances that sequence
+without changing any texels, needlessly invalidating an already uploaded
+sampled view. Use the existing storage content generation instead. Actual
+uploads, image writes, clears and depth-to-storage copies advance this
+generation; read-only bindings do not.
+
+The extended `--sampled-storage-refresh` native probe reproduces the problem
+before the change: a read-only image dispatch causes a third sampled upload
+where only two are expected. With the change, four cases pass under Khronos
+synchronization validation: image/buffer producers, each with timeline
+scheduling disabled/enabled. Pixel readbacks verify pending and published GPU
+writes, a sampler change, read-only reuse, and a later direct CPU update outside
+the sampled texture's sparse probe. No validation errors are reported.
+
+The ReleaseFast runner is SHA-256
+`7d91b76040d7c9136de8f5b59738626d48bf22ee01aa0e0c788455e7b58364da`.
+The installed executable and PDB are updated; the preceding pair remains in a
+local backup. The game repeat starts with the unchanged default cache budgets,
+1080p output, Speed preset and Performance game preference.
+
+| Visible interval | Presented frames | Duration | FPS |
+| --- | ---: | ---: | ---: |
+| Wolf brightness calibration | 38 | 30.044 s | 1.265 |
+| Tree transition into difficulty selection | 38 | 30.044 s | 1.265 |
+
+The tree result matches the preceding shared-transfer build. **No game FPS
+gain is demonstrated for this additional change.** Bark and branches remain
+visible, and the bright vertical streaks remain. Neither measurement overlaps
+input, profiling, screenshot capture or a background build. The new tree
+inventory retains the 72 MiB shared transfer buffer and records 14,654,386,176
+private process bytes; this is not a controlled memory comparison.
+
+A separate eight-second resource trace is enabled and then restored before
+these measurements. It records unresolved buffer-descriptor discovery in
+compute and export-stage branches; no `storage incomplete` fallback is reported
+in that short interval. The per-frame `storage_unresolved` counter reaches
+approximately 900, but includes potentially inactive branches and is not proof
+of that many executed missing accesses. First-occurrence graphics resource
+failures now retain bounded scalar diagnostics without requiring verbose
+buffer-lifetime tracing.
+
+## Illustrated movie and compilation stalls
+
+The read-only reuse build continues past the tree and the dark 3D cinematic
+into a clearly visible illustrated narrative movie. This is progress beyond
+setup, **not confirmation of character control**. No pause input is used in
+this repeat.
+
+![Illustrated narrative movie after the tree and dark cinematic](../images/yotei-post-tree-movie-2026-10-04.png)
+
+A 30.045-second interval during the cold 3D transition presents one frame
+(0.033 FPS). It includes first-use compilation stalls and is not a warmed
+gameplay measurement. With the default 2,048 MiB sampled-image budget, later
+flip 1491 takes 10,429 ms despite only one graphics and three compute pipeline
+misses, totaling 8 ms of pipeline creation. It uploads 1,775,144 KiB of textures
+and records 5,079 sampled misses and 5,016 evictions. Graphics resource
+preparation takes 6,620 ms, with 5,060,485 microseconds of fence waits across
+the frame. These overlapping categories must not be added together.
+
+At 13:37:42 local time, the sampled-image budget is increased live from 2,048
+to 2,560 MiB; storage-image and render-target budgets remain unchanged. The
+scene switches to video immediately afterward. Lower texture churn in the
+movie therefore **does not demonstrate a benefit from this budget change**.
+The installed default remains 2,048 MiB. The live experiment is reverted to
+that value at 13:49:46 to preserve memory headroom during compilation.
+
+Subsequent loading stalls hold the last movie image on screen. Flip 1605 takes
+239,431 ms, with 234,886 ms spent creating 15 compute pipelines. Flip 1606
+takes 105,038 ms, including 104,146 ms of compute pipeline creation. A short
+thread sample finds active NVIDIA compiler work while the submitted GPU tick
+is already complete. The foreground compiler queue remains active; its startup
+warmup has finished. These are observed compilation stalls, not proof of a
+deadlock or a game crash.
+
+Two pending compute modules are captured locally, approximately 1.6 MiB each.
+One has a 364-case dispatcher; the other has 151 cases and 140 loops. The first
+passes SPIR-V validation. An offline `spirv-opt -O` experiment reduces it from
+1,628,004 to 1,448,996 bytes in 3.50 seconds, also passing validation. This has
+not yet been timed in the driver or executed for comparison, and is not
+enabled in the renderer. No game shader bytes are published.
+
+The resource diagnostic still records a rejected pixel-shader draw at
+`0x800026ed00`, instruction `0x8b4`, sampled resource `s28`. Its descriptor
+comes through a vector-loaded pointer and nested material table; a correct
+fix must resolve and stage that table, not substitute a dummy texture.
+Post-movie control, steady gameplay FPS, dark lighting and remaining tree
+streaks are still open at this checkpoint.
+
+The repeat later presents black frames while compiling the next 3D scene.
+Flips 1607, 1608 and 1609 take 396.2, 224.8 and 123.9 seconds. These remain
+cold transitions: flip 1607 alone spends 222.1 seconds on graphics pipeline
+creation and 146.6 seconds on compute pipelines. Later logs explicitly skip
+compute dispatches with unsupported sampled resources (`0x80003aa700`,
+`0x8000364b00`) and storage images (`0x8000265d00`, `0x80003cfa00`). Shader
+translation without an unsupported-opcode report does not imply those
+dispatches execute. The owned run is manually stopped after 2,370 seconds
+for an isolated rebuild; it is not recorded as a spontaneous crash.
+
+## Color attachment transfer memory
+
+The last inventory of that run contains **1,054,163,296 bytes** of permanently
+allocated host readback buffers for 128 color targets, in addition to their
+GPU images and the 72 MiB shared storage transfer buffer. Remove those
+per-attachment buffers as well. Initial color uploads use fresh draw-ring
+slices, retaining their offsets through command recording, including MRT
+attachments and ring spills. Outside a batch, or for oversized uploads, an
+independently owned temporary buffer is retired after its queued users.
+
+Color readbacks now use the existing shared image transfer buffer. Transfer
+barriers order its reuse with storage-image readbacks and depth bridges;
+host reads still wait for completion. The `gpu targets` diagnostic reports
+`shared_image_transfer_mib` rather than the removed per-target allocation sum.
+
+Six ReleaseSafe native probe groups pass with Khronos synchronization
+validation and no validation errors: `--target-reuse`, `--integer-colors`,
+`--sampled-array-refresh`, `--color-cube-publication`, `--storage-reuse`, and
+`--depth-storage`. Target reuse checks both 64/128 entries and timeline
+scheduling disabled/enabled, preserving the complete pixel result when
+repeated CPU reseeds are queued. It retains one 256-byte shared readback
+buffer. The MRT probe seeds four attachments with distinct untouched pixels,
+forces ring overflow, and checks those pixels and rendered exports, including
+the source offsets and spill lifetime.
+
+The ReleaseFast repeat uses runner SHA-256
+`58977d5e64d0e763ee8b37d189016ed3e5af850eda032e46f3f100654f6a1d72`,
+subsequently installed with its matching PDB in `zig-out/bin`. With the same
+1080p output, Speed mode and performance preference, brightness presents
+42 frames in 30.045 seconds (**1.398 FPS**); the tree presents 42 in 30.047
+seconds (**1.398 FPS**). The preceding build presented 38 frames in each
+interval. This is a small observed increase, not a controlled attribution:
+pipeline-cache history and animation position differ. No input, profiling,
+capture or compilation overlaps either interval.
+
+The tree inventory retains a **72 MiB shared image transfer buffer** and no
+per-color-target host readbacks. Tree detail remains visible, including the
+unresolved bright streaks. This repeat also reaches the illustrated movie.
+It is manually stopped after 1,492 seconds for the next format fix; character
+control and post-movie gameplay FPS remain unconfirmed.
+
+## Packed normalized render targets and compute reads
+
+Selective resource diagnostics identify a concrete reason for two rejected
+compute dispatches: program `0x8000265d00` at `0xf0`, and `0x80003cfa00` at
+`0x29c`, load valid T# tuples whose unified format is **30**. The decoder
+rejects that encoding before an image can be bound. AMD's
+[GFX10 format table](https://chromium.googlesource.com/chromiumos/third_party/mesa/+/refs/heads/stabilize-13982.70.B-chromeos-amd/src/amd/registers/gfx10-rsrc.json)
+names it `10_11_11_UNORM`; the local KytyPS5 format definitions also retain
+this normalized packed format. This is descriptor/ISA evidence, not copied
+shader code.
+
+The renderer also previously represented `CB_COLOR_INFO` format 6 with
+number type UNORM as `B10G11R11_UFLOAT_PACK32`. Those bit patterns have different
+meanings. The new implementation retains guest bits in an `R32_UINT` image,
+packs normalized fragment exports into 11/11/10 bits, and decodes normalized
+channels at compute `IMAGE_LOAD`. Compute stores clamp and quantize back to
+the packed representation. Component selection, default alpha and export
+component permutation remain explicit. Floating-point format 36 retains its
+native float representation.
+
+Vulkan has no matching packed UNORM attachment, so blending and
+partial RGB attachment writes remain explicitly unsupported. Filtered sampled
+views of format 30 are not implemented by this change. The fix covers the
+observed compute image reads and full RGB attachment exports; it does not
+claim complete shader or format coverage.
+
+Four descriptor tests pass. ReleaseSafe `--packed-unorm` validates 64-pixel
+reads with independent packed seeds, changed selectors and input data,
+normalized stores with out-of-range values, and exact fragment-export bytes.
+The storage cases pass with timeline scheduling off and on. Native
+`--integer-colors`, `--sampled-storage-refresh`, `--storage-reuse` and
+`--image-d16` also pass. All five groups run with Khronos validation and
+synchronization validation, without VUID or synchronization errors.
+
+The ReleaseFast repeat with runner SHA-256
+`a2b61466d8a08c2dc23f5d05811169dd44ce81880603a9f026edbb840faaddc8`
+reaches brightness and the tree. Each presents 37 frames in 30.049 seconds
+(**1.231 FPS**). The previous runner presented 42 frames per interval; this
+repeat shows no performance improvement, with differing pipeline-cache and
+animation history. Tree streaks remain. The run proceeds into the dark 3D
+cinematic. A subsequent 60.090-second interval presents only one frame
+(**0.017 FPS**), including a long stall; this is not steady gameplay FPS.
+Character control is not reached.
+
+![Dark cinematic with unresolved lighting and geometry](../images/yotei-packed-post-tree-2026-10-04.png)
+
+The live compute-program sampler observes both previously rejected programs,
+and this log contains no `UnsupportedStorageImage` rejection. This is narrower
+evidence than complete shader correctness. Missing pixel resource `s28` and an
+unresolved compute sampler in `0x800027c200` still reject work. The packed
+attachment path also exposes a new `UnsupportedColorTarget` rejection: a
+six-attachment pass enables source-alpha blending on its packed UNORM plane.
+Later frame counters record one failed draw per frame and no failed dispatches,
+while roughly 11,800 storage-resource candidates remain unresolved; those
+candidate counts are not proof that every candidate is accessed by the GPU.
+That operation is not yet implemented for the integer representation, so this
+candidate is not installed over the preceding local runner.
+
+The dark cinematic continues to upload several GiB of texture data per frame.
+For example, flip 1617 reports 5,590,390 KiB of uploads, including 4,043,666 KiB
+of sampled textures, 5,847 texture misses and 5,957 evictions. Its 11.813-second
+frame includes 5.251 seconds of fence waits. A matched-symbol CPU sample also
+finds substantial time mapping and unmapping streaming memory. The run is
+deliberately stopped for an isolated rebuild; it is not a spontaneous crash.
+
+The preceding repeat also reports missing streamed texture backing (`GuestMemoryReadFailed`);
+read-only Windows mapping queries find reserved, unreadable ranges at several
+reported texture addresses. This separate issue remains under investigation.
+
+## Color content generations and virtual-only mapping batches
+
+Render-target LRU ages no longer stand in for texture-content changes. A
+separate global content generation advances on actual GPU writes and seeds;
+rebinding or reading an attachment only changes its eviction age. Draws with
+color writes disabled preserve the content generation of initialized targets.
+Depth operations and other writable MRT attachments still execute normally.
+This prevents a read-only use from invalidating a sampled snapshot without
+discarding real changes.
+
+Batch-map coalescing now requires contiguous physical offsets only for direct
+mappings. Unmap and protection entries can retain zero or stale unused offsets
+while adjacent virtual ranges are combined. Per-entry alignment, operation,
+length, protection and memory-type constraints remain enforced; invalid slices
+cannot become valid merely because their combined size is page aligned. Failed
+batches retain the processed prefix count.
+
+Seven ReleaseSafe Vulkan probe groups pass with Khronos synchronization
+validation and no VUID or synchronization errors: sampled-array refresh,
+integer colors, target reuse, storage reuse, color-cube publication,
+sampled-storage refresh, and feedback snapshots. The new checks retain a
+refreshed sampled image after a producer rebind and verify unchanged pixels
+and generations for a masked MRT attachment while another attachment is drawn.
+Five filtered kernel tests pass, including native protection/unmapping,
+invalid sub-page entries and partial batch progress. Runtime performance of
+these changes remains to be measured in the rebuilt runner.
+
+
+## Color-generation repeat and correlated material pointers
+
+The isolated `65d5fa9609ec` runner presents 39 frames in 30.047 seconds on the
+wolf screen (1.298 FPS) and 39 in 30.044 seconds at the tree (1.298 FPS). The
+post-tree interval presents only 4 frames in 60.092 seconds (0.0666 FPS).
+Measurements count presented frames without input, screenshots, sampling or
+compilation during each interval. The two-frame tree difference from the
+packed-color repeat is too small, and cache history differs too much, to
+attribute a performance improvement to the content-generation change.
+
+The dark cinematic advances, but bodies and lighting remain incomplete. This
+run is deliberately stopped for rebuilding; character control is not reached.
+A live allocation census finds approximately 1,014 MiB of color attachments,
+320 MiB of depth attachments, 1,763 MiB of storage images and 2,045 MiB of
+sampled images. Process private memory is approximately 22 GiB. Individual
+frames still upload several GiB and spend many seconds waiting for GPU work;
+these counters do not establish a single cause for the stalls.
+
+![Incomplete characters in the color-generation repeat](../images/yotei-color-epoch-post-tree-2026-10-04.png)
+
+A local replay of the failing pixel shader identifies a lost material-table
+address: two `v_readfirstlane_b32` operations select a pointer produced by the
+same vector buffer fetch, with WORD_0 sign extension removing the upper tag.
+The proof now follows the common active lane through `s_andn1_saveexec_b64`
+and accepts only bounded records with one non-null pointer. Distinct pointers,
+unknown memory, changed execution masks and unsupported transforms retain
+the unsupported path. Payloads are reread rather than cached as constants.
+
+A conservative material-index bound also includes unused non-descriptor
+records. The candidate collector retains decodable textures and marks this
+case for a GPU check of the actual selected tuple. Both linear and hashed
+lookups retain exact descriptor matching, including mixed 2D/3D banks. An
+active unsupported tuple produces an explicit error; an unused malformed
+record does not reject the entire draw. The captured material-table replay
+now finds 60 distinct image descriptors; this is resource-discovery evidence,
+not proof that the complete game shader renders correctly.
+
+Eight focused GPU analysis tests and the pointer-staging tests pass. Native
+Vulkan checks cover known pixel colors, empty descriptors and active malformed
+descriptors with small and hashed mixed-view tables. Existing indirect-image,
+graphics-descriptor-reuse and deferred sampled-fault probes pass with Khronos
+synchronization validation. The `60cfcb943c44` game repeat measures 38 frames in 30.046 seconds on the
+wolf screen (1.265 FPS), 37 in 30.045 seconds at the tree (1.232 FPS), and
+3 in 60.099 seconds after the tree (0.0499 FPS). Incomplete character surfaces
+remain. This candidate still rejects the material draw because its sampler
+cannot be recovered. It is deliberately stopped for rebuilding. The installed
+runner and release archives are unchanged.
+
+![Material-pointer repeat with incomplete character surfaces](../images/yotei-material-pointer-post-tree-2026-10-04.png)
+
+## Checked material samplers and sampled-lookup translation reuse
+
+The captured material shader obtains its sampler from two 136-byte records.
+A possible `-1` selector previously made the analysis enumerate unrelated
+fields at eight-byte intervals. Signed constant bounds now retain the negative
+range and exclude wrapped offsets only when they cannot land inside the table.
+Negative or oversized selectors still prevent an unconditional sampler proof.
+
+When all in-bounds sampler records agree, the fragment path can use that
+sampler with a GPU comparison of all four actual sampler words. A non-null
+image with an unexpected sampler reports an explicit resource fault; null
+images and inactive invocations retain their existing behavior. This requires
+fragment storage and atomics support. Ambiguous records and inaccessible
+memory still fail preparation. The captured replay now recovers both the
+material pointer and the shared sampler, without changing guest registers.
+
+Five focused staging tests pass. The native sparse-pointer probe verifies 26
+cases across linear/hashed lookups and mixed 2D/3D images, including in-bounds,
+out-of-bounds and inactive sampler selections. Large 4,352-texture tables,
+deferred sampled faults and graphics descriptor reuse also pass with Khronos
+synchronization validation and no VUID or synchronization errors.
+
+Sampled-image lookup payloads no longer produce a different SPIR-V cache key
+when the shader reads those payloads from its runtime lookup buffer. Exact
+runtime descriptor matching remains. Lookup layout, bindings, image dimensions,
+fault checks and all other code-generating options still enter the key; linear
+lookups retain their literal words. Original bindings are validated before a
+cache hit. The focused cache tests compare a reused module against a fresh
+translation and reject invalid candidate tuples.
+
+The combined `ea19ad75fc5f` runner repeats the tree at 37 presented frames in
+30.046 seconds (1.231 FPS), unchanged from the material-pointer candidate.
+A post-tree interval presents 5 frames in 60.094 seconds (0.0832 FPS). It
+covers a different moment of the cinematic than the previous three-frame
+interval, so this is not evidence of a sustained speedup.
+
+The previous pixel-resource rejection at `0x8b4` is passed. Preparation of the
+same `0x800026ed00` shader now reaches `0x22f0`, where it reports a 1D-array
+image incompatible with the 2D operation. That instruction loads its texture
+from an indexed 136-byte table. Its descriptor provenance and metadata fallback
+still need investigation; adding a guessed image-type conversion would not
+establish correctness. The `0x800027c200` compute sampler and source-alpha
+blending on the packed UNORM attachment remain unsupported.
+
+A genuine post-tree capture remains dark and incomplete. Tree streaks persist,
+and character control is not reached. The pause overlay responds after a held
+Options input but offers no visible skip action. System available physical
+memory falls below 1 GiB during this run; Windows raises its commit limit
+automatically. No pagefile setting or cache budget was changed. The diagnostic
+is deliberately stopped for further work, not terminated by a guest fault.
+The installed `zig-out/bin/game-run.exe` and public release archives remain
+unchanged; this candidate is isolated under `out/yotei-gameplay-20261004`.
+
+Local KytyPS5 source review finds texture garbage-collection thresholds derived
+from its reported memory budget (`textureCache.cpp`). This is a useful direction
+for a coordinated renderer budget, not a measured optimization copied into this
+candidate. Repeated texture uploads and fence waits remain major costs.
+
+## Integer material indices after a complete waterfall
+
+A new read-only capture taken immediately after the `0x22f0` diagnostic includes
+both material headers and the 96-record texture table. The headers select R8
+UINT index textures. The previous analysis nevertheless retained a floating-point
+value from before the gather loop, because it could not prove that the loop
+eventually wrote every restored lane. Its unbounded 32-bit multiplication then
+enumerated eight-byte offsets, including ordinary material constants which
+happened to decode as 1D-array descriptors.
+
+The analysis now recognizes a complete partition-and-remove waterfall, with
+one entry and one exit, unchanged saved masks, and restoration of the exact
+entry mask. It rejects bypasses, altered predicates, overlapping mask registers
+and intervening EXEC changes. Integer gather bounds also follow small indirect
+descriptor tables, rereading their current formats with a shared recursion
+budget. Null and out-of-bounds reads retain zero; negative selectors and
+unsupported or unavailable formats retain conservative behavior.
+
+The captured replay resolves both `0x22f0` and `0x22f8` with the intended
+136-byte record step and 84 distinct 2D textures, instead of 229 candidates
+containing false 1D-array images. This is a resource-preparation result, not
+proof that the complete scene renders correctly or runs faster. Ten focused
+analysis tests and six staging tests pass. The capture process was deliberately
+stopped before rebuilding; character control was not reached in that run.
+
+The `9041bab00fe5` ReleaseFast runner builds successfully. Workgroup image
+tables, graphics descriptor reuse and all 26 sparse-pointer fragment cases
+pass with Khronos synchronization validation, without VUID or synchronization
+errors. It is tested separately from the installed runner.
+
+The two-worker repeat presents 35 frames in 30.049 seconds at the tree
+(1.165 FPS); this does not demonstrate an improvement over 1.231 FPS.
+Optional background warmups were cancelled after 435 of 848 jobs, before
+this interval, while required foreground compilation remained enabled.
+The first four-worker run and this repeat both reach the diagnostic host-memory
+guard: three samples below 768 MiB of remaining system commit. These are
+deliberate test stops, not evidence of a guest crash. The second run lasts
+2,648 seconds and stops before character control.
+
+The transition includes a 468.554-second frame. A captured required collision
+shader, `0x800014e300`, has 3,957,304 bytes of SPIR-V and an 880-case dispatcher;
+it passes `spirv-val --target-env vulkan1.2`. A later loading frame spends
+321.849 seconds creating graphics pipelines and 164.232 seconds creating
+compute pipelines. These first-use stalls are separate from warmed frame
+costs. A typical preceding tree frame still uploads 324 MiB and reads back
+369 MiB. No post-tree gameplay FPS is established by this repeat.
+
+The live material now passes resource preparation at `0x22f0` and `0x22f8`.
+Translation next rejects its absolute memory read at `0x748`, before the
+shader can render. Packed-color blending is also still rejected. Thus the
+resource-discovery fix alone does not repair the character surfaces.
+
+## Checked FLAT reads from material pages
+
+Fragment shaders can now read absolute FLAT/GLOBAL addresses from the pages
+already discovered for pointer-form scalar loads. Each snapshot retains the
+guest base address and byte length; the shader checks the actual address and
+records an active missing read through the existing deferred fault path.
+Inactive reads do not raise a fault. This requires fragment storage and atomics;
+it does not substitute zero for an unsupported active address or enable writes
+to those snapshots. GPU storage overlapping a page is flushed before capture.
+
+Compute image candidates also reuse their instruction's resolved sampler
+instead of repeating identical analysis for each candidate. Uncompressed
+image loads retain their previous path. `PS5_GPU_COMPUTE_WARMUP=0` provides a
+diagnostic switch for the optional disk catalog while retaining foreground
+pipeline compilation. Cancelled warmup jobs are counted separately from
+successful and failed compiles. Six catalog tests pass.
+
+The `75ff79529607` ReleaseFast runner builds successfully. Ten native FLAT
+material cases cover narrow and wide tables, changed payloads, unaligned reads,
+active missing pages and inactive accesses. The zero-selection cases also
+change the payload between draws in the same renderer and verify the new
+pixel value. All 26 existing sparse-pointer/sampler cases, the workgroup image
+table and deferred FLAT-fault probes pass with Khronos synchronization
+validation, without VUID or synchronization errors. The game repeat uses
+two compiler workers and `PS5_GPU_COMPUTE_WARMUP=0` from launch.
+
+That repeat presents 38 frames in 30.047 seconds at the tree (1.265 FPS).
+Different cache history prevents attributing the difference from 1.165 FPS
+to this change alone. The transition reaches a close view of the tree and a
+dark cinematic. The former fragment rejection at `0x748` does not recur in
+the observed log, but this does not establish correct character rendering.
+The compute sample at `0xe74` still rejects an implausible texture, and packed
+UNORM blending still rejects draws. A 60.092-second cinematic interval presents
+no new frame while first-use work is pending; it is not a warmed gameplay
+measurement. The owned run is deliberately stopped after 1,493 seconds.
+
+## Sparse material indices and merged memory regions
+
+The pointer-table analysis previously visited every texture index below an
+upper bound. A masked index read from a material buffer can instead select
+only a few of those records. Intermediate records may hold ordinary constants,
+including bit patterns that superficially resemble image descriptors. The
+resolver now rereads and deduplicates the possible masked values, retaining
+zero when the source buffer can be read out of bounds. Invalid selected tuples
+still require an execution-time check. Focused tests cover holes, changed
+payloads, source bounds, invalid selections and unavailable memory.
+
+Adjacent captured SMEM pages now share a checked region. The renderer sorts
+their addresses and copies the already captured bytes; it neither fills gaps
+nor reads extra guest pages. Regions remain separate across 4 GiB boundaries.
+The FLAT snapshots share those merged ranges, so an unaligned word can span
+two captured pages while the same read with the second page absent still
+reports a fault. Scratch storage is reused between preparations.
+
+Twelve native FLAT material cases, all 26 sparse-pointer/sampler cases, the
+workgroup image table and deferred-fault probes pass with Khronos
+synchronization validation. The existing wide-table fragment changes from
+5,272 to 4,071 SPIR-V words (22.8% smaller), with identical expected pixel
+results. The narrow-table case remains 3,493 words. This is a reduction in
+generated code, not a measured game FPS increase. The `16761f86ba35`
+ReleaseFast runner builds successfully. Its repeat uses the same two-worker,
+warmup-disabled configuration and presents **37 frames in 30.043 seconds
+(1.232 FPS)** at the visible tree difficulty menu. The preceding 1.265 FPS
+sample differs by one frame; no performance improvement is demonstrated.
+
+The run reaches the close tree view and a subsequent incomplete 3D cinematic.
+Flip 1558 takes 63.711 seconds, including 60.006 seconds in compute work;
+flip 1560 takes 21.190 seconds, with graphics and compute pipeline creation
+accounting for 6.635 and 8.667 seconds respectively. These loading-frame costs
+are not a steady gameplay FPS measurement. Packed UNORM blending still rejects
+a six-attachment draw. The captured later tree view has major missing lighting
+and material detail; character control is not reached.
+
+![Incomplete post-tree cinematic in the sparse-region repeat](../images/yotei-sparse-post-tree-2026-10-04.png)
+
+The diagnostic guard stops the owned process after 1,158 seconds when system
+commit remains within 768 MiB of its limit for three samples. The final sample
+is 58,832,732,160 committed bytes against a 59,294,818,304-byte limit. This is a
+deliberate memory-pressure stop, not a spontaneous game crash. The later
+compute sample at `0xe74` is not observed before this stop, so this run does
+not prove that issue fixed.
+
+The local `zig-out/bin/game-run.exe` and matching PDB were updated to
+`16761f86ba356020f9902dc591c7bb6b6c7ee3f678102a968ccdb2714a14d02a`.
+The previous `58977d5e64d0` executable and PDB are retained under
+`out/yotei-gameplay-20261004/installed-backup-58977d5e64d0/`.
+Public release archives are unchanged.
+
+
+## Reusing immutable SMEM region headers
+
+Pointer-form scalar loads now read each captured region's base and live Vulkan
+range once in the shader entry block. These values are immutable during an
+invocation and dominate all branch and loop uses. Payload loads remain at their
+original instruction sites. A word's bounds predicate is also reused instead
+of rebuilding it after the load; split-region selection and zero outside a
+captured scalar range retain their previous behavior.
+
+ReleaseSafe `--scalar-pointers` verifies relocation, carry across 4 GiB,
+split reads, overlapping SOFFSET and a range that shrinks between dispatches
+without rebuilding the module. The 12 FLAT-material cases, 26 sparse-pointer
+cases and workgroup image table also pass with Khronos synchronization
+validation and no VUID or synchronization errors. The wide FLAT-material probe
+shrinks from 4,071 to 3,943 words; the narrow version changes from 3,493 to
+3,365. These code-size results do not establish a game FPS improvement.
+
+The `5f02933e1589` ReleaseFast repeat presents **36 frames in 30.044 seconds
+(1.198 FPS)** at the visible Medium difficulty menu, versus 37 frames in the
+preceding repeat. No FPS gain is demonstrated. The tree still has bright
+vertical streaks. After confirming Standard, a first-use compute pipeline for
+`0x8000173b00` is pending with a 3,711,100-byte SPIR-V module. The captured
+module passes `spirv-val --target-env vulkan1.2`. The diagnostic memory guard
+stops the run after 1,544 seconds: system commit is 58,538,655,744 bytes against
+a 59,294,818,304-byte limit. Character control is not reached.
+
+## Releasing unused diagnostic shader IR
+
+A read-only census of the preceding runner at the tree finds 664 cached
+analyses. Their decoded code and instructions own 244,750,008 bytes, while
+extra IR instruction arrays, backend instruction arrays, nodes and blocks own
+another **904,245,296 bytes**. These figures cover owned array capacities,
+not all process memory; they exclude nested specialization caches, the guest
+and Vulkan driver allocations.
+
+The live renderer now releases those extra arrays after analysis when it uses
+decoded-stream execution. It keeps the decoded program, control-flow graph,
+validation and optimization summaries, resource checkpoints and translation
+key. Uniform-branch specializations inherit the same retention policy.
+Explicit typed-IR execution and standalone diagnostic decoders retain their
+full modules. No guest instruction or GPU dispatch is removed by this change.
+
+Five focused ReleaseSafe tests pass, including byte-identical SPIR-V before
+and after release, preserved external memory effects and diagnostic counts,
+repeated release, explicit typed-IR retention, and changing uniform values
+with specialization-cache reuse. The `8c449212c59d` ReleaseFast runner and
+ReleaseSafe Vulkan probe build successfully. Native image copy/sample tests,
+compressed array fetch/gather with a changing uniform output guard, all 12
+FLAT-material cases and the workgroup image table pass with Khronos
+synchronization validation, without VUID or synchronization errors.
+
+The live repeat uses the same two compiler workers and disabled catalog warmup.
+At the visible Medium difficulty menu it presents **38 frames in 30.044 seconds
+(1.265 FPS)**. A two-frame difference from the preceding sample is not evidence
+of a repeatable speedup. A read-only census at the tree finds 648 analyses with
+**zero bytes retained in every diagnostic IR array**; decoded code and
+instructions own 227,818,028 bytes. The different number of cached programs
+prevents treating the total difference as an exact whole-process memory saving.
+Tree streaks remain. After selecting Standard, the diagnostic guard stops this
+repeat after 2,344 seconds, with 58,636,980,224 committed bytes against the same
+59,294,818,304-byte limit. Character control is not reached. This is a deliberate
+memory-pressure stop, not a spontaneous game crash.
+
+The installed `zig-out/bin/game-run.exe` and matching PDB now use
+`8c449212c59d33fe644ab36ed80057ff10c7eec166e6b23b2f008e458e95e517`.
+The preceding `16761f86ba35` executable and PDB are backed up under
+`out/yotei-gameplay-20261004/installed-backup-16761f86ba35/`.
+Public release archives are unchanged.
+
+## Isolating a captured compute pipeline
+
+The 2,175,536-byte module captured while the repeat reported compute program
+`0x8000196500` passes SPIR-V validation. In a separate process with no pipeline
+cache, the original module completes in 21.021 seconds with 1,802,534,912 peak
+private bytes. Applying the SDK's offline `spirv-opt -O` produces 1,860,676 bytes
+and completes in 17.020 seconds with 1,733,201,920 peak private bytes. These are
+single-process compiler probes, not GPU execution or game FPS measurements;
+no external optimizer has been added to the renderer.
+
+The original `--probe-spv` bypasses the Vulkan driver cache. A new
+`vulkan-smoke --probe-spv-cached <module.spv>` diagnostic instead calls the same
+cached compiler job as the renderer, without dispatching the shader. With a
+separate copy of the game's 1,078,173,993-byte cache, pipeline creation takes
+47 ms; the whole probe, including startup and persistence, takes 5.126 seconds
+and peaks at 4,132,552,704 private bytes. The original game cache is untouched
+by this probe. This confirms a cache hit and does not support blaming this
+cached module for the full transition stall. Raw stack scans can retain older
+work records, so the next live audit also checks active thread work and memory.
+
+The next audit does establish active driver compilation: the compute job for
+`0x8000173b00` names worker 5696, its completion event is unset, the compiler
+queue reports one active job, and that worker consumes one CPU core inside the
+driver. A guest thread also spins while waiting. Two successive modules contain
+3,712,724 and 4,245,548 bytes. The memory guard stops this repeat after 1,160
+seconds at 58,655,993,856 committed bytes. A census before the transition finds
+659 parent analyses owning 244,602,680 decoded-array bytes and 86 cached uniform
+specializations owning another 98,099,132 bytes. Diagnostic IR arrays remain
+empty in both groups.
+
+An isolated cached probe of the original 4,245,548-byte module spends **59.473
+seconds** creating the pipeline and peaks at **7,397,425,152 private bytes**.
+Offline `spirv-opt -O` reduces it to 3,841,764 bytes, but creation still takes
+59.023 seconds and peaks at 7,289,778,176 bytes. No meaningful compiler speedup
+is demonstrated by this optimization. Reusing the original module's completed
+cache entry takes **14 ms** in a fresh probe process. The original compiled
+cache is copied back for a live repeat, with the preceding cache retained as
+`out/yotei-gameplay-20261004/cache-before-offline-173b00.bin`. The optimized
+module is never substituted into the game. This experiment concerns loading
+stalls and does not establish a higher steady frame rate.
+
+
+The live repeat with that prewarmed cache continues through setup and the tree,
+but encounters further compute variants for `0x800014e300`: captured modules
+contain 3,947,008, 4,583,200 and 3,944,748 bytes. The pending worker and compiler
+queue confirm that compilation is active. At the last progress sample, the
+renderer has presented 1,274 frames and completed 255,494 submission ticks;
+these cumulative counters are not a gameplay FPS measurement. The owned test
+is deliberately closed after 2,245 seconds for isolated translator regression
+checks. There is still no confirmed character control.
+
+
+## Compact snapshot lookup candidate
+
+The translator candidate preserves pre-existing register, EXEC and buffer-range
+SSA values across diagnostic-only fault branches. Those branches cannot change
+the guest values; values created inside the branches are still discarded at
+the merge. For compute snapshot fallback with at least four regions, it also
+hoists an immutable per-invocation region table and searches it with a bounded
+reverse loop. The first hit in reverse order preserves the existing last-region
+precedence for overlaps. Bounds checks and fault reporting remain enabled.
+
+ReleaseSafe native probes pass with Khronos synchronization validation:
+`--unbound-snapshots` now checks direct and repeated guest-loop reads, runtime
+SMEM descriptors, indexed MUBUF access, overlapping regions and missing-pointer
+fault counts. `--flat-pointers`, `--flat-material-fragment`,
+`--workgroup-image-table`, `--deferred-flat-faults` and `--bvh-intersections`
+also pass. The ReleaseFast candidate is `2bd408156d64`; the installed runner is
+still `8c449212c59d` while the separate live comparison runs. These probe results
+establish tested semantics, not a gameplay performance improvement.
+
+
+The `2bd408156d64` live repeat renders the bonus notices, wolf brightness screen
+and Medium difficulty menu. With read-only watchers stopped and no input,
+capture, build or other GPU probe during the interval, it presents **39 frames
+in 30.047 seconds (1.298 FPS)**. One frame more than the preceding 30-second
+sample is not evidence of a repeatable improvement. Bright tree streaks remain.
+After selecting Standard, the captured `0x8000173b00` module is 3,640,024 bytes
+and `0x800014e300` is 3,793,352 bytes; compilation still stalls progression.
+The first passes standalone SPIR-V validation, as do two captured startup
+modules. Its 356 buffer mappings and six snapshot regions are retained locally
+for further comparison; varying resource layouts prevent interpreting module
+size alone as an exact compiler speedup. The owned run is deliberately stopped
+after 1,565 seconds to test selected-buffer FLAT loads. Character control
+remains unconfirmed and the installed runner is unchanged.
+
+
+## Select the FLAT snapshot before reading its payload
+
+The final candidate keeps the existing unrolled range selection and reads only
+the selected buffer. Previously each FLAT dword loaded two host words from
+every captured region, then selected the matching value. With at least four
+compute snapshot regions, selection now precedes the two-word load. Later
+regions still win overlaps; the match predicate masks missing addresses, and
+byte shifts preserve unaligned words. LDS/private aperture handling and fault
+records are unchanged. No shader dispatch is skipped.
+
+A compiler stress replay uses the locally captured `0x8000173b00` code and its
+356 buffer mappings, 935 scalar values, 28 scalar-memory mappings and six FLAT
+regions. Both translators use the same explicit 512-invocation/spilled-LDS
+configuration. This controlled fixture is not byte-identical to the live job
+and is never dispatched. Each module passes SPIR-V validation, then compiles
+in a fresh process without an application pipeline-cache entry:
+
+| Translator | SPIR-V bytes | Pipeline creation | Peak private bytes |
+|---|---:|---:|---:|
+| Installed `8c449212c59d` source | 3,710,284 | 46.549 s | 3,960,901,632 |
+| First compact-lookup candidate | 3,639,148 | 54.509 s | 4,020,154,368 |
+| Selected FLAT reads with lookup loops, rejected | 3,293,296 | 99.315 s | 3,843,182,592 |
+| Selected FLAT reads with unrolled lookup | 3,414,952 | 39.364 s | 3,367,387,136 |
+
+The loop variant reduces file size but substantially slows this driver compile,
+so it is removed. The final variant reduces compiler time by about 15% and peak
+private memory by about 15% against the installed source in this single fixture.
+These are compiler results, not a demonstrated gameplay FPS increase.
+
+
+The final unrolled variant passes all seven ReleaseSafe native probe commands
+under Khronos synchronization validation: `--flat-pointers`,
+`--unbound-snapshots`, `--flat-apertures`, `--bvh-intersections`,
+`--flat-material-fragment`, `--deferred-flat-faults`, and
+`--workgroup-image-table`. These include overlapping and relocated snapshots,
+divergent lanes, unaligned/bounded reads, repeated guest loops, private/LDS
+apertures, ray intersections and precise missing-memory fault counts.
+
+The ReleaseFast runner and matching PDB are installed in `zig-out/bin` with
+SHA-256 `8cc8cf3c3c7a1082c6d1af542a7c32f2c708d2e2ed7a3a15f62269344e89d11a`.
+The preceding `8c449212c59d` pair is retained locally for rollback. Public release
+archives are unchanged. The subsequent game repeat uses the same 1080p output,
+Speed, Performance game preference, two compiler workers, disabled compute
+warmup and default resource-cache budgets as the preceding comparison.
+
+
+The installed final variant presents **37 frames in 30.046 seconds (1.231 FPS)**
+at the visible Medium difficulty menu. Read-only watchers were stopped, with no
+input, capture, build or separate GPU probe during the interval. This does not
+establish a speedup over the previous 1.265/1.298 FPS samples. Bright vertical
+tree streaks remain. A warmed sample at flip 1380 takes 783 ms, uploads
+316,467 KiB and reads back 382,058 KiB; graphics resource preparation is 156 ms
+and fence waits total 168,130 microseconds, overlapping the higher-level costs.
+The repeated frame cost is still dominated by rendering/resource work rather
+than first-use pipeline creation.
+
+![Installed selected-FLAT runner at Medium difficulty; tree streaks remain](../images/yotei-selected-flat-tree-2026-10-04.png)

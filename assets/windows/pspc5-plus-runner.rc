@@ -1,0 +1,36 @@
+#include <windows.h>
+
+1 ICON "pspc5-plus.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,3,3,0
+PRODUCTVERSION 0,3,3,0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+FILEFLAGS VS_FF_DEBUG
+#else
+FILEFLAGS 0
+#endif
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "PSPC5 Plus Project\0"
+            VALUE "FileDescription", "PSPC5 Plus Game Runner\0"
+            VALUE "FileVersion", "0.3.3\0"
+            VALUE "InternalName", "game-run\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Artur Strazewicz / PSPC5 Plus Contributors\0"
+            VALUE "OriginalFilename", "game-run.exe\0"
+            VALUE "ProductName", "PSPC5 Plus\0"
+            VALUE "ProductVersion", "0.3.3\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

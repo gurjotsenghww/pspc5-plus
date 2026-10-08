@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+.{
+    .name = .pspc5_plus,
+    .version = "0.3.3",
+    .fingerprint = 0x95a124ffe5cfcd1b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .freetype = .{
+            .url = "https://github.com/freetype/freetype/archive/refs/tags/VER-2-14-3.tar.gz",
+            .hash = "N-V-__8AAGJsqgDtM-7hGxs3GiSanZStnUfFiuHmioYRK3hN",
+        },
+        .libatrac9 = .{
+            .url = "https://github.com/shadps4-emu/ext-LibAtrac9/archive/946e05a9212976626a9f5e52f29c0a7202871f29.tar.gz",
+            .hash = "N-V-__8AACDxBADvLCQVTh9mzhuIbwV2zj1QXzdDWXU8J1ZZ",
+        },
+        .minimp3 = .{
+            .url = "https://github.com/lieff/minimp3/archive/7b590fdcfa5a79c033e76eacc05d0c3e4c79f536.tar.gz",
+            .hash = "N-V-__8AAITPDQK9zXacGDpSmTu7XxdPQyDUWldJBmJHdXWU",
+        },
+        .faad2 = .{
+            .url = "https://github.com/knik0/faad2/archive/refs/tags/2.11.2.tar.gz",
+            .hash = "N-V-__8AAPI-KQB4wWupmQ5-EPOUT1qm1y6eufl5DnyO4T9B",
+        },
+        .libopus = .{
+            .url = "https://github.com/xiph/opus/archive/refs/tags/v1.5.2.tar.gz",
+            .hash = "N-V-__8AAMEO5AA16T-SYUVA1ipB1ctBxSMowU_ZD3tzi54M",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}

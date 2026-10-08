@@ -1,0 +1,1244 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Loads, initializes, and enters a decrypted PS5 title through the native
+//! Windows x86-64 guest bridge.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const gpu = @import("gpu");
+const runtime = @import("runtime");
+const loader = @import("loader");
+const vulkan = @import("vulkan");
+const window = @import("window");
+const display_mode = @import("display_mode.zig");
+const performance_mode = @import("performance_mode.zig");
+
+fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?vulkan.GuestMemory.HostMapping {
+    const view = runtime.firmware.libs.agc_submit.pinDirectMemory(context, address, size, identity) orelse return null;
+    return .{ .bytes = view.bytes, .offset = view.offset, .identity = identity, .release = runtime.firmware.libs.agc_submit.releaseDirectMemory };
+}
+
+comptime {
+    @import("host_memory.zig").exportRuntime();
+}
+
+/// Guest-created threads may not have a stack the host unwinder can traverse.
+/// Preserve the failing host address before attempting the normal panic trace.
+pub const panic = std.debug.FullPanic(reportPanic);
+
+fn reportPanic(message: []const u8, return_address: ?usize) noreturn {
+    const address = return_address orelse @returnAddress();
+    std.debug.print("[host panic] caller=0x{x} handler=0x{x}\n", .{ address, @intFromPtr(&reportPanic) });
+    std.debug.defaultPanic(message, address);
+}
+
+const usage =
+    \\game-run [--app0 <content-directory>] <eboot.bin>
+    \\
+    \\Loads and relocates the adjacent PRX graph, runs its initializers, then
+    \\enters the title process. --app0 supplies full game content when eboot.bin
+    \\comes from a sparse patch directory. Direct execution requires Windows x86-64.
+    \\
+;
+
+/// Prepares the directory a title's saved games live in and tells the firmware
+/// which title is running.
+///
+/// The root sits beside the emulator rather than inside the game, because a
+/// title's installation is read-only, may be on removable media, and is
+/// replaced wholesale when it is patched; a save must outlive all three. The
+/// identifier comes from what the title publishes about itself, so two dumps of
+/// the same game share their saves and two different games never do.
+fn openSaveDataHome(io: std.Io, content: std.Io.Dir) !std.Io.Dir {
+    var identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
+    const identifier = readTitleIdentifier(io, content, &identifier_storage) orelse
+        "unknown-title";
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, save_data_home) catch {};
+    const home = try cwd.openDir(io, save_data_home, .{});
+    runtime.firmware.filesystem.attachSaveDataHome(home, identifier);
+    return home;
+}
+
+const save_data_home = "savedata";
+const download_data_home = "out/download0";
+const temporary_data_home = "out/temp0";
+const terminator_2d_title_id = "PPSA25872";
+const tetris_effect_connected_title_id = "PPSA07923";
+const little_nightmares_enhanced_title_id = "PPSA10737";
+const yotei_title_id = "PPSA26344";
+const gta_iii_title_id = "PPSA03527";
+const quake_ii_title_id = "PPSA09477";
+const subnautica_below_zero_title_id = "PPSA02457";
+const terminator_audio_latency_ms: u16 = 128;
+
+/// Compatibility stays the global default, while profiles enable only paths
+/// which have passed isolated title A/B and visual runs. Terminator benefits
+/// from queue-ordered batches in flight and GPU-resident compute outputs; page
+/// tracking and the other experimental paths remain disabled.
+fn titleUsesTerminatorGpuProfile(title_identifier: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(title_identifier, terminator_2d_title_id);
+}
+
+/// These titles consume small compute/storage results from the CPU. Tetris
+/// Effect and Little Nightmares have exposed MallocBinned3 corruption with
+/// deferred writeback; their observed gameplay runs use eager publication.
+/// Keep this compatibility choice scoped until deferred ownership is resolved.
+fn titleNeedsEagerStorageWrites(title_identifier: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(title_identifier, tetris_effect_connected_title_id) or
+        std.ascii.eqlIgnoreCase(title_identifier, little_nightmares_enhanced_title_id);
+}
+
+test "CPU storage consumer profiles materialize writes eagerly" {
+    try std.testing.expect(titleNeedsEagerStorageWrites("PPSA07923"));
+    try std.testing.expect(titleNeedsEagerStorageWrites("ppsa07923"));
+    try std.testing.expect(titleNeedsEagerStorageWrites("PPSA10737"));
+    try std.testing.expect(titleNeedsEagerStorageWrites("ppsa10737"));
+    try std.testing.expect(!titleNeedsEagerStorageWrites("PPSA25872"));
+    try std.testing.expect(!titleNeedsEagerStorageWrites("PPSA03527"));
+    try std.testing.expect(!titleNeedsEagerStorageWrites("PPSA02457"));
+}
+
+/// Reads the product code a title publishes in its own parameter document.
+fn readTitleIdentifier(io: std.Io, content: std.Io.Dir, storage: []u8) ?[]const u8 {
+    const savedata = runtime.firmware.savedata;
+    var document: [8192]u8 = undefined;
+    const text = content.readFile(io, savedata.title_parameter_path, &document) catch return null;
+    return savedata.findJsonString(text, "titleId", storage);
+}
+
+/// Prepares writable, per-title generated/downloaded data. Unreal titles use
+/// these mounts for staged configuration, caches and temporary saves. Keep
+/// generated data writable without changing the installed title directory.
+fn openWritableTitleData(io: std.Io, home: []const u8, title_identifier: []const u8) !std.Io.Dir {
+    const savedata = runtime.firmware.savedata;
+    var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_identifier = savedata.sanitizeName(title_identifier, &identifier_storage);
+    var path_storage: [savedata.maximum_path]u8 = undefined;
+    const path = savedata.joinPath(&path_storage, &.{ home, safe_identifier }) orelse
+        return error.NameTooLong;
+
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, path);
+    return cwd.openDir(io, path, .{});
+}
+
+fn reportUnresolvedImport(context: ?*anyopaque, diagnostic: runtime.module_graph.UnresolvedImport) void {
+    const writer: *std.Io.Writer = @ptrCast(@alignCast(context.?));
+    writer.print("  unresolved {s}: {s} {s} {s}\n", .{
+        diagnostic.path,
+        diagnostic.import.id,
+        diagnostic.import.library orelse diagnostic.import.library_code,
+        @tagName(diagnostic.import.symbol_type),
+    }) catch {};
+}
+
+fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?vulkan.DisplayBuffer {
+    const registration = runtime.firmware.video_out.resolveFlip(flip) orelse return null;
+    return .{
+        .address = registration.data_address,
+        .width = registration.attribute.width,
+        .height = registration.attribute.height,
+        .pitch_in_pixels = registration.attribute.pitch_in_pixels,
+        .tiling_mode = registration.attribute.tiling_mode,
+        .pixel_format = registration.attribute.pixel_format,
+    };
+}
+
+fn listVideoOutAddresses(_: ?*anyopaque, out: []u64) usize {
+    return runtime.firmware.video_out.copyRegisteredAddresses(out);
+}
+
+fn updateHostWindowFps(context: ?*anyopaque, fps_tenths: u32) void {
+    const host_window: *window.HostWindow = @ptrCast(@alignCast(context orelse return));
+    host_window.updateFps(fps_tenths);
+}
+
+fn appendUnityDeferredModules(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    title_root: []const u8,
+    modules: *std.ArrayList([]const u8),
+) !void {
+    var directory = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch return;
+    defer directory.close(io);
+    const candidates = [_][]const u8{
+        "Media/Plugins/lib_burst_generated.prx",
+        "Media/Plugins/SaveData.prx",
+        "Media/Plugins/PSN.prx",
+        "Media/Plugins/PSNCore.prx",
+        // FMOD is resolved through IL2CPP P/Invoke, so it has no DT_NEEDED
+        // edge from the executable. A missing library aborts platform startup
+        // in titles that initialize audio before creating their main menu.
+        "Media/Plugins/libfmod.prx",
+        "Media/Plugins/libfmodstudio.prx",
+    };
+    for (candidates) |path| {
+        _ = directory.statFile(io, path, .{}) catch continue;
+        try modules.append(allocator, path);
+    }
+}
+
+fn reportRelocation(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    node: *runtime.module_graph.Module,
+    target: u64,
+) !void {
+    const mapped = &node.mapped.?;
+    if (target < mapped.load_bias) return;
+    const target_offset = target - mapped.load_bias;
+    try writer.print("  rip-relative target: 0x{x} (image+0x{x})\n", .{ target, target_offset });
+    var encoded_value: [8]u8 = undefined;
+    if (mapped.address_space.read(target, &encoded_value)) |_| {
+        try writer.print("  current target value: 0x{x}\n", .{std.mem.readInt(u64, &encoded_value, .little)});
+    } else |_| {}
+
+    var imports = loader.collectImports(allocator, node.image, &node.dynamic_info) catch return;
+    defer imports.deinit(allocator);
+    for (imports.items.items) |import| {
+        if (import.target_offset != target_offset) continue;
+        try writer.print("  referenced import: {s} {s}\n", .{
+            import.id,
+            import.library orelse import.library_code,
+        });
+    }
+
+    const tables = [_]struct {
+        bytes: []const u8,
+        kind: loader.relocations.TableKind,
+    }{
+        .{
+            .bytes = node.dynamic_info.tableData(
+                node.image,
+                node.dynamic_info.rela_offset,
+                node.dynamic_info.rela_size,
+            ) catch &.{},
+            .kind = .general,
+        },
+        .{
+            .bytes = node.dynamic_info.tableData(
+                node.image,
+                node.dynamic_info.jmprel_offset,
+                node.dynamic_info.jmprel_size,
+            ) catch &.{},
+            .kind = .plt,
+        },
+    };
+    for (tables) |table_data| {
+        const table = loader.relocations.Table.init(table_data.bytes, table_data.kind) catch continue;
+        for (table.entries) |relocation| {
+            if (relocation.offset != target_offset) continue;
+            try writer.print("  relocation: {s}, symbol={d}, addend={d}\n", .{
+                @tagName(relocation.relocationType()),
+                relocation.symbolIndex(),
+                relocation.addend,
+            });
+        }
+    }
+}
+
+/// Prints a bounded view of a pointer retained in the guest registers at a
+/// fault. Error and assertion paths commonly pass either a text message or a
+/// small object containing one to libc before trapping. Keeping the probe in
+/// the runner means the bytes are captured before process teardown unmaps the
+/// allocation that explains the failure.
+fn reportGuestPointer(
+    writer: *std.Io.Writer,
+    address_space: anytype,
+    label: []const u8,
+    address: u64,
+) !void {
+    if (address < 0x1_0000) return;
+    const mapping = address_space.query(address, false) orelse return;
+    if (!mapping.protection.read or address >= mapping.end()) return;
+
+    const available = mapping.end() - address;
+    const byte_count: usize = @intCast(@min(available, 96));
+    if (byte_count == 0) return;
+    var bytes: [96]u8 = undefined;
+    address_space.read(address, bytes[0..byte_count]) catch return;
+
+    const mapping_name = std.mem.sliceTo(&mapping.name, 0);
+    try writer.print("  {s}@0x{x} mapping={s}", .{ label, address, @tagName(mapping.kind) });
+    if (mapping_name.len != 0) try writer.print(" name={s}", .{mapping_name});
+    try writer.print(" range=0x{x}..0x{x}\n", .{ mapping.address, mapping.end() });
+
+    var row: usize = 0;
+    while (row < byte_count) : (row += 16) {
+        const end = @min(row + 16, byte_count);
+        try writer.print("    +0x{x:0>2}:", .{row});
+        for (bytes[row..end]) |byte| try writer.print(" {x:0>2}", .{byte});
+        var padding = end;
+        while (padding < row + 16) : (padding += 1) try writer.writeAll("   ");
+        try writer.writeAll("  |");
+        for (bytes[row..end]) |byte| {
+            try writer.writeByte(if (byte >= 0x20 and byte < 0x7f) byte else '.');
+        }
+        try writer.writeAll("|\n");
+    }
+}
+
+pub fn main(init: std.process.Init) !void {
+    if (!try run(init)) std.process.exit(1);
+}
+
+fn run(init: std.process.Init) !bool {
+    const io = init.io;
+    const startup_arena = init.arena.allocator();
+    // The process init arena intentionally ignores individual frees. That is
+    // useful for short-lived CLI parsing but disastrous for a long-running
+    // renderer: temporary uploads, readbacks, tiled frames, and grown array
+    // capacities would all remain committed until process exit. Use the
+    // thread-safe freeing allocator for runtime-owned state instead.
+    const allocator = std.heap.smp_allocator;
+
+    var stderr_buffer: [2048]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+
+    var stdout_buffer: [2048]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const out = &stdout_writer.interface;
+
+    const args = try init.minimal.args.toSlice(startup_arena);
+    const has_app0_override = args.len == 4 and std.mem.eql(u8, args[1], "--app0");
+    if (args.len != 2 and !has_app0_override) {
+        try stderr.writeAll(usage);
+        try stderr.flush();
+        return false;
+    }
+    const executable_path = if (has_app0_override) args[3] else args[1];
+    const title_root = if (has_app0_override)
+        args[2]
+    else
+        std.fs.path.dirname(executable_path) orelse ".";
+
+    var emu = runtime.Runtime{};
+    try emu.init(allocator);
+    defer emu.deinit();
+
+    const output_mode = if (init.minimal.environ.getAlloc(allocator, display_mode.environment_name)) |value| mode: {
+        defer allocator.free(value);
+        break :mode display_mode.Mode.parse(value) orelse {
+            try stderr.print("Invalid {s}='{s}'; using 1080p\n", .{ display_mode.environment_name, value });
+            try stderr.flush();
+            break :mode display_mode.default;
+        };
+    } else |_| display_mode.default;
+    runtime.firmware.video_out.configureOutputResolution(output_mode.width(), output_mode.height());
+    const render_preset = if (init.minimal.environ.getAlloc(allocator, performance_mode.environment_name)) |value| mode: {
+        defer allocator.free(value);
+        break :mode performance_mode.Mode.parse(value) orelse {
+            try stderr.print("Invalid {s}='{s}'; using {s}\n", .{
+                performance_mode.environment_name, value, performance_mode.default.value(),
+            });
+            try stderr.flush();
+            break :mode performance_mode.default;
+        };
+    } else |_| performance_mode.default;
+    const user_service = runtime.firmware.libs.user_service;
+    const game_preset = if (init.minimal.environ.getAlloc(allocator, user_service.game_preset_environment)) |value| mode: {
+        defer allocator.free(value);
+        break :mode user_service.GamePresetPriority.parse(value) orelse {
+            try stderr.print("Invalid {s}='{s}'; using game default\n", .{ user_service.game_preset_environment, value });
+            try stderr.flush();
+            break :mode user_service.GamePresetPriority.game_default;
+        };
+    } else |_| user_service.GamePresetPriority.performance;
+    user_service.configureGamePreset(game_preset);
+    // Unset PS5_GAME_PRESET matches the launcher: priority 1. Yotei stores
+    // that as internal mode 2, the 1080p preference without ray tracing.
+    // Output status reports HD, SDR and 59.94 Hz, and does not offer 120 Hz.
+    try out.print("  Output  {d}x{d}, VideoOut class {d}, SDR 59.94 Hz; 120 Hz modes are not offered\n", .{
+        output_mode.width(), output_mode.height(), runtime.firmware.video_out.outputResolutionClass(),
+    });
+    try out.print("  Preset  {s}\n", .{render_preset.label()});
+    try out.print("  Game preference  {s}; applied by titles that read system game presets\n", .{game_preset.label()});
+    try out.flush();
+
+    var preload_modules: std.ArrayList([]const u8) = .empty;
+    defer preload_modules.deinit(allocator);
+    var preload_text: ?[]u8 = null;
+    defer if (preload_text) |text| allocator.free(text);
+    if (init.minimal.environ.getAlloc(allocator, "PS5_PRELOAD")) |text| {
+        preload_text = text;
+        var parts = std.mem.splitScalar(u8, text, ';');
+        while (parts.next()) |part| {
+            const path = std.mem.trim(u8, part, " \t\r\n");
+            if (path.len != 0) try preload_modules.append(allocator, path);
+        }
+    } else |_| {}
+
+    var deferred_modules: std.ArrayList([]const u8) = .empty;
+    defer deferred_modules.deinit(allocator);
+    var deferred_text: ?[]u8 = null;
+    defer if (deferred_text) |text| allocator.free(text);
+    if (init.minimal.environ.getAlloc(allocator, "PS5_DEFERRED_MODULES")) |text| {
+        deferred_text = text;
+        var parts = std.mem.splitScalar(u8, text, ';');
+        while (parts.next()) |part| {
+            const path = std.mem.trim(u8, part, " \t\r\n");
+            if (path.len != 0) try deferred_modules.append(allocator, path);
+        }
+    } else |_| {
+        // These Unity plug-ins are loaded explicitly after startup rather than
+        // through DT_NEEDED. Map them ahead of guest execution, while leaving
+        // their constructors deferred until LoadStartModule supplies the real
+        // argument block. The environment variable remains the override for
+        // uncommon title-specific modules.
+        try appendUnityDeferredModules(allocator, io, title_root, &deferred_modules);
+    }
+
+    var graph = emu.loadModuleGraph(io, executable_path, .{
+        .preload_modules = preload_modules.items,
+        .deferred_modules = deferred_modules.items,
+        .diagnostics = .{ .context = stderr, .unresolved_fn = &reportUnresolvedImport },
+    }) catch |err| {
+        try stderr.print("cannot link {s}: {s}\n", .{ executable_path, @errorName(err) });
+        try stderr.flush();
+        return false;
+    };
+    defer graph.deinit();
+
+    // Must precede any guest execution: a throwing title asks the kernel which
+    // module owns each return address, and without an answer its runtime finds
+    // no handler and terminates instead of recovering.
+    const unwind_modules = try graph.publishUnwindModules(allocator);
+    defer {
+        runtime.firmware.unwind.detach();
+        allocator.free(unwind_modules);
+    }
+
+    // Titles load some of their own modules by path once running; everything is
+    // already mapped, so the request has to resolve to what exists.
+    const loaded_modules = try graph.publishModules(allocator, &emu.guest_exports);
+    defer {
+        runtime.firmware.modules.detach();
+        allocator.free(loaded_modules);
+    }
+
+    // The directory holding the executable is what a title sees as /app0.
+    var content = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch |err| {
+        try stderr.print("cannot open {s}: {s}\n", .{ title_root, @errorName(err) });
+        try stderr.flush();
+        return false;
+    };
+    defer content.close(io);
+    runtime.firmware.filesystem.attach(io, content);
+    if (try runtime.firmware.filesystem.configureDisplay(output_mode.width(), output_mode.height())) {
+        try out.print("  Unity startup render size {d}x{d} (virtual boot.config)\n", .{ output_mode.width(), output_mode.height() });
+        try out.flush();
+    }
+    defer runtime.firmware.filesystem.detach();
+
+    const rtc_day_offset: i32 = if (init.minimal.environ.getAlloc(
+        allocator,
+        "PS5_RTC_DAY_OFFSET",
+    )) |text| parse: {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        break :parse std.fmt.parseInt(i32, request, 10) catch 0;
+    } else |_| 0;
+    runtime.firmware.libs.platform_services.setRtcDayOffset(rtc_day_offset);
+    defer runtime.firmware.libs.platform_services.setRtcDayOffset(0);
+    if (rtc_day_offset != 0) {
+        try out.print("  RTC day offset {d}\n", .{rtc_day_offset});
+    }
+
+    // Keep unattended input generic and explicitly selectable. A delayed hold
+    // is useful for menus that require a sustained Triangle press, but silently
+    // choosing it from a product ID would make controller behaviour title code.
+    const automatic_triangle_hold = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_AUTO_HOLD_TRIANGLE",
+    ) catch false;
+    const automatic_rapid_down = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_AUTO_RAPID_DOWN",
+    ) catch false;
+    runtime.firmware.libs.pad.setAutomaticProfile(if (automatic_rapid_down)
+        .rapid_down
+    else if (automatic_triangle_hold)
+        .delayed_triangle_hold
+    else
+        .default);
+    runtime.firmware.libs.pad.setDiagnostics(init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_PAD_DIAGNOSTICS",
+    ) catch false);
+    var saves = openSaveDataHome(io, content) catch null;
+    defer if (saves) |*directory| directory.close(io);
+    defer runtime.firmware.filesystem.unmountSaveData();
+
+    var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
+    const title_identifier = readTitleIdentifier(io, content, &title_identifier_storage) orelse "";
+
+    var download_data: ?std.Io.Dir = openWritableTitleData(io, download_data_home, title_identifier) catch |err| blk: {
+        try stderr.print("cannot prepare /download0: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        break :blk null;
+    };
+    defer if (download_data) |*directory| directory.close(io);
+    if (download_data) |directory| runtime.firmware.filesystem.attachDownloadData(directory);
+    defer runtime.firmware.filesystem.detachDownloadData();
+
+    // Unity validates the mount returned by AppContent before publishing its
+    // temporaryCachePath. A successful mount backed by no filesystem produced
+    // an empty path and stopped new-save creation before loading a level.
+    var temporary_data: ?std.Io.Dir = openWritableTitleData(io, temporary_data_home, title_identifier) catch |err| blk: {
+        try stderr.print("cannot prepare /temp0: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        break :blk null;
+    };
+    defer if (temporary_data) |*directory| directory.close(io);
+    if (temporary_data) |directory| runtime.firmware.filesystem.attachTemporaryData(directory);
+    defer runtime.firmware.filesystem.detachTemporaryData();
+
+    // A contained fault prints the retained calls afterwards, but a process
+    // that dies outright takes the buffer with it. This is the escape hatch for
+    // those, and it is far too noisy for anything else.
+    //
+    // The value may name which entry points to print, as comma-separated
+    // fragments of their names. That is not a convenience: printing every call
+    // costs more than the calls do, so a title that would reach its render loop
+    // in a second never gets there under a full trace — and the render loop is
+    // exactly what one wants to watch. Anything other than a bare "1" is read
+    // as a filter.
+    if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE")) |text| {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        if (request.len != 0) {
+            runtime.firmware.trace.setLive(true);
+            if (!std.mem.eql(u8, request, "1")) {
+                runtime.firmware.trace.setLiveFilter(request);
+                try out.print("  tracing only calls matching: {s}\n", .{request});
+            }
+        }
+    } else |_| {}
+
+    // Which firmware entry points a frame is actually spent inside. The
+    // renderer profiles its own work; this covers everything else.
+    if (init.minimal.environ.getAlloc(allocator, "PS5_HLE_PROFILE")) |text| {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        if (request.len != 0 and !std.mem.eql(u8, request, "0")) {
+            runtime.firmware.trace.enableProfile();
+            try out.print("  profiling firmware call totals every 10s\n", .{});
+        }
+    } else |_| {}
+
+    if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_FAILURES")) |text| {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        if (request.len != 0 and !std.mem.eql(u8, request, "0")) {
+            runtime.firmware.trace.setLive(true);
+            runtime.firmware.trace.setLiveFailuresOnly(true);
+            try out.print("  tracing failed firmware calls only\n", .{});
+        }
+    } else |_| {}
+
+    // Arms a one-shot snapshot of the guest stack at one firmware call, named by
+    // its number in the trace. The trace says which calls a title made; this
+    // says which of the title's own code made one of them, which is the only
+    // question left once a call is seen to repeat thousands of times.
+    if (init.minimal.environ.getAlloc(allocator, "PS5_STACK_AT")) |text| {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        const separator = std.mem.lastIndexOfScalar(u8, request, ':');
+        const name = if (separator) |at| request[0..at] else request;
+        const occurrence = if (separator) |at|
+            std.fmt.parseInt(u64, request[at + 1 ..], 10) catch 0
+        else
+            1;
+        if (occurrence == 0 or name.len == 0) {
+            try stderr.print(
+                "PS5_STACK_AT wants <entry point>[:<call number>], not {s}\n",
+                .{request},
+            );
+            try stderr.flush();
+        } else {
+            runtime.firmware.trace.captureStackAt(name, occurrence);
+        }
+    } else |_| {}
+
+    // Live GPU submissions use the same serialized PM4 scheduler as tracing.
+    // The host renderer stays optional so loader/CPU diagnostics remain useful
+    // on machines without a Vulkan presentation device.
+    var host_window = window.HostWindow{};
+    var window_initialized = false;
+    var renderer: vulkan.Renderer = undefined;
+    var renderer_initialized = false;
+    defer {
+        // Stop every guest worker before taking away callbacks it may still be
+        // executing, then release Vulkan before destroying the HWND surface.
+        emu.disableCpuDispatcher();
+        runtime.firmware.libs.videodec2.attachVideoFrameSink(null);
+        runtime.firmware.libs.agc_submit.attachBackend(null);
+        if (renderer_initialized) renderer.deinit();
+        if (window_initialized) host_window.deinit();
+    }
+
+    const force_headless = init.minimal.environ.containsUnempty(allocator, "PS5_HEADLESS") catch false;
+    const show_fps = init.minimal.environ.containsUnempty(allocator, "PS5_SHOW_FPS") catch false;
+    const enable_cpu_wait_diagnostics = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_CPU_WAIT_DIAGNOSTICS",
+    ) catch false;
+    const enable_vulkan_validation = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_VALIDATION") catch false;
+    if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_TIMESTAMPS")) |text| {
+        defer allocator.free(text);
+        @atomicStore(bool, &vulkan.backend.gpu_timestamp_profiling, std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "1"), .monotonic);
+    } else |_| {}
+    const capture_first_graphics_frame = init.minimal.environ.containsUnempty(allocator, "PS5_CAPTURE_FIRST_FRAME") catch false;
+    const trace_graphics_frame: ?u64 = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_GRAPHICS_FRAME")) |text| parse: {
+        defer allocator.free(text);
+        const value = std.mem.trim(u8, text, " \t\r\n");
+        break :parse std.fmt.parseInt(u64, value, 10) catch null;
+    } else |_| null;
+    const force_probe_fragment = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_COLOR") catch false;
+    const trace_gpu_completion_from_frame: ?u64 = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_GPU_COMPLETION_FROM_FRAME")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch null;
+    } else |_| null;
+    const force_probe_fragment_texture = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_TEXTURE") catch false;
+    const force_probe_fragment_parameter = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_PARAMETER") catch false;
+    const force_probe_fragment_ui = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_UI") catch false;
+    const skip_compute_dispatches = init.minimal.environ.containsUnempty(allocator, "PS5_SKIP_COMPUTE") catch false;
+    const environment_skip_compute_until_flip: ?u64 = if (init.minimal.environ.getAlloc(
+        allocator,
+        "PS5_SKIP_COMPUTE_UNTIL_FLIP",
+    )) |text| parse: {
+        defer allocator.free(text);
+        const value = std.mem.trim(u8, text, " \t\r\n");
+        break :parse std.fmt.parseInt(u64, value, 10) catch null;
+    } else |_| null;
+    // First-frame image passes include persistent atmosphere tables. Keep
+    // startup compute unless explicitly suppressed for diagnostics; fullscreen
+    // movie prioritization still applies once a decoder becomes active.
+    const skip_compute_until_flip = environment_skip_compute_until_flip orelse 0;
+    const environment_compute_execution_limit: ?u64 = if (init.minimal.environ.getAlloc(
+        allocator,
+        "PS5_COMPUTE_EXECUTION_LIMIT",
+    )) |text| parse: {
+        defer allocator.free(text);
+        const value = std.mem.trim(u8, text, " \t\r\n");
+        break :parse std.fmt.parseInt(u64, value, 10) catch null;
+    } else |_| null;
+    const compute_execution_limit = environment_compute_execution_limit;
+    const sparse_graphics_draws = init.minimal.environ.containsUnempty(allocator, "PS5_SPARSE_GRAPHICS") catch false;
+    const translate_compute_only = init.minimal.environ.containsUnempty(allocator, "PS5_COMPUTE_TRANSLATE_ONLY") catch false;
+    const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
+    // Big Helmet Heroes' packed menu scanout has been checked against the
+    // CPU conversion. Avoid reading its 4K attachment back every flip.
+    vulkan.backend.gpu_packed_scanout = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PACKED_SCANOUT")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| std.ascii.eqlIgnoreCase(title_identifier, "PPSA19943");
+    const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
+    const dump_graphics_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_GRAPHICS_SPIRV") catch false;
+    const trace_resource_failures = init.minimal.environ.containsUnempty(allocator, "PS5_TRACE_RESOURCE_FAILURES") catch false;
+    const trace_buffer_range: struct { address: u64 = 0, size: usize = 0 } = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_BUFFER_RANGE")) |text| parse: {
+        defer allocator.free(text);
+        var parts = std.mem.splitScalar(u8, text, ':');
+        const address = std.fmt.parseInt(u64, parts.next() orelse break :parse .{}, 0) catch break :parse .{};
+        const size = std.fmt.parseInt(usize, parts.next() orelse break :parse .{}, 0) catch break :parse .{};
+        if (parts.next() != null or size == 0 or address > std.math.maxInt(u64) - size) break :parse .{};
+        break :parse .{ .address = address, .size = size };
+    } else |_| .{};
+    const capture_extended_progress_frames = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_CAPTURE_PROGRESS_FRAMES",
+    ) catch false;
+    const enable_gpu_experimental = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_GPU_EXPERIMENTAL",
+    ) catch false;
+    const enable_shader_ssa = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_SSA") catch false);
+    const enable_shader_ir = enable_gpu_experimental or enable_shader_ssa or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_SHADER_IR") catch false);
+    const enable_async_pipelines = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_ASYNC_PIPELINES")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| true;
+    const adaptive_cpu_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_ADAPTIVE_WORKERS")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| true;
+    const cpu_worker_limits = gpu.cpu_workers.policy.defaults(std.Thread.getCpuCount() catch 2);
+    var adaptive_compiler_workers = adaptive_cpu_workers;
+    const pipeline_compiler_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMPILER_WORKERS")) |text| workers: {
+        defer allocator.free(text);
+        adaptive_compiler_workers = false;
+        break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 1, 4);
+    } else |_| if (adaptive_cpu_workers) cpu_worker_limits.compilers else 2;
+    // GTA III's frequent ordering callbacks outweigh command lookahead.
+    // Retain the environment override for comparisons and other titles.
+    const parallel_commands = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PARALLEL_COMMANDS")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| !std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id);
+    var adaptive_resource_workers = adaptive_cpu_workers;
+    const resource_preparation_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RESOURCE_WORKERS")) |text| workers: {
+        defer allocator.free(text);
+        adaptive_resource_workers = false;
+        break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 0, gpu.resource_preparation.Pool.maximum_workers);
+    } else |_| if (adaptive_cpu_workers) cpu_worker_limits.resources else 2;
+    // Use title-isolated catalogs and a versioned descriptor ABI directory.
+    // Unknown/nonstandard title identifiers simply run without disk warmup.
+    const safe_shader_title = title_identifier.len == 9 and std.mem.startsWith(u8, title_identifier, "PPSA") and
+        for (title_identifier[4..]) |character| {
+            if (!std.ascii.isDigit(character)) break false;
+        } else true;
+    const enable_compute_warmup = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMPUTE_WARMUP")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| true;
+    const compute_warmup_directory = if (enable_async_pipelines and enable_compute_warmup and safe_shader_title)
+        try std.fmt.allocPrint(startup_arena, "out/shader-cache/{s}/compute-v1", .{title_identifier})
+    else
+        null;
+    const enable_canonical_aliases = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_CANONICAL_ALIASES") catch false);
+    const enable_depth_transfer = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_DEPTH_TRANSFER") catch false);
+    const enable_image_state_optimization = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_IMAGE_STATE_OPT") catch false);
+    const use_terminator_gpu_profile = titleUsesTerminatorGpuProfile(title_identifier);
+    runtime.firmware.libs.audio.setHostTargetLatencyMilliseconds(if (use_terminator_gpu_profile)
+        terminator_audio_latency_ms
+    else
+        runtime.firmware.libs.audio.default_host_target_latency_ms);
+    const force_synchronous_submits = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_GPU_SYNC_SUBMITS",
+    ) catch false;
+    // Keep independent GPU batches in flight by default. Guest-visible
+    // RELEASE/WAIT packets still synchronize explicitly; this only removes
+    // unconditional host waits between otherwise ordered Vulkan submissions.
+    const enable_timeline_scheduler = !force_synchronous_submits;
+    const enable_automatic_timeline_scheduler = enable_timeline_scheduler;
+    const force_eager_storage_writes = titleNeedsEagerStorageWrites(title_identifier) or
+        (init.minimal.environ.containsUnempty(
+            allocator,
+            "PS5_GPU_EAGER_STORAGE_WRITES",
+        ) catch false);
+    // Small compute outputs stay resident until an exact guest-memory read or
+    // a host-visible completion publishes them. Eager writeback otherwise
+    // forces one submit/fence/readback for every dispatch.
+    const defer_small_storage_writes = !force_eager_storage_writes;
+    const enable_automatic_deferred_storage_writes = defer_small_storage_writes;
+    // End-of-pipe releases were a host wait per packet (about 80 waits and
+    // 90 ms on a Big Helmet Heroes gameplay frame). Queuing the label until
+    // the device reaches it removes those waits. PS5_GPU_DEFER_INTERNAL_RELEASES=0
+    // restores the synchronous publish.
+    const defer_internal_releases = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEFER_INTERNAL_RELEASES")) |text| enabled: {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        break :enabled request.len != 0 and !std.mem.eql(u8, request, "0");
+    } else |_| true;
+    // Native Windows writes are observed by the page-fault tracker. Retain
+    // unchanged buffers for every title; explicit zero values remain useful
+    // for comparisons. Vertex-fetch bounds still use the verified profile.
+    const use_quake_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, quake_ii_title_id);
+    const use_gta_iii_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id);
+    const enable_gpu_page_tracker = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PAGE_TRACKER")) |text| enabled: {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        break :enabled request.len != 0 and !std.mem.eql(u8, request, "0");
+    } else |_| builtin.os.tag == .windows or enable_gpu_experimental or use_quake_buffer_profile;
+    const bound_vertex_fetches = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BOUND_VERTEX_FETCHES")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| use_quake_buffer_profile or use_gta_iii_buffer_profile;
+    const reuse_graphics_resources = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_REUSE_GRAPHICS_RESOURCES")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| enable_gpu_page_tracker;
+    const enable_host_import = !enable_gpu_page_tracker and builtin.os.tag == .windows and
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_HOST_IMPORT") catch false);
+    // Yotei repeatedly binds multi-megabyte material buffers whose contents
+    // remain unchanged. Full-range parallel fingerprints retain their upload.
+    // An explicit 0 restores unconditional uploads for comparison.
+    const enable_gpu_buffer_content_cache = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BUFFER_CONTENT_CACHE")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or use_gta_iii_buffer_profile;
+    const default_copy_workers: u8 = if (use_gta_iii_buffer_profile or
+        std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or
+        std.ascii.eqlIgnoreCase(title_identifier, little_nightmares_enhanced_title_id)) 4 else 1;
+    const gpu_copy_workers: u8 = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COPY_WORKERS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(u8, text, 10) catch default_copy_workers, 1, gpu.parallel_copy.Pool.maximum_participants);
+    } else |_| default_copy_workers;
+    gpu.parallel_copy.guest_copy_pool.participants.store(gpu_copy_workers, .release);
+    // Tetris Journey Mode retains about 100 attachments. A 64-entry cache
+    // evicts/reimports roughly 60 of them per frame, causing hundreds of MiB
+    // of readbacks. Keep its working set resident, as for Yotei.
+    // GTA III keeps more than 180 colour attachments, including cube mips.
+    // Keeping that measured working set avoids repeated readback and reupload.
+    const default_render_targets: usize = if (use_gta_iii_buffer_profile) 256 else if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or
+        std.ascii.eqlIgnoreCase(title_identifier, tetris_effect_connected_title_id)) 128 else 64;
+    const render_target_cache_limit = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RENDER_TARGETS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_render_targets, 64, 256);
+    } else |_| default_render_targets;
+    const default_storage_image_mib: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 2560 else 1280;
+    const storage_image_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_IMAGE_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_storage_image_mib, 128, 4096);
+    } else |_| default_storage_image_mib;
+    const sampled_image_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_IMAGE_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(u64, text, 10) catch 2048, 128, 8192);
+    } else |_| 2048;
+    const prefer_nonlocal_sampled_images = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_NONLOCAL_SAMPLED_IMAGES")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    const sampled_image_device_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_DEVICE_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(u64, text, 10) catch 3072, 0, 8192);
+    } else |_| 3072;
+    const default_compute_translation_mib: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 1024 else 256;
+    const compute_translation_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMPUTE_TRANSLATION_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_compute_translation_mib, 64, 1024);
+    } else |_| default_compute_translation_mib;
+    const default_graphics_translation_mib: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 512 else 256;
+    const graphics_translation_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_GRAPHICS_TRANSLATION_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_graphics_translation_mib, 64, 1024);
+    } else |_| default_graphics_translation_mib;
+    // Large working buffers should reside on the GPU regardless of title.
+    // This is an allocation budget, not an up-front VRAM reservation; small
+    // control buffers keep their directly readable host backing.
+    const default_device_storage_mib: usize = 512;
+    const device_storage_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_STORAGE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(usize, text, 10) catch default_device_storage_mib, 2048);
+    } else |_| default_device_storage_mib;
+    const device_storage_min_kib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_STORAGE_MIN_KIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(usize, text, 10) catch 256, 65536);
+    } else |_| 256;
+    const storage_rename_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_RENAME_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 256);
+    } else |_| 0;
+    // GTA III's completed-buffer working set is about 42 MiB. A 32 MiB
+    // pool repeatedly frees allocations needed by the next frame.
+    const default_buffer_recycle_mib: usize = if (use_gta_iii_buffer_profile) 64 else 32;
+    const buffer_recycle_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BUFFER_RECYCLE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(usize, text, 10) catch default_buffer_recycle_mib, 256);
+    } else |_| default_buffer_recycle_mib;
+    const device_detile_sources = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_DETILE_INPUT")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    const queued_host_storage_uploads = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_QUEUED_HOST_UPLOADS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    const retain_storage_buffers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RETAIN_STORAGE_BUFFERS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| enable_gpu_page_tracker or enable_gpu_buffer_content_cache;
+    const storage_buffer_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_BUFFER_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 4096, 128, 4096);
+    } else |_| 4096;
+    const storage_buffer_cache_entries = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_BUFFER_CACHE_ENTRIES")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 4096, 64, 8192);
+    } else |_| 4096;
+
+    // What the rendering preset actually selects. Both of these trade a
+    // little fidelity margin for throughput once the sampled cache is over
+    // budget: reuse hands an evicted image's backing straight to its
+    // replacement, and the retirement slack lets retired images drain behind
+    // the GPU instead of stopping it at every eviction. Under `graphics` the
+    // conservative synchronous paths stay in force. Either can still be set
+    // explicitly, which overrides the preset in both directions.
+    const speed_preset = render_preset.favorsSpeed();
+    vulkan.backend.sampled_backing_reuse = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_BACKING_REUSE")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| speed_preset;
+    // Both default off. The survey costs one block of prints and answers
+    // whether the per-level images even have the extents an assembled chain
+    // would need; assembly itself has faulted the device before and stays
+    // behind its own switch until that question has an answer.
+    vulkan.backend.survey_resident_mip_chains = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_MIP_SURVEY")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    vulkan.backend.trace_materialized_targets = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_TRACE_MATERIALIZE")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    vulkan.backend.assemble_resident_mip_chains = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_ASSEMBLE_MIPS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| true;
+    const default_retirement_slack_mib: u64 = if (speed_preset) 256 else 0;
+    vulkan.backend.sampled_retirement_slack_bytes = (if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_RETIREMENT_SLACK_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(u64, text, 10) catch default_retirement_slack_mib, 1024);
+    } else |_| default_retirement_slack_mib) * 1024 * 1024;
+    if (builtin.os.tag == .windows and !force_headless) live_gpu: {
+        host_window.init(output_mode.width(), output_mode.height()) catch |err| {
+            try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
+            try stderr.flush();
+            break :live_gpu;
+        };
+        window_initialized = true;
+        const native = host_window.nativeHandle() orelse {
+            try stderr.writeAll("live Vulkan window returned no native handle; continuing headless\n");
+            try stderr.flush();
+            break :live_gpu;
+        };
+        renderer = vulkan.Renderer.init(allocator, .{
+            .enable_validation = enable_vulkan_validation,
+            .capture_first_graphics_frame = capture_first_graphics_frame,
+            .trace_graphics_frame = trace_graphics_frame,
+            .trace_gpu_completion_from_frame = trace_gpu_completion_from_frame,
+            .force_probe_fragment = force_probe_fragment,
+            .force_probe_fragment_texture = force_probe_fragment_texture,
+            .force_probe_fragment_parameter = force_probe_fragment_parameter,
+            .force_probe_fragment_ui = force_probe_fragment_ui,
+            .skip_compute_dispatches = skip_compute_dispatches,
+            .skip_compute_until_flip = skip_compute_until_flip,
+            .prioritize_fullscreen_video = std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id),
+            .compute_execution_limit = compute_execution_limit,
+            .sparse_graphics_draws = sparse_graphics_draws,
+            .translate_compute_only = translate_compute_only,
+            .prefer_integrated_gpu = prefer_integrated_gpu,
+            .dump_compute_spirv = dump_compute_spirv,
+            .dump_graphics_spirv = dump_graphics_spirv,
+            .trace_resource_failures = trace_resource_failures,
+            .trace_buffer_address = trace_buffer_range.address,
+            .trace_buffer_size = trace_buffer_range.size,
+            .capture_extended_progress_frames = capture_extended_progress_frames,
+            .enable_shader_ir = enable_shader_ir,
+            .enable_shader_ssa_optimization = enable_shader_ssa,
+            .enable_async_pipeline_compilation = enable_async_pipelines,
+            .pipeline_compiler_workers = pipeline_compiler_workers,
+            .adaptive_compiler_workers = adaptive_compiler_workers,
+            .resource_preparation_workers = resource_preparation_workers,
+            .adaptive_resource_workers = adaptive_resource_workers,
+            .compute_warmup_directory = compute_warmup_directory,
+            .enable_canonical_image_aliases = enable_canonical_aliases,
+            .enable_timeline_scheduler = enable_timeline_scheduler,
+            .defer_shader_fault_checks = enable_timeline_scheduler,
+            .defer_internal_releases = defer_internal_releases,
+            .prefer_nonlocal_sampled_images = prefer_nonlocal_sampled_images,
+            .sampled_image_device_budget_bytes = sampled_image_device_mib * 1024 * 1024,
+            .defer_small_storage_writes = defer_small_storage_writes,
+            .enable_depth_transfer = enable_depth_transfer,
+            .enable_image_state_optimization = enable_image_state_optimization,
+            .render_target_cache_limit = render_target_cache_limit,
+            .storage_image_cache_limit = storage_image_cache_mib * 1024 * 1024,
+            .sampled_image_cache_budget_bytes = sampled_image_cache_mib * 1024 * 1024,
+            .device_detile_sources = device_detile_sources,
+            .compute_translation_cache_limit = compute_translation_cache_mib * 1024 * 1024,
+            .graphics_translation_cache_limit = graphics_translation_cache_mib * 1024 * 1024,
+            .device_storage_budget_bytes = device_storage_mib * 1024 * 1024,
+            .device_storage_min_bytes = device_storage_min_kib * 1024,
+            .storage_buffer_rename_budget_bytes = storage_rename_mib * 1024 * 1024,
+            .buffer_recycle_budget_bytes = buffer_recycle_mib * 1024 * 1024,
+            .queued_host_storage_uploads = queued_host_storage_uploads,
+            .retain_clean_storage_buffers = retain_storage_buffers,
+            .cache_storage_buffer_contents = enable_gpu_buffer_content_cache,
+            .bound_vertex_fetches = bound_vertex_fetches,
+            .reuse_graphics_resources = reuse_graphics_resources,
+            .storage_buffer_cache_budget_bytes = storage_buffer_cache_mib * 1024 * 1024,
+            .storage_buffer_cache_entries = storage_buffer_cache_entries,
+            .enable_host_import = enable_host_import,
+            .native_window = .{
+                .instance = native.instance,
+                .window = native.window,
+                .width = native.width,
+                .height = native.height,
+            },
+        }) catch |err| {
+            try stderr.print("live Vulkan renderer unavailable: {s}; continuing headless\n", .{@errorName(err)});
+            try stderr.flush();
+            host_window.deinit();
+            window_initialized = false;
+            break :live_gpu;
+        };
+        renderer_initialized = true;
+        const presentation_sink = renderer.windowPresentationSink();
+        renderer.setPresentationSink(presentation_sink);
+        if (show_fps) renderer.setFrameRateSink(.{
+            .context = &host_window,
+            .update = updateHostWindowFps,
+        });
+        renderer.setDisplayBufferResolver(.{
+            .context = null,
+            .resolve = resolveVideoOutBuffer,
+            .list_addresses = listVideoOutAddresses,
+        });
+        const address_space = &emu.address_space.?;
+        if (enable_gpu_page_tracker) address_space.enableGpuMemoryTracking();
+        const guest_memory = vulkan.GuestMemory{
+            .host_source = if (enable_host_import) .{
+                .context = address_space,
+                .identity = runtime.firmware.libs.agc_submit.directMemoryIdentity,
+                .acquire = acquireHostMemory,
+                .publish = runtime.firmware.libs.agc_submit.publishDirectMemory,
+            } else null,
+            .context = address_space,
+            .read = runtime.firmware.libs.agc_submit.readGuestMemory,
+            .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
+            .range_accessible = runtime.firmware.libs.agc_submit.guestRangeAccessible,
+            .mapping_identity = runtime.firmware.libs.agc_submit.guestMappingIdentity,
+            .can_batch_copy = runtime.firmware.libs.agc_submit.canBatchGuestCopy,
+            // Images must detect native CPU writes even without page tracking.
+            // Repeated full-buffer hashing is controlled separately by
+            // cache_storage_buffer_contents: it can cost more than uploads.
+            .fingerprint = runtime.firmware.libs.agc_submit.fingerprintGuestMemory,
+            .shader_header = runtime.firmware.libs.agc_submit.findShaderHeader,
+            .track_gpu_read = if (enable_gpu_page_tracker)
+                runtime.firmware.libs.agc_submit.trackGpuRead
+            else
+                null,
+            .gpu_generation = if (enable_gpu_page_tracker)
+                runtime.firmware.libs.agc_submit.gpuGeneration
+            else
+                null,
+            .gpu_tracking_epoch = if (enable_gpu_page_tracker)
+                runtime.firmware.libs.agc_submit.gpuTrackingEpoch
+            else
+                null,
+        };
+        runtime.firmware.libs.agc_submit.setParallelCommandExecution(parallel_commands);
+        runtime.firmware.libs.agc_submit.asynchronous_submissions =
+            !(init.minimal.environ.containsUnempty(allocator, "PS5_SYNC_SUBMISSIONS") catch false);
+        renderer.deferred_release_observer = runtime.firmware.libs.agc_submit.observeDeferredRelease;
+        runtime.firmware.libs.agc_submit.attachBackend(renderer.dcbBackend(guest_memory));
+        const video_sink = renderer.videoFrameSink();
+        runtime.firmware.libs.videodec2.attachVideoFrameSink(.{
+            .context = video_sink.context,
+            .submit = video_sink.submit,
+            .finish = video_sink.finish,
+            .presented = video_sink.presented,
+        });
+        try out.print("  Vulkan  {s} ({d}x{d} VideoOut window)\n", .{
+            renderer.device_info.name(),
+            native.width,
+            native.height,
+        });
+        try out.print("  scanout channel order uses the registered buffer set\n", .{});
+        try out.print("  pipeline compiler worker limit={d} adaptive={any} warmup={s}\n", .{ pipeline_compiler_workers, adaptive_compiler_workers, compute_warmup_directory orelse "disabled" });
+        try out.print("  command processors={d}, bounded lookahead=4 per queue\n", .{if (parallel_commands) @as(u8, 2) else 0});
+        try out.print("  CPU resource preparation worker limit={d} adaptive={any}\n", .{ resource_preparation_workers, adaptive_resource_workers });
+        try out.print("  buffer profile quake={d} retain={d} bounded_vertex={d} device_mib={d}\n", .{
+            @intFromBool(use_quake_buffer_profile), @intFromBool(retain_storage_buffers), @intFromBool(bound_vertex_fetches), device_storage_mib,
+        });
+        try out.print(
+            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d} render_targets={d} storage_image_mib={d} compute_translation_mib={d} graphics_translation_mib={d}\n",
+            .{
+                @intFromBool(enable_shader_ir),
+                @intFromBool(enable_shader_ssa),
+                @intFromBool(enable_async_pipelines),
+                @intFromBool(enable_canonical_aliases),
+                @intFromBool(enable_depth_transfer),
+                @intFromBool(enable_image_state_optimization),
+                @intFromBool(enable_timeline_scheduler),
+                @intFromBool(enable_automatic_timeline_scheduler),
+                @intFromBool(defer_small_storage_writes),
+                @intFromBool(enable_automatic_deferred_storage_writes),
+                @intFromBool(enable_gpu_page_tracker),
+                @intFromBool(enable_gpu_buffer_content_cache),
+                gpu_copy_workers,
+                render_target_cache_limit,
+                storage_image_cache_mib,
+                compute_translation_cache_mib,
+                graphics_translation_cache_mib,
+            },
+        );
+    }
+
+    try emu.enableNativeCpuDispatcher(io);
+    emu.setCpuWaitDiagnostics(enable_cpu_wait_diagnostics);
+    const prepared = try emu.prepareInitialThread("eboot-main");
+    defer emu.releaseInitialThread(prepared.handle) catch {};
+
+    try out.print("loaded {s}\n", .{executable_path});
+    try out.print("  modules {d}\n", .{graph.moduleCount()});
+    try out.print("  entry   0x{x}\n", .{graph.executable().entry_point});
+    for (graph.nodes.items) |*node| {
+        const image = &node.mapped.?;
+        try out.print("  image   0x{x} {s}, init={d}\n", .{
+            image.load_bias,
+            node.path,
+            image.init_functions.items.len,
+        });
+        for (image.init_functions.items) |initializer| {
+            try out.print("    initializer 0x{x}\n", .{initializer});
+        }
+    }
+    try out.writeAll("entering guest process\n");
+    try out.flush();
+
+    const result = emu.dispatchProcess(
+        prepared,
+        graph.executable(),
+        .{
+            .entry = .{ .image_name = std.fs.path.basename(executable_path) },
+            .modules = graph.modules(),
+        },
+    ) catch |err| {
+        // Ask guest I/O hot paths (AGC suspendPoint spam via `_write`) to exit
+        // before the diagnostic dump; otherwise those workers keep burning cores
+        // while the report is formatted.
+        runtime.firmware.libs.kernel_runtime.requestGuestStop();
+
+        // Symbol-attributed report first: it names the module and, for a call
+        // through a null pointer, the caller recovered from the stack. The raw
+        // dumps below stay as supporting detail for cases it cannot classify.
+        if (graph.buildSymbolMap(allocator)) |built| {
+            var map = built;
+            defer map.deinit(allocator);
+            _ = emu.writeLastFault(&map, stderr) catch {};
+        } else |_| {}
+
+        if (emu.lastNativeFault()) |fault| {
+            try stderr.print(
+                "guest fault: {s}/{s}, code=0x{x}, dispatch=0x{x}, rip=0x{x}, address=0x{x}, rsp=0x{x}\n",
+                .{
+                    @tagName(fault.info.kind),
+                    @tagName(fault.info.access),
+                    fault.info.exception_code,
+                    emu.lastDispatchedEntry(),
+                    fault.info.instruction_address,
+                    fault.info.memory_address,
+                    fault.info.registers.rsp,
+                },
+            );
+            var stack_words: [64]u64 = undefined;
+            if (emu.address_space.?.read(fault.info.registers.rsp, std.mem.sliceAsBytes(&stack_words))) |_| {
+                try stderr.writeAll("  stack:");
+                for (stack_words[0..8]) |word| try stderr.print(" 0x{x}", .{word});
+                try stderr.writeByte('\n');
+                var reported_callers: usize = 0;
+                for (stack_words) |return_address| {
+                    if (reported_callers == 12) break;
+                    for (graph.nodes.items) |*node| {
+                        const image = &node.mapped.?;
+                        if (return_address < image.load_bias + 16) continue;
+                        const frame_code = node.image.virtualRange(return_address - image.load_bias - 16, 24) catch continue;
+                        try stderr.print("  caller@0x{x} ({s}):", .{ return_address, node.path });
+                        for (frame_code) |byte| try stderr.print(" {x:0>2}", .{byte});
+                        try stderr.writeByte('\n');
+                        var call_index: usize = 0;
+                        while (call_index + 6 <= 16) : (call_index += 1) {
+                            if (frame_code[call_index] != 0xff or frame_code[call_index + 1] != 0x15) continue;
+                            const displacement = std.mem.readInt(i32, frame_code[call_index + 2 ..][0..4], .little);
+                            const next_instruction = return_address - 16 + call_index + 6;
+                            const target: u64 = @intCast(@as(i64, @intCast(next_instruction)) + displacement);
+                            try reportRelocation(stderr, allocator, node, target);
+                        }
+                        reported_callers += 1;
+                        break;
+                    }
+                }
+            } else |_| {}
+            try stderr.print(
+                "  rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} rbp=0x{x}\n",
+                .{
+                    fault.info.registers.rax,
+                    fault.info.registers.rbx,
+                    fault.info.registers.rcx,
+                    fault.info.registers.rdx,
+                    fault.info.registers.rsi,
+                    fault.info.registers.rdi,
+                    fault.info.registers.rbp,
+                },
+            );
+            const fault_registers = fault.info.registers;
+            try reportGuestPointer(stderr, &emu.address_space.?, "rax", fault_registers.rax);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rbx", fault_registers.rbx);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rcx", fault_registers.rcx);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rsi", fault_registers.rsi);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rdi", fault_registers.rdi);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rbp", fault_registers.rbp);
+            const code_start = fault.info.instruction_address -| 16;
+            var code: [32]u8 = undefined;
+            if (emu.address_space.?.read(code_start, &code)) |_| {
+                try stderr.print("  code@0x{x}:", .{code_start});
+                for (code) |byte| try stderr.print(" {x:0>2}", .{byte});
+                try stderr.writeByte('\n');
+            } else |_| {
+                for (graph.nodes.items) |*node| {
+                    const image = &node.mapped.?;
+                    if (code_start < image.load_bias) continue;
+                    const bytes = node.image.virtualRange(code_start - image.load_bias, code.len) catch continue;
+                    try stderr.print("  file-code@0x{x} ({s}):", .{ code_start, node.path });
+                    for (bytes) |byte| try stderr.print(" {x:0>2}", .{byte});
+                    try stderr.writeByte('\n');
+                    var instruction: usize = 0;
+                    while (instruction + 7 <= 16) : (instruction += 1) {
+                        if (bytes[instruction] != 0x48 or bytes[instruction + 1] != 0x8b or bytes[instruction + 2] != 0x05) continue;
+                        const displacement = std.mem.readInt(i32, bytes[instruction + 3 ..][0..4], .little);
+                        const next_instruction = code_start + instruction + 7;
+                        const target: u64 = @intCast(@as(i64, @intCast(next_instruction)) + displacement);
+                        try reportRelocation(stderr, allocator, node, target);
+                        break;
+                    }
+                    break;
+                }
+            }
+        }
+        try stderr.print("guest execution stopped: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        // Contained guest faults leave AGC/job workers in tight guest loops that
+        // ignore interrupt flags (suspendPoint spam). Joining them in defer hangs
+        // while burning every core. After the report is on the host terminal the
+        // process has nothing left to do for this title run — exit immediately
+        // so the OS reclaims the workers instead of waiting on them.
+        std.process.exit(1);
+    };
+
+    if (runtime.firmware.trace.isLive()) {
+        try stderr.writeAll("[trace] recent firmware calls before guest return:\n");
+        try runtime.firmware.trace.write(stderr, runtime.firmware.trace.capacity);
+        try stderr.flush();
+    }
+
+    const live_threads = emu.liveGuestThreadCount();
+    var thread_info: [16]runtime.firmware.libs.kernel_threading.LiveThreadInfo = @splat(.{});
+    const reported = @min(emu.liveGuestThreads(&thread_info), thread_info.len);
+    var has_non_audio_thread = false;
+    for (thread_info[0..reported]) |thread| {
+        const name = std.mem.sliceTo(&thread.name, 0);
+        if (!std.mem.startsWith(u8, name, "Audio")) has_non_audio_thread = true;
+    }
+    if (live_threads != 0) {
+        try out.print(
+            "guest bootstrap returned 0x{x}; {d} guest thread{s} still running\n",
+            .{ result, live_threads, if (live_threads == 1) "" else "s" },
+        );
+        for (thread_info[0..reported]) |thread| {
+            try out.print(
+                "  live pthread 0x{x} {s}\n",
+                .{ thread.entry_point, std.mem.sliceTo(&thread.name, 0) },
+            );
+        }
+        try out.flush();
+    }
+    if (renderer_initialized and window_initialized and live_threads != 0 and has_non_audio_thread) {
+        while (host_window.isOpen() and emu.liveGuestThreadCount() != 0) {
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+    }
+    try out.print("guest process returned 0x{x}\n", .{result});
+    try out.flush();
+    return true;
+}

@@ -1,0 +1,5403 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Guest CPU dispatch and pthread scheduling.
+//!
+//! The dispatcher owns host workers and implements the complete libkernel
+//! threading backend. Machine execution is deliberately behind `Bridge`: the
+//! bridge is the only layer allowed to install or translate the guest FS base.
+//! This matters on POSIX hosts, where FS commonly addresses host TLS. Windows
+//! x86-64 keeps its TEB under GS, which permits the direct backend below to use
+//! FS for the guest while Zig and Win32 code run on the same worker.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const memory = @import("memory");
+const hle = @import("hle");
+const x86_64_compat = @import("x86_64_compat.zig");
+const threading = hle.libs.kernel_threading;
+const kernel_sync = hle.libs.kernel_sync;
+
+/// Unreal creates synchronization objects for every task-graph worker, render
+/// resource and async service. Keeping only 256 lifetime keys made the table
+/// saturate during Tetris Effect startup; the old global fallback then treated
+/// every wait as signalled and turned RenderThread parking into a hot poll.
+/// Open addressing keeps this larger lifetime table cheap on the HLE hot path.
+const key_state_capacity: usize = 16 * 1024;
+const key_state_mask: usize = key_state_capacity - 1;
+const wake_all = std.math.maxInt(usize);
+const pending_exception_capacity: usize = 512;
+
+const WaitRepeatDiagnostic = struct {
+    key: u64 = 0,
+    sequence: u64 = 0,
+    repeats: u32 = 0,
+
+    fn observe(self: *WaitRepeatDiagnostic, request: threading.WaitRequest) bool {
+        if (self.key == request.key and self.sequence == request.observed_sequence) {
+            self.repeats +|= 1;
+        } else {
+            self.* = .{
+                .key = request.key,
+                .sequence = request.observed_sequence,
+                .repeats = 1,
+            };
+        }
+        return self.repeats == 1_000;
+    }
+};
+
+threadlocal var wait_repeat_diagnostic: WaitRepeatDiagnostic = .{};
+threadlocal var delivering_guest_exception = false;
+
+fn printWaitKeyInfo(key: u64) void {
+    if (hle.libs.kernel_runtime.describeSemaphoreWaitKey(key)) |info| {
+        const name = std.mem.sliceTo(&info.name, 0);
+        const creator_name = std.mem.sliceTo(&info.creator_name, 0);
+        const waiter_name = std.mem.sliceTo(&info.last_waiter_name, 0);
+        const signaller_name = std.mem.sliceTo(&info.last_signaller_name, 0);
+        std.debug.print(
+            "[cpu wait] semaphore key=0x{x} handle=0x{x} name={s} count={d}/{d} initial={d} sequence={d} waiters={d} needed={d} creator=0x{x}/{s} last_waiter=0x{x}/{s} last_signaller=0x{x}/{s} host={d} calls={d}/{d}\n",
+            .{
+                key,
+                info.handle,
+                name,
+                info.count,
+                info.maximum_count,
+                info.initial_count,
+                info.sequence,
+                info.waiters,
+                info.last_needed_count,
+                info.creator,
+                creator_name,
+                info.last_waiter,
+                waiter_name,
+                info.last_signaller,
+                signaller_name,
+                info.last_signaller_host,
+                info.wait_calls,
+                info.signal_calls,
+            },
+        );
+        return;
+    }
+    const info = kernel_sync.describeWaitKey(key) orelse {
+        std.debug.print("[cpu wait] key state untracked key=0x{x}\n", .{key});
+        return;
+    };
+    std.debug.print(
+        "[cpu wait] key state key=0x{x} kind={s} current_sequence={d} waiters={d} owner=0x{x} recursion={d} writer=0x{x} readers={d} waiting_readers={d} waiting_writers={d} arrived={d}/{d} clock={d} last_waiter=0x{x} last_signaller=0x{x} signals={d} zero_waiter={d} broadcasts={d}\n",
+        .{
+            key,
+            @tagName(info.kind),
+            info.sequence,
+            info.waiters,
+            info.owner,
+            info.recursion,
+            info.writer,
+            info.readers,
+            info.waiting_readers,
+            info.waiting_writers,
+            info.arrived,
+            info.threshold,
+            info.clock_id,
+            info.last_waiter,
+            info.last_signaller,
+            info.signal_count,
+            info.zero_waiter_signals,
+            info.broadcast_count,
+        },
+    );
+}
+
+comptime {
+    std.debug.assert(std.math.isPowerOfTwo(key_state_capacity));
+}
+
+const Lock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Lock) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Lock) void {
+        self.inner.unlock();
+    }
+};
+
+/// Parks on a dispatcher epoch without inheriting cancellation from Zig's
+/// threaded-I/O task. Guest pthreads are ordinary host threads, but the
+/// threaded I/O backend keeps cancellation state per worker; a reused worker
+/// can therefore make `futexWaitTimeout` return `error.Canceled` immediately.
+/// Reporting that as ENOSYS breaks otherwise valid kernel semaphores during
+/// scene loading. Windows already exposes the uncancelable primitive that the
+/// threaded backend ultimately models, so use it directly here.
+fn waitOnEpoch(
+    io: std.Io,
+    epoch: *align(@alignOf(u32)) const u32,
+    expected: u32,
+    timeout: std.Io.Timeout,
+) void {
+    if (comptime builtin.os.tag == .windows) {
+        var relative: std.os.windows.LARGE_INTEGER = undefined;
+        const timeout_pointer: ?*const std.os.windows.LARGE_INTEGER = if (timeout.toDurationFromNow(io)) |duration| blk: {
+            const nanoseconds = @max(duration.raw.nanoseconds, 1);
+            const ticks_100ns: u96 = @intCast(@divTrunc(nanoseconds + 99, 100));
+            const bounded: i64 = @intCast(@min(ticks_100ns, @as(u96, std.math.maxInt(i64))));
+            relative = -bounded;
+            break :blk &relative;
+        } else null;
+        const status = std.os.windows.ntdll.RtlWaitOnAddress(
+            epoch,
+            &expected,
+            @sizeOf(u32),
+            timeout_pointer,
+        );
+        // A timeout, APC, or alert is a permitted spurious wake. The caller
+        // re-checks both the object generation and its absolute deadline.
+        _ = status;
+        return;
+    }
+
+    // Cancellation is not an object failure. Treat it like any other spurious
+    // futex wake so a host runtime detail cannot escape as guest ENOSYS.
+    io.futexWaitTimeout(u32, epoch, expected, timeout) catch {};
+}
+
+fn wakeEpoch(io: std.Io, epoch: *align(@alignOf(u32)) const u32, maximum_waiters: u32) void {
+    if (maximum_waiters == 0) return;
+    if (comptime builtin.os.tag == .windows) {
+        if (maximum_waiters == 1) {
+            std.os.windows.ntdll.RtlWakeAddressSingle(epoch);
+        } else {
+            // Extra wakeups are harmless: waiters still consume the bounded
+            // generation tokens under the dispatcher lock before proceeding.
+            std.os.windows.ntdll.RtlWakeAddressAll(epoch);
+        }
+        return;
+    }
+    io.futexWake(u32, epoch, maximum_waiters);
+}
+
+pub const ExecutionError = error{
+    Unsupported,
+    ExecutionFailed,
+    GuestFault,
+    Interrupted,
+};
+
+pub const Error = error{
+    AlreadyInitialized,
+    NotInitialized,
+    InvalidArgument,
+    DispatcherBusy,
+    FaultHandlerUnavailable,
+} || std.mem.Allocator.Error || threading.Error || ExecutionError;
+
+pub const EntryKind = enum {
+    process_entry,
+    module_initializer,
+    pthread_entry,
+    guest_callback,
+};
+
+pub const maximum_arguments: usize = 6;
+
+pub const FaultKind = enum(u32) {
+    none,
+    access_violation,
+    illegal_instruction,
+};
+
+pub const FaultAccess = enum(u32) {
+    unknown,
+    read,
+    write,
+    execute,
+};
+
+/// Register state captured by the Windows vectored exception handler before
+/// the native bridge leaves guest execution.
+pub const GuestRegisters = extern struct {
+    rax: u64 = 0,
+    rbx: u64 = 0,
+    rcx: u64 = 0,
+    rdx: u64 = 0,
+    rsi: u64 = 0,
+    rdi: u64 = 0,
+    rbp: u64 = 0,
+    rsp: u64 = 0,
+    r8: u64 = 0,
+    r9: u64 = 0,
+    r10: u64 = 0,
+    r11: u64 = 0,
+    r12: u64 = 0,
+    r13: u64 = 0,
+    r14: u64 = 0,
+    r15: u64 = 0,
+    rip: u64 = 0,
+    rflags: u64 = 0,
+};
+
+/// Platform-neutral diagnostic record for a contained guest CPU fault.
+pub const FaultInfo = extern struct {
+    kind: FaultKind = .none,
+    access: FaultAccess = .unknown,
+    exception_code: u32 = 0,
+    padding: u32 = 0,
+    instruction_address: u64 = 0,
+    memory_address: u64 = 0,
+    registers: GuestRegisters = .{},
+};
+
+pub const FaultRecord = struct {
+    thread_handle: u64,
+    info: FaultInfo,
+};
+
+/// Complete machine state required by an execution bridge for one guest call.
+///
+/// `stack_address` is the lowest writable byte. The initial RSP is normally
+/// derived from `stack_address + stack_size` and aligned down to 16 bytes.
+pub const ExecuteRequest = struct {
+    kind: EntryKind,
+    entry_point: u64,
+    thread_handle: u64,
+    arguments: [maximum_arguments]u64 = [_]u64{0} ** maximum_arguments,
+    argument_count: u8 = 0,
+    context: threading.ThreadContext,
+    stack_address: u64,
+    stack_size: u64,
+    guard_size: u64,
+    /// Stack pointer immediately before the bridge's CALL instruction. When
+    /// omitted, the bridge uses the aligned top of the mapped thread stack.
+    stack_pointer: ?u64 = null,
+};
+
+/// Platform/native machine bridge used by `Dispatcher`.
+///
+/// Implementations execute System V AMD64 guest code and must make
+/// `request.context.fs_base` visible to guest FS-relative instructions without
+/// exposing that FS state to host Zig/HLE code. `interrupt` must make an active
+/// `execute` return `error.Interrupted`; it is used by `scePthreadExit` and
+/// dispatcher shutdown.
+pub const Bridge = struct {
+    context: ?*anyopaque = null,
+    execute_fn: *const fn (?*anyopaque, ExecuteRequest) ExecutionError!u64,
+    interrupt_fn: ?*const fn (?*anyopaque, u64) void = null,
+
+    fn execute(self: Bridge, request: ExecuteRequest) ExecutionError!u64 {
+        return self.execute_fn(self.context, request);
+    }
+
+    fn interrupt(self: Bridge, thread_handle: u64) void {
+        if (self.interrupt_fn) |interrupt_fn| interrupt_fn(self.context, thread_handle);
+    }
+};
+
+/// Whether this build can contain the direct Windows x86-64 execution path.
+/// Runtime availability additionally depends on the operating system exposing
+/// user-mode RDFSBASE/WRFSBASE support.
+pub const can_use_native_bridge = builtin.cpu.arch == .x86_64 and
+    builtin.os.tag == .windows;
+
+const NativeCallFrame = extern struct {
+    // The first 272 bytes are shared with the hand-written assembly below.
+    host_rsp: u64 = 0,
+    host_fs_base: u64 = 0,
+    host_rbx: u64 = 0,
+    host_rbp: u64 = 0,
+    host_rsi: u64 = 0,
+    host_rdi: u64 = 0,
+    host_r12: u64 = 0,
+    host_r13: u64 = 0,
+    host_r14: u64 = 0,
+    host_r15: u64 = 0,
+    guest_fs_base: u64 = 0,
+    result: u64 = 0,
+    interrupted: u32 = 0,
+    host_mxcsr: u32 = 0,
+    host_x87_control: u16 = 0,
+    padding: [6]u8 = [_]u8{0} ** 6,
+    host_xmm_nonvolatile: [10][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 10,
+
+    // Dispatcher metadata is never accessed by assembly.
+    owner: ?*NativeBridge = null,
+    thread_handle: u64 = 0,
+    guest_arguments: [maximum_arguments]u64 = [_]u64{0} ** maximum_arguments,
+    fault: FaultInfo = .{},
+};
+
+comptime {
+    // Keep these checks beside the assembly so a layout edit fails loudly.
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_rsp") == 0);
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_fs_base") == 8);
+    std.debug.assert(@offsetOf(NativeCallFrame, "guest_fs_base") == 80);
+    std.debug.assert(@offsetOf(NativeCallFrame, "result") == 88);
+    std.debug.assert(@offsetOf(NativeCallFrame, "interrupted") == 96);
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_mxcsr") == 100);
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_x87_control") == 104);
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_xmm_nonvolatile") == 112);
+    std.debug.assert(@offsetOf(NativeCallFrame, "owner") == 272);
+    std.debug.assert(@offsetOf(NativeCallFrame, "guest_arguments") == 288);
+    std.debug.assert(@offsetOf(NativeCallFrame, "fault") == 336);
+}
+
+threadlocal var active_native_frame: ?*NativeCallFrame = null;
+threadlocal var handling_native_fault = false;
+/// AddressSpace's page tracker must also see writes made by guest-created host
+/// workers which are not currently inside NativeBridge.execute's TLS frame.
+var gpu_tracking_address_space: std.atomic.Value(usize) = .init(0);
+
+/// How many times the host dropped a guest thread pointer and it was put back.
+///
+/// Worth counting rather than repairing silently: the number says how often the
+/// host is losing state the guest depends on, and a run where it stays at zero
+/// means something else is keeping threads on the processor.
+pub var fs_base_restorations: std.atomic.Value(usize) = .init(0);
+/// How many `cmp [null+disp], imm` probes were stepped past during bring-up.
+pub var null_object_compare_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many `mov/movzx/movsx dest, [null+disp]` loads were zeroed and stepped past.
+pub var null_memory_load_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many stores into the first page were discarded and stepped past.
+pub var null_memory_store_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many calls through a null pointer were treated as `return 0`.
+pub var null_call_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many times a null base register was redirected to the synthetic stub object.
+pub var null_base_redirect_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many optional linked-list pointer loads from an unmapped guest page were
+/// converted to null. Some UE subsystems leave a stale terminal node behind;
+/// their generated code immediately null-tests the loaded payload.
+pub var optional_pointer_load_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many missing linked-list next pointers were converted to the loop's
+/// explicit sentinel. Unity emits a sentinel comparison after the load; the
+/// generic null-object stub otherwise turns a null terminal node into a hot
+/// loop, while allocator poison otherwise terminates the guest thread.
+pub var sentinel_pointer_load_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many dequeued Unreal work nodes with an absent payload took the queue
+/// routine's existing null-item cleanup path. The node itself has already been
+/// removed at this point; dereferencing its null payload only kills the worker.
+pub var null_queued_work_item_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many non-canonical dangling shared references were omitted while Unity
+/// copied worker state. The copied field is optional at cleanup, so null is the
+/// only safe value when the supposed refcount pointer is actually tagged data.
+pub var invalid_shared_reference_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many stale optional hash-map pointers followed the null-map branch
+/// already encoded by Unity's worker-state lookup.
+pub var invalid_optional_map_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many table lookups through packed non-pointer data returned the leaf
+/// helper's preloaded 0x7fff fallback.
+pub var invalid_packed_table_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many unmapped allocator-table candidates followed Unity's existing
+/// fallback-allocator branch instead of calling a vtable through null.
+pub var missing_allocator_candidate_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many absent small-address keys were supplied as zero to Unity's hash
+/// insertion helper instead of becoming a fake stub pointer or crossing the
+/// first-page recovery boundary.
+pub var near_null_hash_key_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many missing 16-byte metadata entries were treated as empty while a
+/// generated bit-mask builder scanned its bounded array.
+pub var sparse_metadata_load_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many oversized Unity metadata scans were rebuilt from the 16 records
+/// that physically belong to their fixed-size table.
+pub var oversized_metadata_scan_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many hash-table bucket probes against an absent backing pointer returned
+/// the table's own -1 (empty) marker.
+pub var empty_hash_bucket_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many AGC argument validators returned their preloaded error after an
+/// unmapped command-buffer pointer reached the encoded type-byte probe.
+pub var invalid_agc_pointer_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many Unity command buffers with an absolute pointer in their allocator
+/// size field were leaked instead of letting the allocator unlink outside the
+/// guest address space and terminate the graphics worker.
+pub var corrupt_allocator_free_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many invalid Unreal free-list nodes were discarded before their
+/// out-of-range address could replace an otherwise valid bucket head.
+pub var invalid_allocator_insert_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many non-canonical Unreal small-allocation free-list heads used the
+/// allocator's existing slow fallback instead of being dereferenced.
+pub var invalid_allocator_head_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many corrupt Unity frame-slot indices were reset to the renderer's
+/// explicit inactive slot before their scaled address reached unmapped memory.
+pub var invalid_frame_slot_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many corrupt terminal links were dropped from the guest AGC interrupt
+/// registration list.  The recovery is tied to the exact list-walk machine
+/// code and preserves that routine's existing end-of-list path.
+pub var corrupt_agc_interrupt_list_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many stale nodes in the companion AGC cleanup list followed that
+/// routine's existing null-tail exit instead of terminating CleanupThread.
+pub var corrupt_agc_cleanup_list_recoveries: std.atomic.Value(u64) = .init(0);
+/// First native access violation declined by the guest exception bridge.
+///
+/// Host faults normally disappear into Windows with only process exit code
+/// 0xc0000005.  Keep this diagnostic one-shot: it preserves the original
+/// exception while leaving enough information to distinguish emulator code,
+/// a graphics driver, and an invalid guest address crossing the HLE boundary.
+var declined_host_access_violations: std.atomic.Value(u64) = .init(0);
+
+/// Synthetic object used when soft-recovering 8-byte loads from the first page.
+/// Pointer fields self-reference; call targets land on a RET sled so accidental
+/// virtual calls through the stub return instead of killing the process.
+var null_object_stub: [4096]u8 align(16) = undefined;
+var null_object_stub_ready: bool = false;
+
+const null_object_vtable_offset: usize = 0x100;
+
+fn nullObjectReturnThunk() callconv(hle.abi.guest) u64 {
+    return 0;
+}
+
+fn ensureNullObjectStub() u64 {
+    if (!null_object_stub_ready) {
+        const base: u64 = @intFromPtr(&null_object_stub);
+        @memset(&null_object_stub, 0);
+        // Fake vtable at +0x100: every slot points at executable code so
+        // accidental virtual calls return zero instead of faulting. Unreal interfaces can have
+        // several hundred virtual entries (REANIMAL reaches slot +0x3f0), so
+        // keep the table large. The old RET sled lived in writable `.data` and
+        // DEP correctly rejected calls into it.
+        const ret_thunk: u64 = @intFromPtr(&nullObjectReturnThunk);
+        var offset: usize = null_object_vtable_offset;
+        while (offset + 8 <= null_object_stub.len) : (offset += 8) {
+            std.mem.writeInt(u64, null_object_stub[offset..][0..8], ret_thunk, .little);
+        }
+        // [0] = vtable pointer (common C++/IL2CPP layout).
+        std.mem.writeInt(u64, null_object_stub[0..8], base + null_object_vtable_offset, .little);
+        // Leave body fields at +0x08..+0xF8 as zero. Unity/IL2CPP null checks
+        // are often `cmp [obj+0x10/0x20], 0` / `je null_path`. A self-pointer
+        // here made the check pass and the title followed a "ready" path with a
+        // hollow object — frame encode then stopped after ACQUIRE_MEM. Zero
+        // fields take the null branch while still giving the instruction a
+        // mapped page to read.
+        // Deeper slots (+0x80..) self-reference for pointer-chasing that is not
+        // a null-test.
+        offset = 0x80;
+        while (offset + 8 <= 0x100) : (offset += 8) {
+            std.mem.writeInt(u64, null_object_stub[offset..][0..8], base, .little);
+        }
+        // REANIMAL's optional callback at object field +0xb8 is invoked
+        // directly. A self-pointer here made the guest execute this writable
+        // stub page and raised a host DEP violation. Point that exact callback
+        // field at the executable zero-return thunk instead.
+        std.mem.writeInt(u64, null_object_stub[0xb8..][0..8], ret_thunk, .little);
+        null_object_stub_ready = true;
+    }
+    return @intFromPtr(&null_object_stub);
+}
+
+/// Direct System V AMD64 execution on a Windows x86-64 host.
+///
+/// Windows x64 uses GS rather than FS for its TEB, so Zig and Win32 remain able
+/// to run while the guest FS base is installed. The assembly boundary still
+/// restores FS before it returns to ordinary Zig code and preserves every
+/// register which Win64 requires a callee to retain, including XMM6-XMM15.
+/// Other hosts intentionally report `error.Unsupported`: POSIX runtimes use FS
+/// for host TLS and need import trampolines that restore it before entering HLE.
+pub const NativeBridge = struct {
+    allocator: std.mem.Allocator = undefined,
+    address_space: *memory.AddressSpace = undefined,
+    active_frames: std.ArrayList(*NativeCallFrame) = .empty,
+    fault_handler_handle: ?*anyopaque = null,
+    last_fault: ?FaultRecord = null,
+    lock: Lock = .{},
+    initialized: bool = false,
+
+    pub fn init(
+        self: *NativeBridge,
+        allocator: std.mem.Allocator,
+        address_space: *memory.AddressSpace,
+    ) Error!void {
+        if (self.initialized) return error.AlreadyInitialized;
+        if (!NativeMachine.isSupported()) return error.Unsupported;
+        const fault_handler_handle = NativeMachine.installFaultHandler() orelse
+            return error.FaultHandlerUnavailable;
+        self.* = .{
+            .allocator = allocator,
+            .address_space = address_space,
+            .fault_handler_handle = fault_handler_handle,
+            .initialized = true,
+        };
+        gpu_tracking_address_space.store(@intFromPtr(address_space), .release);
+    }
+
+    pub fn deinit(self: *NativeBridge) void {
+        if (!self.initialized) return;
+        self.lock.lock();
+        std.debug.assert(self.active_frames.items.len == 0);
+        self.active_frames.deinit(self.allocator);
+        self.lock.unlock();
+        if (gpu_tracking_address_space.load(.acquire) == @intFromPtr(self.address_space)) {
+            gpu_tracking_address_space.store(0, .release);
+        }
+        if (self.fault_handler_handle) |handle| {
+            NativeMachine.removeFaultHandler(handle);
+        }
+        self.* = .{};
+    }
+
+    pub fn isInitialized(self: *const NativeBridge) bool {
+        return self.initialized;
+    }
+
+    pub fn isSupported() bool {
+        return NativeMachine.isSupported();
+    }
+
+    pub fn bridge(self: *NativeBridge) Bridge {
+        return .{
+            .context = self,
+            .execute_fn = &executeThunk,
+            .interrupt_fn = &interruptThunk,
+        };
+    }
+
+    /// Returns the most recently contained fault. The thread handle identifies
+    /// the execution which produced it; a later guest fault replaces it.
+    pub fn lastFault(self: *NativeBridge) ?FaultRecord {
+        if (!self.initialized) return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.last_fault;
+    }
+
+    fn executeThunk(raw: ?*anyopaque, request: ExecuteRequest) ExecutionError!u64 {
+        const pointer = raw orelse return error.ExecutionFailed;
+        const self: *NativeBridge = @ptrCast(@alignCast(pointer));
+        return self.execute(request);
+    }
+
+    fn execute(self: *NativeBridge, request: ExecuteRequest) ExecutionError!u64 {
+        if (!self.initialized) return error.Unsupported;
+        if (request.entry_point == 0 or request.argument_count > maximum_arguments) {
+            return error.ExecutionFailed;
+        }
+
+        const previous = active_native_frame;
+        const nested = previous != null;
+        if (previous) |parent| {
+            if (parent.owner != self or parent.thread_handle != request.thread_handle or
+                parent.guest_fs_base != request.context.fs_base or
+                request.kind != .guest_callback)
+            {
+                return error.ExecutionFailed;
+            }
+        } else if (!self.validateInitialRequest(request)) {
+            return error.ExecutionFailed;
+        }
+
+        if (!self.isExecutableAddress(request.entry_point)) {
+            return error.ExecutionFailed;
+        }
+        self.clearFault(request.thread_handle);
+
+        const stack_pointer = if (nested)
+            0
+        else
+            resolveStackPointer(request) orelse
+                return error.ExecutionFailed;
+
+        var frame: NativeCallFrame align(16) = .{
+            .guest_fs_base = request.context.fs_base,
+            .owner = self,
+            .thread_handle = request.thread_handle,
+            .guest_arguments = request.arguments,
+        };
+        try self.registerFrame(&frame);
+        defer self.unregisterFrame(&frame);
+        active_native_frame = &frame;
+        defer active_native_frame = previous;
+
+        const result = NativeMachine.call(
+            &frame,
+            request.entry_point,
+            stack_pointer,
+        );
+        if (frame.fault.kind != .none) {
+            self.recordFault(.{
+                .thread_handle = request.thread_handle,
+                .info = frame.fault,
+            });
+            reportFaultAddressSpace(self.address_space, frame.fault);
+            return error.GuestFault;
+        }
+        if (@atomicLoad(u32, &frame.interrupted, .acquire) != 0) {
+            return error.Interrupted;
+        }
+        return result;
+    }
+
+    fn interruptThunk(raw: ?*anyopaque, thread_handle: u64) void {
+        const pointer = raw orelse return;
+        const self: *NativeBridge = @ptrCast(@alignCast(pointer));
+        self.interrupt(thread_handle);
+    }
+
+    fn interrupt(self: *NativeBridge, thread_handle: u64) void {
+        if (!self.initialized) return;
+
+        // pthread_exit reaches this path synchronously on the executing host
+        // worker. The assembly escape discards the guest/HLE frames and returns
+        // from NativeMachine.call with the host FS and ABI state restored.
+        if (active_native_frame) |frame| {
+            if (frame.owner == self and frame.thread_handle == thread_handle) {
+                @atomicStore(u32, &frame.interrupted, 1, .release);
+                NativeMachine.escape(frame);
+            }
+        }
+
+        // Shutdown may request interruption from another host thread. Marking
+        // the frame is race-safe and makes a returning guest report Interrupted.
+        // Forced cross-thread context transfer belongs with the fault backend;
+        // suspending a worker while it owns an HLE lock would corrupt state.
+        self.lock.lock();
+        for (self.active_frames.items) |frame| {
+            if (frame.thread_handle != thread_handle) continue;
+            @atomicStore(u32, &frame.interrupted, 1, .release);
+        }
+        self.lock.unlock();
+    }
+
+    fn registerFrame(
+        self: *NativeBridge,
+        frame: *NativeCallFrame,
+    ) ExecutionError!void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.active_frames.append(self.allocator, frame) catch
+            return error.ExecutionFailed;
+    }
+
+    fn unregisterFrame(self: *NativeBridge, frame: *NativeCallFrame) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.active_frames.items, 0..) |known, index| {
+            if (known != frame) continue;
+            _ = self.active_frames.swapRemove(index);
+            return;
+        }
+        unreachable;
+    }
+
+    fn clearFault(self: *NativeBridge, thread_handle: u64) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.last_fault) |record| {
+            if (record.thread_handle == thread_handle) self.last_fault = null;
+        }
+    }
+
+    fn recordFault(self: *NativeBridge, record: FaultRecord) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.last_fault = record;
+    }
+
+    fn validateInitialRequest(self: *NativeBridge, request: ExecuteRequest) bool {
+        if (request.context.fs_base == 0 or request.stack_address == 0 or
+            request.stack_size < 256)
+        {
+            return false;
+        }
+        const stack_end = std.math.add(
+            u64,
+            request.stack_address,
+            request.stack_size,
+        ) catch return false;
+        const stack = self.address_space.query(request.stack_address, false) orelse
+            return false;
+        if (!stack.protection.write or stack.kind == .reserved or stack.end() < stack_end) {
+            return false;
+        }
+        const tls = self.address_space.query(request.context.fs_base, false) orelse
+            return false;
+        return tls.kind != .reserved and tls.protection.read and tls.protection.write;
+    }
+
+    fn isExecutableAddress(self: *NativeBridge, address: u64) bool {
+        const mapping = self.address_space.query(address, false) orelse return false;
+        return mapping.kind != .reserved and mapping.protection.execute;
+    }
+};
+
+fn reportFaultAddressSpace(address_space: *memory.AddressSpace, fault: FaultInfo) void {
+    if (fault.kind != .access_violation or fault.memory_address == 0) return;
+    const address = fault.memory_address;
+    if (address_space.query(address, false)) |mapping| {
+        std.debug.print(
+            "[cpu fault map] target=0x{x} mapping=0x{x}-0x{x} kind={s} protection=r{d}w{d}x{d} bits=0x{x} name={s}\n",
+            .{
+                address,
+                mapping.address,
+                mapping.end(),
+                @tagName(mapping.kind),
+                @intFromBool(mapping.protection.read),
+                @intFromBool(mapping.protection.write),
+                @intFromBool(mapping.protection.execute),
+                @as(u32, @bitCast(mapping.protection_bits)),
+                std.mem.sliceTo(&mapping.name, 0),
+            },
+        );
+    } else {
+        const previous = if (address > 0) address_space.query(address - 1, false) else null;
+        const next = address_space.query(address, true);
+        std.debug.print(
+            "[cpu fault map] target=0x{x} unmapped previous_end=0x{x} next_start=0x{x}\n",
+            .{
+                address,
+                if (previous) |mapping| mapping.end() else 0,
+                if (next) |mapping| mapping.address else 0,
+            },
+        );
+    }
+    reportFaultBytes(address_space, "r10", fault.registers.r10);
+    reportFaultBytes(address_space, "r10+15000", fault.registers.r10 +| 0x1_5000);
+    reportFaultBytes(address_space, "rax", fault.registers.rax);
+    reportFaultBytes(address_space, "r13", fault.registers.r13);
+    reportFaultBytes(address_space, "r12", fault.registers.r12);
+    reportFaultBytes(address_space, "rbx-8", fault.registers.rbx -| 8);
+    reportFaultBytes(address_space, "r9", fault.registers.r9);
+    reportFaultBytes(address_space, "rsp", fault.registers.rsp);
+    reportFaultBytes(address_space, "rbp", fault.registers.rbp);
+    reportFaultBytes(address_space, "rsi", fault.registers.rsi);
+    reportFaultBytes(address_space, "rdi", fault.registers.rdi);
+    if (memory.isHostRangeReadable(fault.registers.r13, 4) and
+        memory.isHostRangeReadable(fault.registers.r9, 4))
+    {
+        const header_bytes: *const [4]u8 = @ptrFromInt(fault.registers.r13);
+        const stride_bytes: *const [4]u8 = @ptrFromInt(fault.registers.r9);
+        const header = std.mem.readInt(u32, header_bytes, .little);
+        const stride = std.mem.readInt(u32, stride_bytes, .little);
+        const slot_offset = @as(u64, header >> 18) * stride;
+        reportFaultBytes(address_space, "slab-slot", fault.registers.r10 +| slot_offset);
+    }
+}
+
+fn reportFaultBytes(address_space: *memory.AddressSpace, label: []const u8, address: u64) void {
+    _ = address_space;
+    if (!memory.isHostRangeReadable(address, 32)) return;
+    var bytes: [32]u8 = undefined;
+    const source: [*]const u8 = @ptrFromInt(address);
+    @memcpy(&bytes, source[0..bytes.len]);
+    const hex = std.fmt.bytesToHex(bytes, .lower);
+    std.debug.print("[cpu fault bytes] {s}@0x{x}={s}\n", .{ label, address, &hex });
+}
+
+fn resolveStackPointer(request: ExecuteRequest) ?u64 {
+    const address = request.stack_address;
+    const size = request.stack_size;
+    const end = std.math.add(u64, address, size) catch return null;
+    const minimum_top = std.math.add(u64, address, 256) catch return null;
+    const stack_pointer = request.stack_pointer orelse
+        std.mem.alignBackward(u64, end, 16);
+    if (!std.mem.isAligned(stack_pointer, 16)) return null;
+    return if (stack_pointer >= minimum_top and stack_pointer <= end)
+        stack_pointer
+    else
+        null;
+}
+
+const NativeMachine = if (can_use_native_bridge) WindowsX64Machine else UnsupportedMachine;
+
+const UnsupportedMachine = struct {
+    fn isSupported() bool {
+        return false;
+    }
+
+    fn installFaultHandler() ?*anyopaque {
+        return null;
+    }
+
+    fn removeFaultHandler(_: *anyopaque) void {
+        unreachable;
+    }
+
+    fn call(_: *NativeCallFrame, _: u64, _: u64) u64 {
+        unreachable;
+    }
+
+    fn escape(_: *NativeCallFrame) noreturn {
+        unreachable;
+    }
+
+    fn readFsBase() u64 {
+        return 0;
+    }
+};
+
+const WindowsX64Machine = struct {
+    const exception_continue_execution: c_long = -1;
+    const exception_noncontinuable: u32 = 0x1;
+    const WindowsMemoryInfo = extern struct {
+        base_address: ?*anyopaque,
+        allocation_base: ?*anyopaque,
+        allocation_protect: u32,
+        partition_id: u16,
+        _padding0: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+        _padding1: u32,
+    };
+
+    extern "kernel32" fn VirtualQuery(
+        address: ?*const anyopaque,
+        info: *WindowsMemoryInfo,
+        length: usize,
+    ) callconv(.winapi) usize;
+
+    fn hostAllocationBase(address: u64) u64 {
+        var info: WindowsMemoryInfo = undefined;
+        if (VirtualQuery(@ptrFromInt(address), &info, @sizeOf(WindowsMemoryInfo)) == 0) return 0;
+        return if (info.allocation_base) |base| @intFromPtr(base) else 0;
+    }
+
+    fn isSupported() bool {
+        return std.os.windows.IsProcessorFeaturePresent(.RDWRFSGBASE_AVAILABLE);
+    }
+
+    fn installFaultHandler() ?*anyopaque {
+        return std.os.windows.ntdll.RtlAddVectoredExceptionHandler(
+            1,
+            &handleGuestException,
+        );
+    }
+
+    fn removeFaultHandler(handle: *anyopaque) void {
+        _ = std.os.windows.ntdll.RtlRemoveVectoredExceptionHandler(handle);
+    }
+
+    fn call(
+        frame: *NativeCallFrame,
+        entry_point: u64,
+        stack_pointer: u64,
+    ) u64 {
+        const firmware_state = hle.host_stack.CallState.capture();
+        defer firmware_state.restore();
+        return ps5NativeCallWindowsX64(
+            frame,
+            entry_point,
+            stack_pointer,
+        );
+    }
+
+    fn escape(frame: *NativeCallFrame) noreturn {
+        ps5NativeEscapeWindowsX64(frame);
+    }
+
+    /// An access this close to zero is a segment-relative one whose base was
+    /// lost. The first page is never mapped, and thread-local offsets are small,
+    /// so a lost base always lands inside it.
+    const lost_base_window: u64 = 0x1000;
+
+    /// Whether a fault is a dropped thread pointer rather than a guest mistake.
+    ///
+    /// Windows does not keep a user-written FS base across a context switch.
+    /// After a guest thread sleeps or blocks, `rdfsbase` reads zero again —
+    /// measured here, a one-millisecond sleep loses it every single time, and a
+    /// blocking call loses it occasionally. Guest code follows the System V
+    /// convention and keeps its thread-local storage in FS, so the first
+    /// FS-relative access after the thread is rescheduled reads a near-zero
+    /// address and faults. Nothing in the guest is wrong; the host dropped a
+    /// register the guest is entitled to rely on.
+    ///
+    /// Restoring the base and retrying the instruction is what makes native
+    /// execution survivable at all. Before this, a title died at whatever
+    /// thread-local access happened to follow its first sleep, which is why the
+    /// crash moved around between runs.
+    ///
+    /// A genuine null dereference is not swallowed by this. Restoring the base
+    /// does not make that instruction succeed: it faults again, this sees a base
+    /// that is no longer zero, declines, and the fault is reported normally. The
+    /// cost of being wrong is one extra trip through the handler.
+    fn shouldRestoreFsBase(address: u64, intended: u64, current: u64) bool {
+        if (intended == 0) return false;
+        if (current != 0) return false;
+        return address < lost_base_window;
+    }
+
+    fn readFsBase() u64 {
+        return asm volatile ("rdfsbase %[base]"
+            : [base] "=r" (-> u64),
+        );
+    }
+
+    fn writeFsBase(value: u64) void {
+        asm volatile ("wrfsbase %[base]"
+            :
+            : [base] "r" (value),
+        );
+    }
+
+    fn handleGuestException(
+        exception: *std.os.windows.EXCEPTION_POINTERS,
+    ) callconv(.winapi) c_long {
+        const record = exception.ExceptionRecord;
+        const context = exception.ContextRecord;
+
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1)
+        {
+            const space_address = gpu_tracking_address_space.load(.acquire);
+            if (space_address != 0) {
+                const space: *memory.AddressSpace = @ptrFromInt(space_address);
+                if (space.handleGpuTrackedWriteFault(record.ExceptionInformation[1])) {
+                    return exception_continue_execution;
+                }
+            }
+        }
+
+        const frame = active_native_frame orelse
+            return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
+
+        // Checked before anything else, including the reentrancy guard: a lost
+        // thread pointer is not a fault to report but a host condition to
+        // repair, and it can strike while a report is already being built.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            shouldRestoreFsBase(record.ExceptionInformation[1], frame.guest_fs_base, readFsBase()))
+        {
+            writeFsBase(frame.guest_fs_base);
+            _ = fs_base_restorations.fetchAdd(1, .monotonic);
+            return exception_continue_execution;
+        }
+        // Unreal's async work queue can retain a node whose shared payload was
+        // cleared by another worker. The pop routine has already unlinked and
+        // freed that node before it calls the payload vtable, but contains a
+        // normal null cleanup path later in the same function. Follow that
+        // path for this exact instruction/epilogue pair instead of fabricating
+        // an object or terminating the render worker.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            trySkipNullQueuedWorkItem(context, record.ExceptionInformation[1]))
+        {
+            _ = null_queued_work_item_recoveries.fetchAdd(1, .monotonic);
+            const count = null_queued_work_item_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] skipped null queued work item @rip=0x{x} (#{d})\n",
+                .{ context.Rip - 0xb0, count },
+            );
+            return exception_continue_execution;
+        }
+        // The title's AgcInterruptThread removes registrations from an
+        // intrusive list. A stale terminal link can contain event payload data
+        // instead of another node; follow the routine's own end-of-list exit
+        // for this exact generated loop instead of terminating the only
+        // interrupt thread and leaving the renderer waiting forever.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            const corrupt_node = context.Rcx;
+            if (tryDropCorruptAgcInterruptListTail(context, record.ExceptionInformation[1])) {
+                _ = corrupt_agc_interrupt_list_recoveries.fetchAdd(1, .monotonic);
+                const count = corrupt_agc_interrupt_list_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) std.debug.print(
+                    "[cpu] dropped corrupt AGC interrupt-list tail @rip=0x{x} node=0x{x} (#{d})\n",
+                    .{ context.Rip - 0x1c, corrupt_node, count },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // AgcCleanupThread walks the same registration chain with a distinct
+        // generated loop. Treat an unreadable candidate as its tested null
+        // tail, preserving the normal cleanup epilogue at the branch target.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            const corrupt_node = context.R13;
+            if (tryDropCorruptAgcCleanupListTail(context, record.ExceptionInformation[1])) {
+                _ = corrupt_agc_cleanup_list_recoveries.fetchAdd(1, .monotonic);
+                const count = corrupt_agc_cleanup_list_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) std.debug.print(
+                    "[cpu] dropped corrupt AGC cleanup-list tail @rip=0x{x} node=0x{x} (#{d})\n",
+                    .{ context.Rip - 0x64, corrupt_node, count },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // IL2CPP/Unity often does `cmp byte/dword [obj+0x20], 0` / `je null_path`
+        // after a flip. Handle compares *before* base redirect: redirecting the
+        // base to a self-pointer stub makes `[stub+0x20]` look non-null and the
+        // title takes the "object ready" path with a fake object — observed to
+        // abort frame encoding after the first full DCB (only ACQUIRE_MEM left).
+        // Treating the memory as zero takes the real null branch instead.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateNullObjectCompare(context, record.ExceptionInformation[1]))
+        {
+            _ = null_object_compare_recoveries.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "[cpu] recovered null-object cmp @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip, record.ExceptionInformation[1], null_object_compare_recoveries.load(.monotonic) },
+            );
+            return exception_continue_execution;
+        }
+        // Unity walks sentinel-terminated lists with
+        //   mov rcx,[rcx+8]; inc eax; cmp rcx,rdx; jne loop
+        // A missing terminal link is semantically the sentinel in this shape.
+        // Redirecting RCX to the generic stub instead reloads zero on every
+        // iteration and spins forever at the same instruction.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateNullSentinelPointerLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = sentinel_pointer_load_recoveries.fetchAdd(1, .monotonic);
+            const count = sentinel_pointer_load_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered missing sentinel link @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 4, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Unreal's small-allocation fast path pops an intrusive free-list head
+        // after decrementing the bucket count. If packed payload has replaced
+        // that pointer, discard the inconsistent head/count pair and take the
+        // allocator's already-encoded slow path; retaining the bad head would
+        // make the slow path immediately dereference it a second time.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryFallbackInvalidAllocatorHead(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_allocator_head_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_allocator_head_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] bypassed invalid Unreal allocator head @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0x14, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Unity copies an optional shared worker-state reference and then
+        // increments its refcount. A stale field can contain tagged payload
+        // data whose low 48 bits merely resemble a guest pointer. Preserve the
+        // exact function's own null cleanup path instead of mutating that data.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryDropInvalidSharedReference(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_shared_reference_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_shared_reference_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] omitted invalid shared reference @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 4, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // The worker-state lookup explicitly branches around an optional null
+        // hash map. A dangling non-canonical value in that same field is also
+        // an absent map; take the existing empty-result branch before reading
+        // its mask or backing array.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            trySkipInvalidOptionalMap(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_optional_map_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_optional_map_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] skipped invalid optional map @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0xc1, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // This leaf table lookup preloads AX with 0x7fff and returns it when the
+        // requested index is outside the inline table. If its supposed table
+        // pointer is actually packed payload data, the same fallback is the
+        // only bounded result and the function can return without touching it.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryReturnInvalidPackedTableFallback(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_packed_table_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_packed_table_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] returned packed-table fallback @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0x19, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // A streamed job can reach Unity's map insertion with an absent key
+        // pointer plus its per-record offset. The helper immediately hashes the
+        // loaded qword. Use its natural zero key for this exact instruction
+        // sequence; the generic pointer-load recovery would insert the shared
+        // stub, and the offset eventually crosses 0x1000 into an unhandled AV.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateNearNullHashKeyLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = near_null_hash_key_recoveries.fetchAdd(1, .monotonic);
+            const count = near_null_hash_key_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered absent hash key @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 3, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // For non-compare field access, rewrite the null base to a synthetic
+        // stub object and retry the instruction so ALU/SSE/mov see real memory.
+        // Pure address 0 (no field displacement) stays a contained guest fault
+        // for diagnostics and the native-bridge tests.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[1] > 0 and
+            record.ExceptionInformation[1] < lost_base_window and
+            tryRedirectNullBaseRegister(context, record.ExceptionInformation[1]))
+        {
+            _ = null_base_redirect_recoveries.fetchAdd(1, .monotonic);
+            const count = null_base_redirect_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] redirected null base -> stub @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Fallback: soft-zero / stub individual loads when base redirect failed.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            const fault_rip = context.Rip;
+            if (tryEmulateNullMemoryLoad(context, record.ExceptionInformation[1])) {
+                _ = null_memory_load_recoveries.fetchAdd(1, .monotonic);
+                std.debug.print(
+                    "[cpu] recovered null-memory load @rip=0x{x} addr=0x{x} (#{d})\n",
+                    .{ fault_rip, record.ExceptionInformation[1], null_memory_load_recoveries.load(.monotonic) },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // UE's bounded linked-list walkers use this exact terminal-node shape:
+        //   mov rax, [rdx+8] ; test rax, rax ; je missing
+        // A stale node can point at a released guest page even though the value
+        // is optional. Preserve the program's explicit null path without
+        // broadening recovery to arbitrary wild-pointer reads.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateUnmappedOptionalPointerLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = optional_pointer_load_recoveries.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "[cpu] recovered optional pointer load @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 4, record.ExceptionInformation[1], optional_pointer_load_recoveries.load(.monotonic) },
+            );
+            return exception_continue_execution;
+        }
+        // Unity can compute an allocator-table index before validating the
+        // category which supplied it. An unmapped entry must follow the same
+        // fallback-allocator path used when no candidate accepts the pointer;
+        // merely supplying zero would call the candidate vtable through null.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            trySkipUnmappedAllocatorCandidate(context, record.ExceptionInformation[1]))
+        {
+            _ = missing_allocator_candidate_recoveries.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "[cpu] skipped unmapped allocator candidate @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0xf2, record.ExceptionInformation[1], missing_allocator_candidate_recoveries.load(.monotonic) },
+            );
+            return exception_continue_execution;
+        }
+        // Unity stores 16 metadata records per group and keeps the last occupied
+        // record as a signed index. A corrupted positive index makes the tight
+        // 16-byte scan run through unrelated guest memory until a Job.Worker
+        // faults, while audio and the remaining workers keep running. Rebuild
+        // the index and mask from the table's actual 16 records, then advance
+        // through the function's existing outer-group path.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            const corrupt_last_index = context.R12 -% 1;
+            const group = context.Rsi;
+            if (tryRepairOversizedSparseMetadataScan(context, record.ExceptionInformation[1])) {
+                _ = oversized_metadata_scan_recoveries.fetchAdd(1, .monotonic);
+                const count = oversized_metadata_scan_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) std.debug.print(
+                    "[cpu] rebuilt oversized Unity metadata scan group={d} last=0x{x} @rip=0x{x} addr=0x{x} (#{d})\n",
+                    .{ group, corrupt_last_index, context.Rip, record.ExceptionInformation[1], count },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // A bounded metadata scan combines a word and a dword from each
+        // 16-byte record only to decide whether to set one mask bit. A stale
+        // optional backing range means "empty record" for this exact probe;
+        // skip both loads together so the second one cannot fault separately.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateUnmappedSparseMetadataLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = sparse_metadata_load_recoveries.fetchAdd(1, .monotonic);
+            const count = sparse_metadata_load_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered empty metadata entry @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 6, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Unity's empty hash-table representation can retain -1 as its backing
+        // pointer. The lookup's first bucket value is immediately compared to
+        // the same -1 empty marker; supply it directly for this exact probe so
+        // the generated missing-entry branch is taken.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateEmptyHashBucketLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = empty_hash_bucket_recoveries.fetchAdd(1, .monotonic);
+            const count = empty_hash_bucket_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered empty hash bucket @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 4, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // AGC's command-buffer validator preloads its invalid-argument result,
+        // checks the optional DCB/ACB pointer's type byte, and returns that
+        // result on mismatch. An unmapped guest pointer must take the same
+        // bounded error return instead of terminating the Unity job worker.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryRejectUnmappedAgcBuffer(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_agc_pointer_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_agc_pointer_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] rejected unmapped AGC buffer @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0x20, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // The same corrupt command-buffer header can fault one level earlier:
+        // Unity's allocator unlink helper masks the supposed relative size and
+        // adds it to the block. When that field contains an absolute guest
+        // pointer, the sum leaves guest VA before the adjacent free-list node
+        // can be inspected. This helper is a leaf, so take its exact RET path
+        // instead of terminating the sole UnityGfxDeviceWorker while an
+        // asynchronous scene is waiting at 90 percent.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryDropCorruptAllocatorUnlink(context, record.ExceptionInformation[1]))
+        {
+            _ = corrupt_allocator_free_recoveries.fetchAdd(1, .monotonic);
+            const count = corrupt_allocator_free_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] dropped corrupt allocator unlink @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0xce, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Unreal can also derive a new free-list node from a packed size value.
+        // The generated insertion clears that node and then installs it as the
+        // bucket head. If the derived address is not committed, keep the
+        // bucket empty and skip only those three exact stores; publishing the
+        // bad head makes every later allocation fault at the same address.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1 and
+            tryDropInvalidAllocatorInsert(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_allocator_insert_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_allocator_insert_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] dropped invalid allocator insert @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0xf, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Unity keeps the current renderer frame in a three-entry array and
+        // reserves index 3 for an explicit inactive slot. Streamed scene work
+        // can observe a stale pointer-sized value in the 32-bit index field;
+        // scaling it by the 16-byte slot size writes far into unmapped guest VA
+        // and kills a Job.Worker, leaving the main thread waiting forever.
+        // Repair only this exact generated store and retry it against Unity's
+        // own inactive slot.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1 and
+            tryRepairInvalidFrameSlot(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_frame_slot_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_frame_slot_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] reset invalid Unity frame slot @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // A smaller corrupt index can make the marker store above land in some
+        // other committed part of the renderer object. The first observable AV
+        // then occurs when cleanup treats packed data from that false slot as a
+        // reference-counted pointer. Rebind the exact cleanup sequence to the
+        // inactive slot and let Unity reload/decrement its real reference.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1 and
+            tryRepairInvalidFrameSlotReference(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_frame_slot_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_frame_slot_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] rebound invalid Unity frame reference @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip + 9, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // A streamed command buffer can arrive at Unity's dynamic-heap free
+        // path with an absolute guest pointer in its size/offset header. The
+        // generated unlink adds that value to the buffer address and writes
+        // outside every guest range. Abandon this exact free at its epilogue;
+        // leaking the already-corrupt buffer is safer than corrupting the heap
+        // or killing UnityGfxDeviceWorker.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1 and
+            tryDropCorruptAllocatorFree(context, record.ExceptionInformation[1]))
+        {
+            _ = corrupt_allocator_free_recoveries.fetchAdd(1, .monotonic);
+            const count = corrupt_allocator_free_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] dropped corrupt allocator free @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0x17d, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Discard stores into the first page (null object field writes).
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1)
+        {
+            const fault_rip = context.Rip;
+            if (tryEmulateNullMemoryStore(context, record.ExceptionInformation[1])) {
+                _ = null_memory_store_recoveries.fetchAdd(1, .monotonic);
+                const count = null_memory_store_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) {
+                    var saved_frame: u64 = 0;
+                    var return_address: u64 = 0;
+                    if (frame.owner != null and
+                        memory.isHostRangeReadable(context.Rsp, 2 * @sizeOf(u64)))
+                    {
+                        const stack = @as([*]align(1) const u64, @ptrFromInt(context.Rsp));
+                        saved_frame = stack[0];
+                        return_address = stack[1];
+                    }
+                    std.debug.print(
+                        "[cpu] recovered null-memory store @rip=0x{x} addr=0x{x} caller=0x{x} frame=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} r14=0x{x} r15=0x{x} (#{d})\n",
+                        .{
+                            fault_rip,
+                            record.ExceptionInformation[1],
+                            return_address,
+                            saved_frame,
+                            context.Rax,
+                            context.Rcx,
+                            context.Rdx,
+                            context.Rsi,
+                            context.Rdi,
+                            context.R14,
+                            context.R15,
+                            count,
+                        },
+                    );
+                }
+                return exception_continue_execution;
+            }
+        }
+        // Call/jmp through a null function pointer: pretend the callee returned 0.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            (record.ExceptionInformation[0] == 8 or isNullControlTransfer(context.Rip)))
+        {
+            const fault_rip = context.Rip;
+            if (tryEmulateNullCallReturn(context)) {
+                _ = null_call_recoveries.fetchAdd(1, .monotonic);
+                std.debug.print(
+                    "[cpu] recovered null-call return @rip=0x{x} -> 0x{x} (#{d})\n",
+                    .{ fault_rip, context.Rip, null_call_recoveries.load(.monotonic) },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // A later indirect call can target the synthetic object's data base
+        // rather than one of the executable vtable slots. Treat execution of
+        // that exact private address as the same optional null call and return
+        // zero; no arbitrary host DEP violation is made recoverable here.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and record.ExceptionInformation[0] == 8 and
+            tryEmulateSyntheticStubCallReturn(context))
+        {
+            _ = null_call_recoveries.fetchAdd(1, .monotonic);
+            const count = null_call_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered synthetic-stub call -> 0x{x} (#{d})\n",
+                .{ context.Rip, count },
+            );
+            return exception_continue_execution;
+        }
+
+        if (handling_native_fault) return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
+        // A call through a function pointer that was never filled in leaves
+        // Rip at or near zero, which belongs to neither guest nor host. That is
+        // exactly the fault worth containing: declining it kills the process at
+        // the one moment the guest registers still explain why. Reaching a null
+        // address requires a control transfer, and `active_native_frame` has
+        // already established that this thread is inside a guest call.
+        const from_guest = isGuestAddress(context.Rip) or isNullControlTransfer(context.Rip);
+        if (record.ExceptionFlags & exception_noncontinuable != 0 or !from_guest) {
+            if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+                record.NumberParameters >= 2 and
+                declined_host_access_violations.fetchAdd(1, .monotonic) == 0)
+            {
+                handling_native_fault = true;
+                defer handling_native_fault = false;
+                const allocation_base = hostAllocationBase(context.Rip);
+                var return_address: u64 = 0;
+                var next_return_address: u64 = 0;
+                if (memory.isHostRangeReadable(context.Rsp, 2 * @sizeOf(u64))) {
+                    const stack_words = @as([*]align(1) const u64, @ptrFromInt(context.Rsp));
+                    return_address = stack_words[0];
+                    next_return_address = stack_words[1];
+                }
+                std.debug.print(
+                    "[cpu] unhandled host access violation rip=0x{x} module_base=0x{x} offset=0x{x} target=0x{x} operation={d} rsp=0x{x} rax=0x{x} ret=0x{x} next=0x{x}\n",
+                    .{
+                        context.Rip,
+                        allocation_base,
+                        context.Rip -| allocation_base,
+                        record.ExceptionInformation[1],
+                        record.ExceptionInformation[0],
+                        context.Rsp,
+                        context.Rax,
+                        return_address,
+                        next_return_address,
+                    },
+                );
+                std.debug.print(
+                    "[cpu host fault registers] rcx=0x{x} rdx=0x{x} rbx=0x{x} rbp=0x{x} rsi=0x{x} rdi=0x{x} r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x} r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n",
+                    .{ context.Rcx, context.Rdx, context.Rbx, context.Rbp, context.Rsi, context.Rdi, context.R8, context.R9, context.R10, context.R11, context.R12, context.R13, context.R14, context.R15 },
+                );
+                // Optimized leaf functions often keep saved registers at RSP,
+                // rather than a return address. Scan a bounded readable stack
+                // prefix for same-module candidates, without allocating or
+                // invoking a symbol loader from the exception handler. These
+                // are candidates, not an unwound backtrace.
+                if (allocation_base != 0) {
+                    var candidates: usize = 0;
+                    var offset: usize = 0;
+                    while (offset < 4096 and candidates < 32) : (offset += @sizeOf(u64)) {
+                        const address = std.math.add(u64, context.Rsp, offset) catch break;
+                        if (!memory.isHostRangeReadable(address, @sizeOf(u64))) break;
+                        const value = @as(*align(1) const u64, @ptrFromInt(address)).*;
+                        if (value < allocation_base or hostAllocationBase(value) != allocation_base) continue;
+                        std.debug.print("[cpu host stack candidate] sp+0x{x}=0x{x} module+0x{x}\n", .{ offset, value, value - allocation_base });
+                        candidates += 1;
+                    }
+                }
+            }
+            return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        const kind: FaultKind = switch (record.ExceptionCode) {
+            std.os.windows.EXCEPTION_ACCESS_VIOLATION => .access_violation,
+            std.os.windows.EXCEPTION_ILLEGAL_INSTRUCTION => .illegal_instruction,
+            else => return std.os.windows.EXCEPTION_CONTINUE_SEARCH,
+        };
+
+        handling_native_fault = true;
+        defer handling_native_fault = false;
+
+        if (kind == .illegal_instruction and tryEmulateIllegalInstruction(context)) {
+            return exception_continue_execution;
+        }
+
+        var fault = FaultInfo{
+            .kind = kind,
+            .exception_code = record.ExceptionCode,
+            .instruction_address = context.Rip,
+            .registers = .{
+                .rax = context.Rax,
+                .rbx = context.Rbx,
+                .rcx = context.Rcx,
+                .rdx = context.Rdx,
+                .rsi = context.Rsi,
+                .rdi = context.Rdi,
+                .rbp = context.Rbp,
+                .rsp = context.Rsp,
+                .r8 = context.R8,
+                .r9 = context.R9,
+                .r10 = context.R10,
+                .r11 = context.R11,
+                .r12 = context.R12,
+                .r13 = context.R13,
+                .r14 = context.R14,
+                .r15 = context.R15,
+                .rip = context.Rip,
+                .rflags = context.EFlags,
+            },
+        };
+        if (kind == .access_violation and record.NumberParameters >= 2) {
+            fault.access = switch (record.ExceptionInformation[0]) {
+                0 => .read,
+                1 => .write,
+                8 => .execute,
+                else => .unknown,
+            };
+            fault.memory_address = record.ExceptionInformation[1];
+        }
+        frame.fault = fault;
+        const fault_code: [*]const u8 = @ptrFromInt(fault.instruction_address);
+        std.debug.print(
+            "[cpu] contained guest fault thread=0x{x} kind={s} rip=0x{x} exception=0x{x} target=0x{x} access={s} " ++
+                "rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} " ++
+                "rbp=0x{x} rsp=0x{x} r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x} " ++
+                "r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n",
+            .{
+                frame.thread_handle,
+                @tagName(fault.kind),
+                fault.instruction_address,
+                @intFromPtr(record.ExceptionAddress),
+                fault.memory_address,
+                @tagName(fault.access),
+                fault.registers.rax,
+                fault.registers.rbx,
+                fault.registers.rcx,
+                fault.registers.rdx,
+                fault.registers.rsi,
+                fault.registers.rdi,
+                fault.registers.rbp,
+                fault.registers.rsp,
+                fault.registers.r8,
+                fault.registers.r9,
+                fault.registers.r10,
+                fault.registers.r11,
+                fault.registers.r12,
+                fault.registers.r13,
+                fault.registers.r14,
+                fault.registers.r15,
+            },
+        );
+        std.debug.print(
+            "[cpu] fault code=" ++
+                "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}" ++
+                "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
+            .{
+                fault_code[0],
+                fault_code[1],
+                fault_code[2],
+                fault_code[3],
+                fault_code[4],
+                fault_code[5],
+                fault_code[6],
+                fault_code[7],
+                fault_code[8],
+                fault_code[9],
+                fault_code[10],
+                fault_code[11],
+                fault_code[12],
+                fault_code[13],
+                fault_code[14],
+                fault_code[15],
+            },
+        );
+
+        // Returning CONTINUE_EXECUTION makes Windows restore this edited
+        // context. The assembly escape does not touch the potentially damaged
+        // guest stack: it restores the saved host RSP and FS base first.
+        context.Rcx = @intFromPtr(frame);
+        context.Rip = @intFromPtr(&ps5NativeEscapeWindowsX64);
+        return exception_continue_execution;
+    }
+
+    /// Arithmetic flag bits used by conditional branches after CMP.
+    const flag_cf: u32 = 0x0001;
+    const flag_pf: u32 = 0x0004;
+    const flag_af: u32 = 0x0010;
+    const flag_zf: u32 = 0x0040;
+    const flag_sf: u32 = 0x0080;
+    const flag_of: u32 = 0x0800;
+    const flag_arith_mask: u32 = flag_cf | flag_pf | flag_af | flag_zf | flag_sf | flag_of;
+
+    /// When a first-page AV is caused by a null base register, point that
+    /// register at the synthetic stub object and leave RIP unchanged so Windows
+    /// re-executes the faulting instruction against real memory.
+    fn tryRedirectNullBaseRegister(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
+        if (memory_address == 0 or memory_address >= lost_base_window) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        var offset: usize = 0;
+        var rex: u8 = 0;
+        var vex_b: u8 = 0;
+        // Skip optional REX or VEX prefixes. Unity's generated setters commonly
+        // use `vmovss [null+disp], xmm` (C5 FA 11 /r), which has the same ModRM
+        // base encoding as a regular MOV but puts the ModRM after a VEX prefix.
+        if (code[0] & 0xf0 == 0x40) {
+            rex = code[0];
+            offset = 1;
+        } else if (code[0] == 0xc5) {
+            offset = 2;
+        } else if (code[0] == 0xc4) {
+            // VEX.~B is inverted: zero means the high base-register bit is set.
+            vex_b = if (code[1] & 0x20 == 0) 8 else 0;
+            offset = 3;
+        }
+        // Two-byte opcode (0F xx) places modrm at offset+2.
+        const modrm_index: usize = if (code[offset] == 0x0f) offset + 2 else offset + 1;
+        if (modrm_index >= 14) return false;
+        const modrm = code[modrm_index];
+        const mod = modrm >> 6;
+        const rm = modrm & 7;
+        if (mod == 3) return false; // register form
+        // SIB form: base is in the SIB byte.
+        if (rm == 4) {
+            const sib = code[modrm_index + 1];
+            const base = sib & 7;
+            if (mod == 0 and base == 5) return false; // disp32, no base
+            const reg_index: u4 = @truncate(base | ((rex & 0x01) << 3) | vex_b);
+            if (readGpr(context, reg_index) != 0) return false;
+            writeGpr(context, reg_index, ensureNullObjectStub());
+            return true;
+        }
+        if (mod == 0 and rm == 5) return false; // rip-relative
+        const reg_index: u4 = @truncate(rm | ((rex & 0x01) << 3) | vex_b);
+        if (readGpr(context, reg_index) != 0) return false;
+        // Sanity: base 0 + small disp should match the fault address.
+        // (disp is not re-decoded here; a null base always lands in the first page.)
+        writeGpr(context, reg_index, ensureNullObjectStub());
+        return true;
+    }
+
+    /// Emulates `cmp [null+disp], imm` as if the memory byte/dword was zero.
+    /// Returns true when the instruction was stepped past with flags updated.
+    fn tryEmulateNullObjectCompare(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
+        if (memory_address == 0 or memory_address >= lost_base_window) return false;
+        // Do not require isGuestAddress: the VEH already established this thread
+        // is in a guest call, and some titles map PRX outside the nominal
+        // ranges during bring-up.
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        var offset: usize = 0;
+        if (code[0] & 0xf0 == 0x40) offset = 1;
+        const opcode = code[offset];
+        // 80 /7 ib  — CMP r/m8, imm8
+        // 83 /7 ib  — CMP r/m16/32/64, imm8
+        // 81 /7 id  — CMP r/m32/64, imm32
+        if (opcode != 0x80 and opcode != 0x83 and opcode != 0x81) return false;
+        const modrm = code[offset + 1];
+        if ((modrm >> 3) & 7 != 7) return false; // /7 = CMP
+        const mod = modrm >> 6;
+        const rm = modrm & 7;
+        // Reject SIB and rip-relative — only plain [reg(+disp)].
+        if (rm == 4) return false;
+        if (mod == 0 and rm == 5) return false;
+        if (mod == 3) return false; // register form
+        var length: usize = offset + 2;
+        if (mod == 1) length += 1;
+        if (mod == 2) length += 4;
+        const imm_is_byte = opcode == 0x80 or opcode == 0x83;
+        length += if (imm_is_byte) @as(usize, 1) else 4;
+        if (length > 15) return false;
+
+        var imm: u32 = 0;
+        if (imm_is_byte) {
+            imm = code[length - 1];
+        } else {
+            var imm_bytes: [4]u8 = undefined;
+            @memcpy(&imm_bytes, code[length - 4 ..][0..4]);
+            imm = std.mem.readInt(u32, &imm_bytes, .little);
+        }
+        // cmp 0, imm → ZF iff imm==0; CF set when imm!=0 (unsigned borrow).
+        var flags = context.EFlags & ~flag_arith_mask;
+        if (imm == 0) {
+            flags |= flag_zf | flag_pf;
+        } else {
+            flags |= flag_cf;
+            if (imm_is_byte and imm & 0x80 != 0) flags |= flag_sf;
+            if (!imm_is_byte and imm & 0x8000_0000 != 0) flags |= flag_sf;
+        }
+        context.EFlags = flags;
+        context.Rip += length;
+        return true;
+    }
+
+    /// Emulates integer reads from the first page as zeros (or a stub object for
+    /// 64-bit pointer MOVs). Covers MOV/MOVZX/MOVSX plus ALU forms that only
+    /// read memory (`add/sub/cmp/and/or/xor/test reg, [null+disp]`).
+    fn tryEmulateNullMemoryLoad(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
+        if (memory_address == 0 or memory_address >= lost_base_window) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        var offset: usize = 0;
+        var rex: u8 = 0;
+        if (code[0] & 0xf0 == 0x40) {
+            rex = code[0];
+            offset = 1;
+        }
+        const opcode0 = code[offset];
+
+        // Two-byte opcodes: 0F B6/B7/BE/BF (MOVZX/MOVSX).
+        if (opcode0 == 0x0f) {
+            const opcode1 = code[offset + 1];
+            switch (opcode1) {
+                0xb6, 0xb7, 0xbe, 0xbf => {},
+                else => return false,
+            }
+            const modrm = code[offset + 2];
+            const mem_len = modrmMemoryOperandLength(modrm, code[offset + 3 ..]) orelse return false;
+            const length = offset + 3 + mem_len;
+            if (length > 15) return false;
+            const reg = @as(u4, @truncate(((modrm >> 3) & 7) | ((rex & 0x04) << 1)));
+            writeGpr(context, reg, 0);
+            context.Rip += length;
+            return true;
+        }
+
+        // 8A/8B MOV, 63 MOVSXD, and r,r/m ALU ops that read memory as the second operand.
+        const op = opcode0;
+        const is_mov8 = op == 0x8a;
+        const is_mov = op == 0x8b;
+        const is_movsxd = op == 0x63;
+        const is_alu_rm = op == 0x03 or op == 0x0b or op == 0x23 or op == 0x2b or
+            op == 0x33 or op == 0x3b or op == 0x85; // ADD/OR/AND/SUB/XOR/CMP/TEST r, r/m
+        if (!is_mov8 and !is_mov and !is_movsxd and !is_alu_rm) return false;
+
+        const modrm = code[offset + 1];
+        const mem_len = modrmMemoryOperandLength(modrm, code[offset + 2 ..]) orelse return false;
+        const length = offset + 2 + mem_len;
+        if (length > 15) return false;
+        const reg = @as(u4, @truncate(((modrm >> 3) & 7) | ((rex & 0x04) << 1)));
+        const stub = ensureNullObjectStub();
+        const reg_value = readGpr(context, reg);
+
+        if (is_mov8) {
+            writeGpr(context, reg, reg_value & ~@as(u64, 0xff));
+        } else if (is_mov) {
+            // 64-bit pointer loads get a synthetic object so follow-up field
+            // accesses hit real memory; 32-bit loads stay zero.
+            if (rex & 0x08 != 0) writeGpr(context, reg, stub) else writeGpr(context, reg, 0);
+        } else if (is_movsxd) {
+            writeGpr(context, reg, 0);
+        } else {
+            // ALU with mem=0: result is identity for ADD/SUB/OR/XOR, zero for AND,
+            // flags-only for CMP/TEST.
+            const mem: u64 = 0;
+            const wide = (rex & 0x08) != 0;
+            const mask: u64 = if (wide) std.math.maxInt(u64) else 0xffff_ffff;
+            const a = reg_value & mask;
+            const b = mem & mask;
+            var result: u64 = a;
+            var flags = context.EFlags & ~flag_arith_mask;
+            switch (op) {
+                0x03 => result = a +% b, // ADD
+                0x0b => result = a | b, // OR
+                0x23 => result = a & b, // AND
+                0x2b => result = a -% b, // SUB
+                0x33 => result = a ^ b, // XOR
+                0x3b, 0x85 => { // CMP / TEST — flags only
+                    result = if (op == 0x85) a & b else a -% b;
+                    if (result == 0) flags |= flag_zf | flag_pf;
+                    if (result & (if (wide) @as(u64, 1) << 63 else 0x8000_0000) != 0) flags |= flag_sf;
+                    if (op == 0x3b and a < b) flags |= flag_cf;
+                    context.EFlags = flags;
+                    context.Rip += length;
+                    return true;
+                },
+                else => return false,
+            }
+            if (!wide) result &= 0xffff_ffff;
+            writeGpr(context, reg, result);
+            if (result == 0) flags |= flag_zf | flag_pf;
+            if (result & (if (wide) @as(u64, 1) << 63 else 0x8000_0000) != 0) flags |= flag_sf;
+            context.EFlags = flags;
+        }
+        context.Rip += length;
+        return true;
+    }
+
+    fn tryEmulateUnmappedOptionalPointerLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const effective_address = context.Rdx +% 8;
+        const unmapped_guest_address = isGuestAddress(memory_address) and
+            memory_address >= memory.page_size and
+            effective_address == memory_address;
+        // Windows reports every non-canonical x64 effective address as -1.
+        // Allocator poison can reach the same optional-list load as an ordinary
+        // unmapped guest pointer, so classify it from the base register instead.
+        const poisoned_address = memory_address == std.math.maxInt(u64) and
+            context.Rdx != 0 and
+            !isCanonicalX64Address(context.Rdx);
+        if (!unmapped_guest_address and !poisoned_address) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x48, 0x8b, 0x42, 0x08, // mov rax, qword ptr [rdx+8]
+            0x48, 0x85, 0xc0, // test rax, rax
+            0x74, // je rel8
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rax = 0;
+        context.Rip += 4;
+        return true;
+    }
+
+    fn tryEmulateNullSentinelPointerLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const null_link = memory_address == 8 and context.Rcx == 0;
+        // Windows reports a non-canonical x64 effective address as -1 in the
+        // access-violation record. Unity uses an allocator poison value for the
+        // same absent terminal link after streamed objects are reclaimed.
+        const poisoned_link = memory_address == std.math.maxInt(u64) and
+            context.Rcx != 0 and
+            !isCanonicalX64Address(context.Rcx);
+        // Streamed list nodes can also retain a canonical poison value outside
+        // committed guest memory. Unlike Windows' -1 report for a non-canonical
+        // address, this AV preserves the exact base+8 effective address. The
+        // numeric value can still fall inside a reserved console VA window, so
+        // the access violation itself establishes that the page is absent.
+        const stale_link = context.Rcx != 0 and
+            isCanonicalX64Address(context.Rcx) and
+            isGuestAddress(context.Rdx) and
+            memory_address == context.Rcx +% 8;
+        if ((!null_link and !poisoned_link and !stale_link) or context.Rdx == 0) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x48, 0x8b, 0x49, 0x08, // mov rcx, qword ptr [rcx+8]
+            0xff, 0xc0, // inc eax
+            0x48, 0x39, 0xd1, // cmp rcx, rdx
+            0x75, 0xf5, // jne back to the load
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rcx = context.Rdx;
+        context.Rip += 4;
+        return true;
+    }
+
+    fn trySkipNullQueuedWorkItem(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (memory_address != 0 or context.Rbx != 0) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const dispatch_pattern = [_]u8{
+            0x48, 0x8b, 0x03, // mov rax,qword ptr [rbx]
+            0xff, 0x50, 0x28, // call qword ptr [rax+0x28]
+            0x85, 0xc0, // test eax,eax
+            0x74, 0x0d, // je alternate work method
+            0x41, 0x83, 0x7e, 0x40, 0x00, // cmp dword ptr [r14+0x40],0
+        };
+        for (dispatch_pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const cleanup_offset: usize = 0xb0;
+        const cleanup_pattern = [_]u8{
+            0x48, 0x85, 0xdb, // test rbx,rbx
+            0x74, 0x09, // je function epilogue
+        };
+        for (cleanup_pattern, 0..) |byte, index| {
+            if (code[cleanup_offset + index] != byte) return false;
+        }
+        context.Rip += cleanup_offset;
+        return true;
+    }
+
+    fn tryFallbackInvalidAllocatorHead(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const fallback_offset: u64 = 0x14;
+        const noncanonical_head = memory_address == std.math.maxInt(u64) and
+            context.Rcx != 0 and !isCanonicalX64Address(context.Rcx);
+        const unmapped_canonical_head = context.Rcx != 0 and
+            isCanonicalX64Address(context.Rcx) and
+            memory_address == context.Rcx and
+            !memory.isHostRangeReadable(context.Rcx, @sizeOf(u64));
+        if ((!noncanonical_head and !unmapped_canonical_head) or
+            context.Rbx > 0x2_0000 or context.R14 > 0x10 or
+            context.Rdx > 0x1fe0 or context.Rdx & 0x1f != 0 or
+            !isGuestAddress(context.Rax) or
+            context.Rsi != context.Rax +% context.Rdx or
+            !isGuestAddress(context.Rsi) or
+            !memory.isHostRangeReadable(context.Rsi, 12) or
+            !memory.isHostRangeWritable(context.Rsi, 12))
+        {
+            return false;
+        }
+
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pop_pattern = [_]u8{
+            0x48, 0x8b, 0x01, // mov rax,[rcx]
+            0x48, 0x89, 0x06, // mov [rsi],rax
+            0x48, 0x89, 0xc8, // mov rax,rcx
+            0x48, 0x83, 0xc4, 0x08, // add rsp,8
+            0x5b, // pop rbx
+            0x41, 0x5e, // pop r14
+            0x41, 0x5f, // pop r15
+            0x5d, // pop rbp
+            0xc3, // ret
+        };
+        for (pop_pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const fallback_pattern = [_]u8{
+            0x4c, 0x89, 0xff, // mov rdi,r15
+            0x48, 0x89, 0xde, // mov rsi,rbx
+            0x44, 0x89, 0xf2, // mov edx,r14d
+            0x48, 0x83, 0xc4, 0x08, // add rsp,8
+            0x5b, // pop rbx
+            0x41, 0x5e, // pop r14
+            0x41, 0x5f, // pop r15
+            0x5d, // pop rbp
+            0xe9, // jmp slow allocator
+        };
+        for (fallback_pattern, 0..) |byte, index| {
+            if (code[fallback_offset + index] != byte) return false;
+        }
+
+        const bucket_head: *u64 = @ptrFromInt(context.Rsi);
+        if (bucket_head.* != context.Rcx) return false;
+        const bucket_count: *u32 = @ptrFromInt(context.Rsi + 8);
+        bucket_head.* = 0;
+        bucket_count.* = 0;
+        context.Rip += fallback_offset;
+        return true;
+    }
+
+    fn tryDropInvalidSharedReference(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const pointer_mask: u64 = 0x0000_ffff_ffff_ffff;
+        if (memory_address != std.math.maxInt(u64) or
+            isCanonicalX64Address(context.Rax) or
+            !isGuestAddress(context.Rax & pointer_mask))
+        {
+            return false;
+        }
+        const source_address = context.Rdx +% 0x4e20;
+        const destination_address = context.Rdi +% 0x4e20;
+        if (!memory.isHostRangeReadable(source_address, @sizeOf(u64)) or
+            !memory.isHostRangeWritable(destination_address, @sizeOf(u64)))
+        {
+            return false;
+        }
+        const source: *const u64 = @ptrFromInt(source_address);
+        const destination: *u64 = @ptrFromInt(destination_address);
+        if (source.* != context.Rax or destination.* != context.Rax) return false;
+
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0xf0, 0xff, 0x40, 0x18, // lock inc dword ptr [rax+0x18]
+            0x48, 0x8b, 0x42, 0x08, // mov rax,qword ptr [rdx+8]
+            0x48, 0x89, 0x47, 0x08, // mov qword ptr [rdi+8],rax
+            0x8b, 0x82, 0x04, 0x4e, 0x00, 0x00, // mov eax,[rdx+0x4e04]
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        destination.* = 0;
+        context.Rax = 0;
+        context.Rip += 4;
+        return true;
+    }
+
+    fn trySkipInvalidOptionalMap(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const empty_branch_offset: u64 = 0xc1;
+        if (memory_address != std.math.maxInt(u64) or
+            isCanonicalX64Address(context.Rcx))
+        {
+            return false;
+        }
+        const map_field_address = context.R10 +% 0x5dd8;
+        if (!memory.isHostRangeReadable(map_field_address, @sizeOf(u64))) return false;
+        const map_field: *const u64 = @ptrFromInt(map_field_address);
+        if (map_field.* != context.Rcx) return false;
+
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x44, 0x8b, 0x51, 0x08, // mov r10d,dword ptr [rcx+8]
+            0x44, 0x69, 0xdf, 0xb5, 0xfd, 0x97, 0x54, // imul r11d,edi,0x5497fdb5
+            0x4c, 0x8b, 0x31, // mov r14,qword ptr [rcx]
+            0x44, 0x89, 0xd6, // mov esi,r10d
+            0x44, 0x21, 0xde, // and esi,r11d
+            0x41, 0x83, 0xe3, 0xfc, // and r11d,-4
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const empty_branch = [_]u8{
+            0x4c, 0x89, 0xe3, // mov rbx,r12
+            0x45, 0x31, 0xe4, // xor r12d,r12d
+        };
+        for (empty_branch, 0..) |byte, index| {
+            if (code[empty_branch_offset + index] != byte) return false;
+        }
+        context.Rip += empty_branch_offset;
+        return true;
+    }
+
+    fn tryReturnInvalidPackedTableFallback(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const return_offset: u64 = 0x19;
+        if (memory_address != std.math.maxInt(u64) or
+            isCanonicalX64Address(context.Rdi) or
+            context.Rax & 0xffff != 0x7fff or
+            @as(u32, @truncate(context.Rcx)) != @as(u32, @truncate(context.Rsi)))
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x0f, 0xb7, 0x74, 0x4f, 0x2e, // movzx esi,word ptr [rdi+rcx*2+0x2e]
+            0x39, 0xd6, // cmp esi,edx
+            0x76, 0x10, // jbe fallback return
+            0x48, 0x8b, 0x44, 0xcf, 0x08, // mov rax,[rdi+rcx*8+8]
+            0x89, 0xd1, // mov ecx,edx
+            0x0f, 0xb7, 0x04, 0x48, // movzx eax,word ptr [rax+rcx*2]
+            0x25, 0xff, 0x7f, 0x00, 0x00, // and eax,0x7fff
+            0xc3, // ret
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rip += return_offset;
+        return true;
+    }
+
+    fn tryEmulateNearNullHashKeyLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const near_null_limit: u64 = 0x1_0000;
+        if (memory_address >= near_null_limit or context.Rdx != memory_address) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x4c, 0x8b, 0x0a, // mov r9, qword ptr [rdx]
+            0x45, 0x69, 0xe1, 0xb5, 0xfd, 0x97, 0x54, // imul r12d,r9d,0x5497fdb5
+            0x45, 0x89, 0xe2, // mov r10d,r12d
+            0x45, 0x21, 0xf4, // and r12d,r14d
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.R9 = 0;
+        context.Rip += 3;
+        return true;
+    }
+
+    fn trySkipUnmappedAllocatorCandidate(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const fallback_offset: u64 = 0xf2;
+        if (!isGuestAddress(memory_address) or memory_address < memory.page_size) return false;
+        const expected = context.R15 +% (context.Rax *% 8) +% 0x19f0;
+        if (expected != memory_address) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x4d, 0x8b, 0xac, 0xc7, 0xf0, 0x19, 0x00, 0x00, // mov r13,[r15+rax*8+0x19f0]
+            0xb8, 0x00, 0x00, 0x00, 0x00, // mov eax,0
+            0x49, 0x81, 0xfd, 0x01, 0x02, 0x00, 0x00, // cmp r13,0x201
+            0x4c, 0x0f, 0x42, 0xe8, // cmovb r13,rax
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const fallback_pattern = [_]u8{
+            0x4c, 0x89, 0xff, // mov rdi,r15
+            0x48, 0x89, 0xde, // mov rsi,rbx
+            0xe8, 0x26, 0x01, 0x00, 0x00, // call fallback allocator lookup
+        };
+        for (fallback_pattern, 0..) |byte, index| {
+            if (code[fallback_offset + index] != byte) return false;
+        }
+        context.Rip += fallback_offset;
+        return true;
+    }
+
+    fn tryEmulateUnmappedSparseMetadataLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (!isGuestAddress(memory_address) or memory_address != context.Rax) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x0f, 0xb7, 0x18, // movzx ebx,word ptr [rax]
+            0x8b, 0x78, 0xfc, // mov edi,dword ptr [rax-4]
+            0x48, 0x09, 0xdf, // or rdi,rbx
+            0x74, 0xe3, // je next record
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rbx = 0;
+        context.Rdi = 0;
+        context.Rip += 6;
+        return true;
+    }
+
+    fn tryRepairOversizedSparseMetadataScan(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const group_count: u64 = 7;
+        const record_count: usize = 16;
+        const record_stride: u64 = 0x10;
+        const group_stride: u64 = 0x100;
+        const table_base_offset: u64 = 0x3f04;
+        const mask_base_offset: u64 = 0x4d00;
+        const last_index_base_offset: u64 = 0x4d1c;
+        const outer_loop_offset: u64 = 0x110;
+        const scan_setup_offset: u64 = 0x40;
+
+        if (context.Rsi == 0 or context.Rsi >= group_count or
+            context.R12 <= record_count or context.Rcx < record_count or
+            memory_address != context.Rax)
+        {
+            return false;
+        }
+
+        const fault_offset = std.math.mul(u64, context.Rcx, record_stride) catch return false;
+        const expected_fault = std.math.add(u64, context.R9, fault_offset) catch return false;
+        if (memory_address != expected_fault) return false;
+
+        const group_table_offset = std.math.mul(u64, context.Rsi, group_stride) catch return false;
+        const expected_table = std.math.add(
+            u64,
+            context.R15,
+            table_base_offset + group_table_offset,
+        ) catch return false;
+        if (context.R9 != expected_table) return false;
+
+        const group_field_offset = std.math.mul(u64, context.Rsi, @sizeOf(u32)) catch return false;
+        const mask_address = std.math.add(
+            u64,
+            context.R15,
+            mask_base_offset + group_field_offset,
+        ) catch return false;
+        const last_index_address = std.math.add(
+            u64,
+            context.R15,
+            last_index_base_offset + group_field_offset,
+        ) catch return false;
+        const readable_start = context.R9 -% @sizeOf(u32);
+        const readable_bytes = record_count * record_stride - @sizeOf(u32) + @sizeOf(u16);
+        if (!memory.isHostRangeReadable(readable_start, readable_bytes) or
+            !memory.isHostRangeReadable(last_index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(last_index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(mask_address, @sizeOf(u32)))
+        {
+            return false;
+        }
+        const stored_last_index: *u32 = @ptrFromInt(last_index_address);
+        if (stored_last_index.* <= record_count - 1 or
+            stored_last_index.* != @as(u32, @truncate(context.R12 - 1)))
+        {
+            return false;
+        }
+
+        if (context.Rip < outer_loop_offset or context.Rip < scan_setup_offset) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const scan_pattern = [_]u8{
+            0x0f, 0xb7, 0x18, // movzx ebx,word ptr [rax]
+            0x8b, 0x78, 0xfc, // mov edi,dword ptr [rax-4]
+            0x48, 0x09, 0xdf, // or rdi,rbx
+            0x74, 0xe5, // je next record
+            0x0f, 0xab, 0xca, // bts edx,ecx
+            0x41, 0x89, // mov [r15+rsi*4+0x4d00],edx
+        };
+        for (scan_pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const setup_code: [*]const u8 = @ptrFromInt(context.Rip - scan_setup_offset);
+        const setup_pattern = [_]u8{
+            0x41, 0xc7, 0x84, 0xb7, 0x00, 0x4d, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, // mov dword ptr [r15+rsi*4+0x4d00],0
+            0x45, 0x8b, 0xa4, 0xb7, 0x1c, 0x4d, 0x00, 0x00, // mov r12d,[...+0x4d1c]
+            0x45, 0x85, 0xe4, // test r12d,r12d
+            0x0f, 0x88, 0x13, 0xff, 0xff, 0xff, // js outer loop
+            0x49, 0xff, 0xc4, // inc r12
+            0x4c, 0x89, 0xc8, // mov rax,r9
+            0x31, 0xd2, // xor edx,edx
+            0x31, 0xc9, // xor ecx,ecx
+            0xeb, 0x17, // jmp scan
+        };
+        for (setup_pattern, 0..) |byte, index| {
+            if (setup_code[index] != byte) return false;
+        }
+        const outer_code: [*]const u8 = @ptrFromInt(context.Rip - outer_loop_offset);
+        const outer_pattern = [_]u8{
+            0x48, 0xff, 0xc6, // inc rsi
+            0x49, 0x81, 0xc2, 0x00, 0x02, 0x00, 0x00, // add r10,0x200
+            0x49, 0x81, 0xc3, 0x00, 0x02, 0x00, 0x00, // add r11,0x200
+            0x49, 0x81, 0xc1, 0x00, 0x01, 0x00, 0x00, // add r9,0x100
+            0x48, 0x83, 0xfe, 0x07, // cmp rsi,7
+        };
+        for (outer_pattern, 0..) |byte, index| {
+            if (outer_code[index] != byte) return false;
+        }
+
+        var mask: u32 = 0;
+        var repaired_last_index: u32 = std.math.maxInt(u32);
+        for (0..record_count) |index| {
+            const record_address = context.R9 + @as(u64, index) * record_stride;
+            const flags: *const u32 = @ptrFromInt(record_address - @sizeOf(u32));
+            const tag: *const u16 = @ptrFromInt(record_address);
+            if (flags.* == 0 and tag.* == 0) continue;
+            mask |= @as(u32, 1) << @intCast(index);
+            repaired_last_index = @intCast(index);
+        }
+
+        const stored_mask: *u32 = @ptrFromInt(mask_address);
+        stored_mask.* = mask;
+        stored_last_index.* = repaired_last_index;
+        context.Rdx = mask;
+        context.R12 = if (repaired_last_index == std.math.maxInt(u32)) 0 else repaired_last_index + 1;
+        context.Rip -= outer_loop_offset;
+        return true;
+    }
+
+    fn tryEmulateEmptyHashBucketLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (memory_address != std.math.maxInt(u64) and !isGuestAddress(memory_address)) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const r14_pattern = [_]u8{
+            0x41, 0x8b, 0x14, 0x06, // mov edx,dword ptr [r14+rax]
+            0x44, 0x39, 0xda, // cmp edx,r11d
+            0x75, 0x09, // jne empty check
+            0x4c, 0x01, 0xf0, // add rax,r14
+            0x48, 0x39, 0x78, 0x08, // cmp [rax+8],rdi
+            0x74, 0x54, // je found
+            0x83, 0xfa, 0xff, // cmp edx,-1
+            0x74, 0x46, // je missing
+        };
+        if (memory_address == context.R14 +% context.Rax) {
+            var matches = true;
+            for (r14_pattern, 0..) |byte, index| {
+                if (code[index] != byte) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                context.Rdx = 0xffff_ffff;
+                context.Rip += 4;
+                return true;
+            }
+        }
+
+        const rcx_pattern = [_]u8{
+            0x42, 0x8b, 0x04, 0x19, // mov eax,dword ptr [rcx+r11]
+            0x44, 0x39, 0xf8, // cmp eax,r15d
+            0x75, 0x0a, // jne empty check
+            0x4a, 0x8d, 0x3c, 0x19, // lea rdi,[rcx+r11]
+            0x4c, 0x39, 0x77, 0x08, // cmp [rdi+8],r14
+            0x74, 0x4b, // je found
+            0x83, 0xf8, 0xff, // cmp eax,-1
+            0x74, 0x3d, // je missing
+        };
+        if (memory_address != context.Rcx +% context.R11) return false;
+        for (rcx_pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rax = 0xffff_ffff;
+        context.Rip += 4;
+        return true;
+    }
+
+    fn tryRejectUnmappedAgcBuffer(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (context.Rax != 0x8a6c_000a or
+            !isGuestAddress(context.Rsi) or
+            memory_address != context.Rsi +% 0x5a)
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x80, 0x7e, 0x5a, 0x02, // cmp byte ptr [rsi+0x5a],2
+            0xb8, 0x08, 0x00, 0x6c, 0x8a, // mov eax,0x8a6c0008
+            0x75, 0x15, // jne error return
+            0x48, 0x85, 0xd2, // test rdx,rdx
+            0x74, 0x0b, // je submit
+            0x80, 0x7a, 0x5a, 0x01, // cmp byte ptr [rdx+0x5a],1
+            0xb8, 0x08, 0x00, 0x6c, 0x8a, // mov eax,0x8a6c0008
+            0x75, 0x05, // jne error return
+            0xe9, 0x27, 0x3b, 0x68, 0x01, // jmp submit implementation
+            0xc3, // error return
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rip += 0x20;
+        return true;
+    }
+
+    fn tryDropCorruptAllocatorFree(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const epilogue_offset: u64 = 0x17d;
+        if (!isGuestAddress(context.Rax) or
+            !isGuestAddress(context.Rsi) or
+            isGuestAddress(memory_address) or
+            context.Rax +% context.Rsi != memory_address or
+            context.Rbx != context.Rsi -% 0x10 or
+            context.Rbp != context.Rsp +% 0x10)
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x48, 0x89, 0x1c, 0x30, // mov qword ptr [rax+rsi],rbx
+            0x80, 0x4c, 0x30, 0x08, 0x02, // or byte ptr [rax+rsi+8],2
+            0x48, 0x8b, 0x46, 0xf8, // mov rax,qword ptr [rsi-8]
+            0x48, 0x89, 0xc1, // mov rcx,rax
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const epilogue = [_]u8{
+            0x5b, // pop rbx
+            0x41, 0x5e, // pop r14
+            0x5d, // pop rbp
+            0xc3, // ret
+        };
+        for (epilogue, 0..) |byte, index| {
+            if (code[epilogue_offset + index] != byte) return false;
+        }
+        context.Rip += epilogue_offset;
+        return true;
+    }
+
+    fn tryDropInvalidAllocatorInsert(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const pattern = [_]u8{
+            0x49, 0x89, 0x45, 0x00, // mov qword ptr [r13],rax
+            0x49, 0xc7, 0x45, 0x08, 0x00, 0x00, 0x00, 0x00, // mov qword ptr [r13+8],0
+            0x4c, 0x89, 0x2b, // mov qword ptr [rbx],r13
+        };
+        if (memory_address != context.R13 or context.R13 == 0 or
+            context.Rbp != context.Rsp +% 0x70 or
+            !isGuestAddress(context.Rbx) or
+            !memory.isHostRangeWritable(context.Rbx, 12) or
+            memory.isHostRangeWritable(context.R13, 16))
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        @as(*align(1) u64, @ptrFromInt(context.Rbx)).* = 0;
+        @as(*align(1) u32, @ptrFromInt(context.Rbx + 8)).* = 0;
+        context.Rip += pattern.len;
+        return true;
+    }
+
+    fn tryDropCorruptAllocatorUnlink(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const epilogue_offset: u64 = 0xce;
+        if (!isGuestAddress(context.Rsi) or
+            !isGuestAddress(context.Rdx) or
+            isGuestAddress(memory_address) or
+            context.Rax != context.Rsi or
+            context.Rsi +% context.Rdx +% 0x10 != memory_address)
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x48, 0x8b, 0x4c, 0x16, 0x10, // mov rcx,qword ptr [rsi+rdx+0x10]
+            0xf6, 0xc1, 0x01, // test cl,1
+            0x0f, 0x84, 0xc0, 0x00, 0x00, 0x00, // je non-coalescing return
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        if (code[epilogue_offset] != 0xc3) return false;
+        context.Rip += epilogue_offset;
+        return true;
+    }
+
+    fn tryRepairInvalidFrameSlot(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const index_offset: u64 = 0x7410;
+        const inactive_slot_offset: u64 = 0x7628;
+        const indexed_slot_offset: u64 = 0x7638;
+        const slot_stride: u64 = 16;
+        const inactive_index: u32 = 3;
+
+        if (!isGuestAddress(context.R13) or
+            context.Rdi != context.R13 or
+            context.Rax > std.math.maxInt(u32) or
+            context.Rax <= inactive_index)
+        {
+            return false;
+        }
+        const expected_address = context.R13 +% context.Rax *% slot_stride +% indexed_slot_offset;
+        if (context.R14 != expected_address or memory_address != expected_address) return false;
+
+        const index_address = context.R13 +% index_offset;
+        const inactive_slot = context.R13 +% inactive_slot_offset;
+        if (!memory.isHostRangeReadable(index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(inactive_slot, @sizeOf(u32)))
+        {
+            return false;
+        }
+        const index: *u32 = @ptrFromInt(index_address);
+        if (index.* != @as(u32, @truncate(context.Rax))) return false;
+
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x41, 0xc7, 0x06, 0x01, 0x00, 0x00, 0x00, // mov dword ptr [r14],1
+            0x48, 0x8b, 0x7b, 0x50, // mov rdi,qword ptr [rbx+0x50]
+            0x48, 0x83, 0xc3, 0x50, // add rbx,0x50
+            0x48, 0x83, 0xc7, 0x48, // add rdi,0x48
+        };
+        for (pattern, 0..) |byte, pattern_index| {
+            if (code[pattern_index] != byte) return false;
+        }
+
+        index.* = inactive_index;
+        context.Rax = inactive_index;
+        context.R14 = inactive_slot;
+        return true;
+    }
+
+    fn tryRepairInvalidFrameSlotReference(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const index_offset: u64 = 0x7410;
+        const inactive_slot_offset: u64 = 0x7628;
+        const indexed_slot_offset: u64 = 0x7638;
+        const slot_stride: u64 = 16;
+        const inactive_index: u32 = 3;
+        const reload_offset: u64 = 9;
+
+        if (!isGuestAddress(context.R13) or
+            context.Rsi == 0 or
+            memory_address != context.Rsi +% 0x28)
+        {
+            return false;
+        }
+
+        const index_address = context.R13 +% index_offset;
+        const inactive_slot = context.R13 +% inactive_slot_offset;
+        if (!memory.isHostRangeReadable(index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(inactive_slot, @sizeOf(u32)) or
+            !memory.isHostRangeReadable(inactive_slot + 8, @sizeOf(u64)))
+        {
+            return false;
+        }
+        const index: *u32 = @ptrFromInt(index_address);
+        if (index.* <= inactive_index) return false;
+        const expected_slot = context.R13 +% @as(u64, index.*) *% slot_stride +% indexed_slot_offset;
+        if (context.R14 != expected_slot or
+            !memory.isHostRangeReadable(expected_slot + 8, @sizeOf(u64)))
+        {
+            return false;
+        }
+        const false_reference: *const u64 = @ptrFromInt(expected_slot + 8);
+        if (false_reference.* != context.Rsi) return false;
+
+        const inactive_reference: *const u64 = @ptrFromInt(inactive_slot + 8);
+        if (inactive_reference.* != 0 and
+            (!isGuestAddress(inactive_reference.*) or
+                !memory.isHostRangeWritable(inactive_reference.* +% 0x28, @sizeOf(u32))))
+        {
+            return false;
+        }
+
+        const reload_code: [*]const u8 = @ptrFromInt(context.Rip -% reload_offset);
+        const pattern = [_]u8{
+            0x49, 0x8b, 0x76, 0x08, // mov rsi,qword ptr [r14+8]
+            0x48, 0x85, 0xf6, // test rsi,rsi
+            0x74, 0x54, // je epilogue
+            0xf0, 0xff, 0x4e, 0x28, // lock dec dword ptr [rsi+0x28]
+            0x75, 0x46, // jne clear slot
+            0x48, 0x8b, 0x3d, 0xfb, 0xfd, 0xd1, 0x00, // mov rdi,qword ptr [rip+...]
+            0x48, 0x85, 0xff, // test rdi,rdi
+        };
+        for (pattern, 0..) |byte, pattern_index| {
+            if (reload_code[pattern_index] != byte) return false;
+        }
+
+        index.* = inactive_index;
+        const inactive_marker: *u32 = @ptrFromInt(inactive_slot);
+        inactive_marker.* = 1;
+        context.R14 = inactive_slot;
+        context.Rip -= reload_offset;
+        return true;
+    }
+
+    /// Finishes the exact AGC registration-list walk whose terminal link was
+    /// observed to contain packed event data. At the faulting CMP, RCX is the
+    /// candidate node. Advancing by the whole loop tail reaches the routine's
+    /// normal cleanup block at the same address as a null next pointer.
+    fn tryDropCorruptAgcInterruptListTail(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const pattern = [_]u8{
+            0x83, 0x79, 0x48, 0x01, // cmp dword ptr [rcx+0x48],1
+            0x74, 0xe4, // je previous-node path
+            0x48, 0x8b, 0x71, 0x20, // mov rsi,qword ptr [rcx+0x20]
+            0x48, 0x2b, 0x31, // sub rsi,qword ptr [rcx]
+            0x48, 0x01, 0xf0, // add rax,rsi
+            0x48, 0x89, 0x02, // mov qword ptr [rdx],rax
+            0x48, 0x8b, 0x49, 0x40, // mov rcx,qword ptr [rcx+0x40]
+            0x48, 0x85, 0xc9, // test rcx,rcx
+            0x75, 0xe4, // jne loop
+        };
+
+        // A sentinel immediately below a committed guest mapping can make the
+        // first `[rcx+0x48]` probe land on a mapped page even though the node
+        // base is unmapped. In that case the same loop faults later at `[rcx]`;
+        // match the remaining tail and take the identical normal cleanup exit.
+        const base_fault_offset = 10;
+        const partial_node = context.Rcx != 0 and memory_address == context.Rcx;
+        if (partial_node) {
+            const code: [*]const u8 = @ptrFromInt(context.Rip);
+            for (pattern[base_fault_offset..], 0..) |byte, index| {
+                if (code[index] != byte) return false;
+            }
+            context.Rcx = 0;
+            context.Rip += pattern.len - base_fault_offset;
+            return true;
+        }
+
+        const exact_field = memory_address == context.Rcx +% 0x48;
+        const poisoned_field = memory_address == std.math.maxInt(u64) and
+            !isCanonicalX64Address(context.Rcx);
+        if (!exact_field and !poisoned_field) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+
+        context.Rcx = 0;
+        context.Rip += pattern.len;
+        return true;
+    }
+
+    fn tryDropCorruptAgcCleanupListTail(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const exact_field = memory_address == context.R13 +% 0x48;
+        // Windows reports an access to a non-canonical x64 pointer as
+        // `0xffffffffffffffff`, rather than preserving the effective address.
+        // Packed AGC event data can leak into this second registration walk in
+        // exactly the same way as the interrupt-list loop handled above.
+        const poisoned_field = memory_address == std.math.maxInt(u64) and
+            !isCanonicalX64Address(context.R13);
+        if (!exact_field and !poisoned_field) return false;
+        const before: [*]const u8 = @ptrFromInt(context.Rip -% 9);
+        const prefix = [_]u8{
+            0x4d, 0x8b, 0x6d, 0x40, // mov r13,qword ptr [r13+0x40]
+            0x4d, 0x85, 0xed, // test r13,r13
+            0x74, 0x64, // je normal cleanup
+        };
+        for (prefix, 0..) |byte, index| {
+            if (before[index] != byte) return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x41, 0x83, 0x7d, 0x48, 0x00, // cmp dword ptr [r13+0x48],0
+            0x75, 0xf0, // jne next node
+            0x4d, 0x8b, 0x75, 0x00, // mov r14,qword ptr [r13]
+            0x4d, 0x63, 0x3c, 0x24, // movsxd r15,dword ptr [r12]
+            0x41, 0x8d, 0x5f, 0x01, // lea ebx,[r15+1]
+            0x41, 0x89, 0x1c, 0x24, // mov dword ptr [r12],ebx
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.R13 = 0;
+        context.Rip += 0x64;
+        return true;
+    }
+
+    /// Discards scalar and vector stores into the first page and steps past the instruction.
+    fn tryEmulateNullMemoryStore(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
+        if (memory_address >= lost_base_window) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        // C5 xx 11 /r and C5 xx 7F /r are the two-byte-VEX store forms of
+        // VMOVUPS/VMOVUPD/VMOVSS/VMOVSD and VMOVDQA/VMOVDQU. Unreal uses them
+        // while zero-initializing optional renderer buffers for which the
+        // scalar path below already discards first-page writes.
+        if (code[0] == 0xc5 and (code[2] == 0x11 or code[2] == 0x7f)) {
+            const modrm = code[3];
+            const mem_len = modrmMemoryOperandLength(modrm, code[4..]) orelse return false;
+            const length = 4 + mem_len;
+            if (length > 15) return false;
+            context.Rip += length;
+            return true;
+        }
+        var offset: usize = 0;
+        if (code[0] & 0xf0 == 0x40) offset = 1;
+        const opcode = code[offset];
+        // 88 /r MOV r/m8, r8 · 89 /r MOV r/m16/32/64, r · C6 /0 ib · C7 /0 id
+        if (opcode != 0x88 and opcode != 0x89 and opcode != 0xc6 and opcode != 0xc7) return false;
+        const modrm = code[offset + 1];
+        if (opcode == 0xc6 or opcode == 0xc7) {
+            if ((modrm >> 3) & 7 != 0) return false; // /0 = MOV
+        }
+        const mem_len = modrmMemoryOperandLength(modrm, code[offset + 2 ..]) orelse return false;
+        var length: usize = offset + 2 + mem_len;
+        if (opcode == 0xc6) length += 1;
+        if (opcode == 0xc7) {
+            // imm32 (or imm16 with 66 — treat as 4 for bring-up).
+            length += 4;
+        }
+        if (length > 15) return false;
+        context.Rip += length;
+        return true;
+    }
+
+    /// Treats execute-at-null / near-null as a callee that returned zero.
+    fn tryEmulateNullCallReturn(context: *std.os.windows.CONTEXT) bool {
+        if (!isNullControlTransfer(context.Rip)) return false;
+        // Pop the return address from the guest stack.
+        const rsp = context.Rsp;
+        if (rsp < 8 or rsp > std.math.maxInt(u64) - 8) return false;
+        const ret_ptr: *align(1) const u64 = @ptrFromInt(rsp);
+        const return_address = ret_ptr.*;
+        if (!isGuestAddress(return_address)) return false;
+        context.Rax = 0;
+        context.Rsp = rsp + 8;
+        context.Rip = return_address;
+        return true;
+    }
+
+    fn tryEmulateSyntheticStubCallReturn(context: *std.os.windows.CONTEXT) bool {
+        if (context.Rip != ensureNullObjectStub()) return false;
+        const rsp = context.Rsp;
+        if (rsp < 8 or rsp > std.math.maxInt(u64) - 8 or
+            !memory.isHostRangeReadable(rsp, @sizeOf(u64)))
+        {
+            return false;
+        }
+        const return_address = @as(*align(1) const u64, @ptrFromInt(rsp)).*;
+        if (!isGuestAddress(return_address)) return false;
+        context.Rax = 0;
+        context.Rsp = rsp + 8;
+        context.Rip = return_address;
+        return true;
+    }
+
+    /// Bytes following ModRM for a memory operand (SIB + displacement), or null
+    /// when the form is register-only / unsupported.
+    fn modrmMemoryOperandLength(modrm: u8, after_modrm: [*]const u8) ?usize {
+        const mod = modrm >> 6;
+        const rm = modrm & 7;
+        if (mod == 3) return null; // register form
+        var length: usize = 0;
+        if (rm == 4) {
+            // SIB present.
+            length += 1;
+            const sib = after_modrm[0];
+            const base = sib & 7;
+            if (mod == 0 and base == 5) length += 4; // disp32 with no base
+        } else if (mod == 0 and rm == 5) {
+            // RIP-relative: not a null-object field load we care about.
+            return null;
+        }
+        if (mod == 1) length += 1;
+        if (mod == 2) length += 4;
+        return length;
+    }
+
+    fn readGpr(context: *std.os.windows.CONTEXT, index: u4) u64 {
+        return switch (index) {
+            0 => context.Rax,
+            1 => context.Rcx,
+            2 => context.Rdx,
+            3 => context.Rbx,
+            4 => context.Rsp,
+            5 => context.Rbp,
+            6 => context.Rsi,
+            7 => context.Rdi,
+            8 => context.R8,
+            9 => context.R9,
+            10 => context.R10,
+            11 => context.R11,
+            12 => context.R12,
+            13 => context.R13,
+            14 => context.R14,
+            15 => context.R15,
+        };
+    }
+
+    fn writeGpr(context: *std.os.windows.CONTEXT, index: u4, value: u64) void {
+        switch (index) {
+            0 => context.Rax = value,
+            1 => context.Rcx = value,
+            2 => context.Rdx = value,
+            3 => context.Rbx = value,
+            4 => context.Rsp = value,
+            5 => context.Rbp = value,
+            6 => context.Rsi = value,
+            7 => context.Rdi = value,
+            8 => context.R8 = value,
+            9 => context.R9 = value,
+            10 => context.R10 = value,
+            11 => context.R11 = value,
+            12 => context.R12 = value,
+            13 => context.R13 = value,
+            14 => context.R14 = value,
+            15 => context.R15 = value,
+        }
+    }
+
+    fn tryEmulateIllegalInstruction(context: *std.os.windows.CONTEXT) bool {
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const instruction = x86_64_compat.decode(code) orelse return false;
+        switch (instruction.kind) {
+            .monitorx, .mwaitx => {},
+            .extrq => {
+                const destination = contextXmm(context, instruction.destination);
+                const result = x86_64_compat.extractBitField(
+                    destination.Low,
+                    instruction.field_length,
+                    instruction.field_index,
+                ) orelse return false;
+                destination.Low = result;
+                destination.High = 0;
+            },
+            .insertq => {
+                const destination = contextXmm(context, instruction.destination);
+                const source = contextXmm(context, instruction.source);
+                const result = x86_64_compat.insertBitField(
+                    destination.Low,
+                    source.Low,
+                    instruction.field_length,
+                    instruction.field_index,
+                ) orelse return false;
+                destination.Low = result;
+                destination.High = 0;
+            },
+        }
+        // MONITORX arms a cache-line monitor and MWAITX waits for a write or
+        // timeout. The compatibility path treats both as completed operations,
+        // preserving forward progress without blocking inside the VEH.
+        context.Rip += instruction.length;
+        return true;
+    }
+
+    fn contextXmm(
+        context: *std.os.windows.CONTEXT,
+        index: u8,
+    ) *std.os.windows.M128A {
+        std.debug.assert(index < 16);
+        const first = &context.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Xmm0;
+        const registers: [*]std.os.windows.M128A = @ptrCast(first);
+        return &registers[index];
+    }
+};
+
+fn isGuestAddress(address: u64) bool {
+    inline for (memory.guest_ranges) |range| {
+        if (range.contains(address, 1)) return true;
+    }
+    return false;
+}
+
+fn isCanonicalX64Address(address: u64) bool {
+    const sign = (address >> 47) & 1;
+    const upper = address >> 48;
+    return if (sign == 0) upper == 0 else upper == 0xffff;
+}
+
+/// Whether an instruction pointer looks like a jump through a null pointer.
+///
+/// The whole first page counts, not just zero: a null vtable slot or a callback
+/// reached through a struct field lands a little above it. No guest mapping
+/// exists there, so nothing legitimate is misclassified.
+fn isNullControlTransfer(address: u64) bool {
+    return address < memory.page_size;
+}
+
+test "a null instruction pointer is treated as guest control flow" {
+    // The fault a title hits when it calls a callback that was never
+    // registered. Declining to contain it loses every register that explains
+    // the failure.
+    try std.testing.expect(isNullControlTransfer(0));
+    try std.testing.expect(isNullControlTransfer(0x10));
+    try std.testing.expect(!isNullControlTransfer(memory.page_size));
+    // Real guest code stays out of the first page.
+    try std.testing.expect(!isGuestAddress(0));
+    try std.testing.expect(isGuestAddress(memory.system_managed.start));
+}
+
+test "integer stores at exact null are discarded" {
+    if (can_use_native_bridge) {
+        // mov qword ptr [rax], rdi
+        const code = [_]u8{ 0x48, 0x89, 0x38 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        try std.testing.expect(WindowsX64Machine.tryEmulateNullMemoryStore(&context, 0));
+        try std.testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+
+        context.Rip = @intFromPtr(&code);
+        try std.testing.expect(!WindowsX64Machine.tryEmulateNullMemoryStore(
+            &context,
+            WindowsX64Machine.lost_base_window,
+        ));
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "VEX vector stores into the first page are discarded" {
+    if (can_use_native_bridge) {
+        // vmovups ymmword ptr [rax], ymm0
+        const code = [_]u8{ 0xc5, 0xfc, 0x11, 0x00 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        try testing.expect(WindowsX64Machine.tryEmulateNullMemoryStore(&context, 0));
+        try testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+
+        // vmovdqu xmmword ptr [rdi], xmm0
+        const unaligned_integer = [_]u8{ 0xc5, 0xfa, 0x7f, 0x07 };
+        context.Rip = @intFromPtr(&unaligned_integer);
+        try testing.expect(WindowsX64Machine.tryEmulateNullMemoryStore(&context, 0));
+        try testing.expectEqual(@intFromPtr(&unaligned_integer) + unaligned_integer.len, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a dropped thread pointer is repaired, a null dereference is not" {
+    const shouldRestore = WindowsX64Machine.shouldRestoreFsBase;
+
+    // Windows loses a user-written FS base across a context switch, so the next
+    // thread-local access lands near zero through no fault of the guest.
+    try std.testing.expect(shouldRestore(0, 0x8000_0000, 0));
+    try std.testing.expect(shouldRestore(0x28, 0x8000_0000, 0));
+
+    // With the base intact, an access near zero is the guest's own mistake and
+    // has to be reported. This is also what stops the repair from looping: the
+    // retried instruction faults again with a base that is no longer zero.
+    try std.testing.expect(!shouldRestore(0x28, 0x8000_0000, 0x8000_0000));
+
+    // Outside the first page the base cannot be what went wrong: thread-local
+    // offsets are small and nothing maps that page.
+    try std.testing.expect(!shouldRestore(memory.page_size, 0x8000_0000, 0));
+
+    // A thread with no guest thread pointer has none to lose.
+    try std.testing.expect(!shouldRestore(0x28, 0, 0));
+}
+
+test "null base recovery decodes VEX2 and VEX3 memory operands" {
+    if (can_use_native_bridge) {
+        // vmovss dword ptr [rax+0x70], xmm0
+        const vex2 = [_]u8{ 0xc5, 0xfa, 0x11, 0x40, 0x70 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&vex2);
+        try std.testing.expect(WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0x70));
+        try std.testing.expectEqual(ensureNullObjectStub(), context.Rax);
+
+        // The inverted VEX.B bit extends the ModRM base from RAX to R8.
+        const vex3 = [_]u8{ 0xc4, 0xc1, 0x7a, 0x11, 0x40, 0x70 };
+        context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&vex3);
+        try std.testing.expect(WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0x70));
+        try std.testing.expectEqual(ensureNullObjectStub(), context.R8);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "synthetic null object covers large Unreal virtual tables" {
+    const base = ensureNullObjectStub();
+    const vtable = std.mem.readInt(
+        u64,
+        null_object_stub[0..@sizeOf(u64)],
+        .little,
+    );
+    try std.testing.expectEqual(base + null_object_vtable_offset, vtable);
+
+    const large_slot = null_object_vtable_offset + 0x3f0;
+    const target = std.mem.readInt(
+        u64,
+        null_object_stub[large_slot..][0..@sizeOf(u64)],
+        .little,
+    );
+    try std.testing.expectEqual(@as(u64, @intFromPtr(&nullObjectReturnThunk)), target);
+    try std.testing.expectEqual(
+        @as(u64, @intFromPtr(&nullObjectReturnThunk)),
+        std.mem.readInt(u64, null_object_stub[0xb8..][0..8], .little),
+    );
+}
+
+test "execution of the synthetic null object returns through the guest stack" {
+    if (can_use_native_bridge) {
+        const return_address = memory.system_managed.start + 0x1234;
+        var stack = [1]u64{return_address};
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = ensureNullObjectStub();
+        context.Rsp = @intFromPtr(&stack);
+        context.Rax = 0xffff_ffff_ffff_ffff;
+
+        try std.testing.expect(WindowsX64Machine.tryEmulateSyntheticStubCallReturn(&context));
+        try std.testing.expectEqual(return_address, context.Rip);
+        try std.testing.expectEqual(@as(u64, @intFromPtr(&stack) + 8), context.Rsp);
+        try std.testing.expectEqual(@as(u64, 0), context.Rax);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an unmapped optional linked-list payload follows its null branch" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{ 0x48, 0x8b, 0x42, 0x08, 0x48, 0x85, 0xc0, 0x74, 0x09 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0xfeed_face;
+        context.Rdx = 0x1_0078_5a4d;
+        try std.testing.expect(WindowsX64Machine.tryEmulateUnmappedOptionalPointerLoad(
+            &context,
+            context.Rdx + 8,
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0xfeed_face;
+        context.Rdx = 0xaaaa_aaaa_aaaa_aaaa;
+        try std.testing.expect(WindowsX64Machine.tryEmulateUnmappedOptionalPointerLoad(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a null list link reaches the loop sentinel instead of spinning" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{ 0x48, 0x8b, 0x49, 0x08, 0xff, 0xc0, 0x48, 0x39, 0xd1, 0x75, 0xf5 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = 0;
+        context.Rdx = 0x1234_5678;
+        try std.testing.expect(WindowsX64Machine.tryEmulateNullSentinelPointerLoad(&context, 8));
+        try std.testing.expectEqual(context.Rdx, context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a poisoned list link reaches the loop sentinel instead of faulting" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{ 0x48, 0x8b, 0x49, 0x08, 0xff, 0xc0, 0x48, 0x39, 0xd1, 0x75, 0xf5 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = 0xc0de_c0de_cafe_ba00;
+        context.Rdx = 0x1234_5678;
+        try std.testing.expect(WindowsX64Machine.tryEmulateNullSentinelPointerLoad(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(context.Rdx, context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a dequeued null work payload follows the queue cleanup path" {
+    if (can_use_native_bridge) {
+        var code: [0xb5]u8 = @splat(0xcc);
+        const dispatch_pattern = [_]u8{
+            0x48, 0x8b, 0x03,
+            0xff, 0x50, 0x28,
+            0x85, 0xc0, 0x74,
+            0x0d, 0x41, 0x83,
+            0x7e, 0x40, 0x00,
+        };
+        @memcpy(code[0..dispatch_pattern.len], &dispatch_pattern);
+        const cleanup_pattern = [_]u8{ 0x48, 0x85, 0xdb, 0x74, 0x09 };
+        @memcpy(code[0xb0..][0..cleanup_pattern.len], &cleanup_pattern);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rbx = 0;
+        try std.testing.expect(WindowsX64Machine.trySkipNullQueuedWorkItem(&context, 0));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0xb0, context.Rip);
+
+        context.Rip = @intFromPtr(&code);
+        context.Rbx = 0x1234;
+        try std.testing.expect(!WindowsX64Machine.trySkipNullQueuedWorkItem(&context, 0));
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a corrupt AGC interrupt registration tail reaches normal cleanup" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x83, 0x79, 0x48, 0x01,
+            0x74, 0xe4, 0x48, 0x8b,
+            0x71, 0x20, 0x48, 0x2b,
+            0x31, 0x48, 0x01, 0xf0,
+            0x48, 0x89, 0x02, 0x48,
+            0x8b, 0x49, 0x40, 0x48,
+            0x85, 0xc9, 0x75, 0xe4,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = 0xc005_5000_0000_0000;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAgcInterruptListTail(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a partially mapped AGC interrupt sentinel reaches normal cleanup" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x48, 0x2b, 0x31, 0x48,
+            0x01, 0xf0, 0x48, 0x89,
+            0x02, 0x48, 0x8b, 0x49,
+            0x40, 0x48, 0x85, 0xc9,
+            0x75, 0xe4,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = memory.system_managed.start - 1;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAgcInterruptListTail(
+            &context,
+            context.Rcx,
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a corrupt AGC cleanup registration tail reaches its null exit" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x4d, 0x8b, 0x6d, 0x40,
+            0x4d, 0x85, 0xed, 0x74,
+            0x64, 0x41, 0x83, 0x7d,
+            0x48, 0x00, 0x75, 0xf0,
+            0x4d, 0x8b, 0x75, 0x00,
+            0x4d, 0x63, 0x3c, 0x24,
+            0x41, 0x8d, 0x5f, 0x01,
+            0x41, 0x89, 0x1c, 0x24,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code) + 9;
+        context.R13 = 0xc00e_1000;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAgcCleanupListTail(
+            &context,
+            context.R13 + 0x48,
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.R13);
+        try std.testing.expectEqual(@intFromPtr(&code) + 9 + 0x64, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a packed AGC cleanup link reaches its null exit" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x4d, 0x8b, 0x6d, 0x40,
+            0x4d, 0x85, 0xed, 0x74,
+            0x64, 0x41, 0x83, 0x7d,
+            0x48, 0x00, 0x75, 0xf0,
+            0x4d, 0x8b, 0x75, 0x00,
+            0x4d, 0x63, 0x3c, 0x24,
+            0x41, 0x8d, 0x5f, 0x01,
+            0x41, 0x89, 0x1c, 0x24,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code) + 9;
+        context.R13 = 0x0023_0022_0021_0020;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAgcCleanupListTail(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.R13);
+        try std.testing.expectEqual(@intFromPtr(&code) + 9 + 0x64, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an out-of-range stale list link reaches its guest sentinel" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{ 0x48, 0x8b, 0x49, 0x08, 0xff, 0xc0, 0x48, 0x39, 0xd1, 0x75, 0xf5 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = 0xf000_0008e;
+        context.Rdx = memory.system_managed.start + 0x20_000;
+        try std.testing.expect(WindowsX64Machine.tryEmulateNullSentinelPointerLoad(
+            &context,
+            0xf000_00096,
+        ));
+        try std.testing.expectEqual(context.Rdx, context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a tagged dangling shared reference becomes optional null" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0xf0, 0xff, 0x40, 0x18,
+            0x48, 0x8b, 0x42, 0x08,
+            0x48, 0x89, 0x47, 0x08,
+            0x8b, 0x82, 0x04, 0x4e,
+            0x00, 0x00,
+        };
+        const guest_pointer = memory.system_managed.start + 0x20_000;
+        const tagged_pointer = guest_pointer | (@as(u64, 0x3c) << 48);
+        var source_field = tagged_pointer;
+        var destination_field = tagged_pointer;
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = tagged_pointer;
+        context.Rdx = @intFromPtr(&source_field) - 0x4e20;
+        context.Rdi = @intFromPtr(&destination_field) - 0x4e20;
+        try std.testing.expect(WindowsX64Machine.tryDropInvalidSharedReference(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@as(u64, 0), destination_field);
+        try std.testing.expectEqual(@as(u64, 0), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a dangling optional map follows the exact empty-map branch" {
+    if (can_use_native_bridge) {
+        var code: [0xc7]u8 = @splat(0);
+        const pattern = [_]u8{
+            0x44, 0x8b, 0x51, 0x08,
+            0x44, 0x69, 0xdf, 0xb5,
+            0xfd, 0x97, 0x54, 0x4c,
+            0x8b, 0x31, 0x44, 0x89,
+            0xd6, 0x44, 0x21, 0xde,
+            0x41, 0x83, 0xe3, 0xfc,
+        };
+        @memcpy(code[0..pattern.len], &pattern);
+        const empty_branch = [_]u8{ 0x4c, 0x89, 0xe3, 0x45, 0x31, 0xe4 };
+        @memcpy(code[0xc1..][0..empty_branch.len], &empty_branch);
+
+        var map_field: u64 = 0xbe01_e8c6_863f_2b45;
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = map_field;
+        context.R10 = @intFromPtr(&map_field) - 0x5dd8;
+        try std.testing.expect(WindowsX64Machine.trySkipInvalidOptionalMap(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0xc1, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "packed table data returns the leaf lookup fallback" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x0f, 0xb7, 0x74, 0x4f, 0x2e,
+            0x39, 0xd6, 0x76, 0x10, 0x48,
+            0x8b, 0x44, 0xcf, 0x08, 0x89,
+            0xd1, 0x0f, 0xb7, 0x04, 0x48,
+            0x25, 0xff, 0x7f, 0x00, 0x00,
+            0xc3,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0x20206_7fff;
+        context.Rdi = 0x0004_a3ac_0000_0054;
+        context.Rsi = 3;
+        context.Rcx = 3;
+        try std.testing.expect(WindowsX64Machine.tryReturnInvalidPackedTableFallback(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x19, context.Rip);
+        try std.testing.expectEqual(@as(u64, 0x20206_7fff), context.Rax);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a near-null hash key uses zero across the first-page boundary" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x4c, 0x8b, 0x0a,
+            0x45, 0x69, 0xe1,
+            0xb5, 0xfd, 0x97,
+            0x54, 0x45, 0x89,
+            0xe2, 0x45, 0x21,
+            0xf4,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rdx = 0x1004;
+        context.R9 = 0xfeed_face;
+        try std.testing.expect(WindowsX64Machine.tryEmulateNearNullHashKeyLoad(&context, 0x1004));
+        try std.testing.expectEqual(@as(u64, 0), context.R9);
+        try std.testing.expectEqual(@intFromPtr(&code) + 3, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an unmapped allocator candidate follows the existing fallback lookup" {
+    if (can_use_native_bridge) {
+        var code: [0xfd]u8 = @splat(0);
+        const pattern = [_]u8{
+            0x4d, 0x8b, 0xac, 0xc7, 0xf0, 0x19, 0x00, 0x00,
+            0xb8, 0x00, 0x00, 0x00, 0x00, 0x49, 0x81, 0xfd,
+            0x01, 0x02, 0x00, 0x00, 0x4c, 0x0f, 0x42, 0xe8,
+        };
+        @memcpy(code[0..pattern.len], &pattern);
+        const fallback_pattern = [_]u8{
+            0x4c, 0x89, 0xff,
+            0x48, 0x89, 0xde,
+            0xe8, 0x26, 0x01,
+            0x00, 0x00,
+        };
+        @memcpy(code[0xf2..][0..fallback_pattern.len], &fallback_pattern);
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0x20;
+        context.R15 = memory.system_managed.start + 0x20_000;
+        context.R13 = 0xfeed_face;
+        const address = context.R15 + context.Rax * 8 + 0x19f0;
+        try std.testing.expect(WindowsX64Machine.trySkipUnmappedAllocatorCandidate(&context, address));
+        try std.testing.expectEqual(@as(u64, 0xfeed_face), context.R13);
+        try std.testing.expectEqual(@intFromPtr(&code) + 0xf2, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an unmapped sparse metadata record leaves its mask bit clear" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x0f, 0xb7, 0x18,
+            0x8b, 0x78, 0xfc,
+            0x48, 0x09, 0xdf,
+            0x74, 0xe3,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = memory.system_managed.start + 0x20_000;
+        context.Rbx = 0xfeed;
+        context.Rdi = 0xbeef;
+        try std.testing.expect(WindowsX64Machine.tryEmulateUnmappedSparseMetadataLoad(
+            &context,
+            context.Rax,
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rbx);
+        try std.testing.expectEqual(@as(u64, 0), context.Rdi);
+        try std.testing.expectEqual(@intFromPtr(&code) + 6, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an oversized sparse metadata scan is rebuilt from its fixed table" {
+    if (can_use_native_bridge) {
+        var object: [0x6000]u8 align(16) = @splat(0);
+        const object_address = @intFromPtr(&object);
+        const group: u64 = 3;
+        const table_address = object_address + 0x3f04 + group * 0x100;
+        const mask_address = object_address + 0x4d00 + group * @sizeOf(u32);
+        const last_index_address = object_address + 0x4d1c + group * @sizeOf(u32);
+        const corrupt_last_index: u32 = 0x0f67_9e5c;
+
+        const first_flags: *u32 = @ptrFromInt(table_address - @sizeOf(u32));
+        const sixth_tag: *u16 = @ptrFromInt(table_address + 5 * 0x10);
+        const last_flags: *u32 = @ptrFromInt(table_address + 15 * 0x10 - @sizeOf(u32));
+        first_flags.* = 1;
+        sixth_tag.* = 2;
+        last_flags.* = 3;
+        const stored_mask: *u32 = @ptrFromInt(mask_address);
+        const stored_last_index: *u32 = @ptrFromInt(last_index_address);
+        stored_mask.* = std.math.maxInt(u32);
+        stored_last_index.* = corrupt_last_index;
+
+        var code: [0x120]u8 = @splat(0);
+        const outer_pattern = [_]u8{
+            0x48, 0xff, 0xc6,
+            0x49, 0x81, 0xc2,
+            0x00, 0x02, 0x00,
+            0x00, 0x49, 0x81,
+            0xc3, 0x00, 0x02,
+            0x00, 0x00, 0x49,
+            0x81, 0xc1, 0x00,
+            0x01, 0x00, 0x00,
+            0x48, 0x83, 0xfe,
+            0x07,
+        };
+        @memcpy(code[0..outer_pattern.len], &outer_pattern);
+        const setup_pattern = [_]u8{
+            0x41, 0xc7, 0x84, 0xb7, 0x00, 0x4d, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x45, 0x8b, 0xa4, 0xb7,
+            0x1c, 0x4d, 0x00, 0x00, 0x45, 0x85, 0xe4, 0x0f,
+            0x88, 0x13, 0xff, 0xff, 0xff, 0x49, 0xff, 0xc4,
+            0x4c, 0x89, 0xc8, 0x31, 0xd2, 0x31, 0xc9, 0xeb,
+            0x17,
+        };
+        @memcpy(code[0xd0..][0..setup_pattern.len], &setup_pattern);
+        const scan_pattern = [_]u8{
+            0x0f, 0xb7, 0x18,
+            0x8b, 0x78, 0xfc,
+            0x48, 0x09, 0xdf,
+            0x74, 0xe5, 0x0f,
+            0xab, 0xca, 0x41,
+            0x89,
+        };
+        @memcpy(code[0x110..][0..scan_pattern.len], &scan_pattern);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code) + 0x110;
+        context.R15 = object_address;
+        context.Rsi = group;
+        context.R9 = table_address;
+        context.Rcx = 0x20;
+        context.Rax = table_address + context.Rcx * 0x10;
+        context.R12 = @as(u64, corrupt_last_index) + 1;
+        context.Rdx = std.math.maxInt(u64);
+
+        try std.testing.expect(WindowsX64Machine.tryRepairOversizedSparseMetadataScan(
+            &context,
+            context.Rax,
+        ));
+        const expected_mask = (@as(u32, 1) << 0) | (@as(u32, 1) << 5) | (@as(u32, 1) << 15);
+        try std.testing.expectEqual(expected_mask, stored_mask.*);
+        try std.testing.expectEqual(@as(u32, 15), stored_last_index.*);
+        try std.testing.expectEqual(@as(u64, expected_mask), context.Rdx);
+        try std.testing.expectEqual(@as(u64, 16), context.R12);
+        try std.testing.expectEqual(@intFromPtr(&code), context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an absent hash backing returns its empty bucket marker" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x41, 0x8b, 0x14, 0x06,
+            0x44, 0x39, 0xda, 0x75,
+            0x09, 0x4c, 0x01, 0xf0,
+            0x48, 0x39, 0x78, 0x08,
+            0x74, 0x54, 0x83, 0xfa,
+            0xff, 0x74, 0x46,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0;
+        context.R14 = std.math.maxInt(u64);
+        try std.testing.expect(WindowsX64Machine.tryEmulateEmptyHashBucketLoad(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@as(u64, 0xffff_ffff), context.Rdx);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an unmapped alternate hash backing returns its empty bucket marker" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x42, 0x8b, 0x04, 0x19,
+            0x44, 0x39, 0xf8, 0x75,
+            0x0a, 0x4a, 0x8d, 0x3c,
+            0x19, 0x4c, 0x39, 0x77,
+            0x08, 0x74, 0x4b, 0x83,
+            0xf8, 0xff, 0x74, 0x3d,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = memory.user.start + 0x20_001;
+        context.R11 = 0x40;
+        context.Rax = 0xfeed_face;
+        try std.testing.expect(WindowsX64Machine.tryEmulateEmptyHashBucketLoad(
+            &context,
+            context.Rcx + context.R11,
+        ));
+        try std.testing.expectEqual(@as(u64, 0xffff_ffff), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an unmapped AGC buffer returns the validator's encoded error" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x80, 0x7e, 0x5a, 0x02,
+            0xb8, 0x08, 0x00, 0x6c,
+            0x8a, 0x75, 0x15, 0x48,
+            0x85, 0xd2, 0x74, 0x0b,
+            0x80, 0x7a, 0x5a, 0x01,
+            0xb8, 0x08, 0x00, 0x6c,
+            0x8a, 0x75, 0x05, 0xe9,
+            0x27, 0x3b, 0x68, 0x01,
+            0xc3,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0x8a6c_000a;
+        context.Rsi = memory.system_reserved.start + 0x100;
+        try std.testing.expect(WindowsX64Machine.tryRejectUnmappedAgcBuffer(
+            &context,
+            context.Rsi + 0x5a,
+        ));
+        try std.testing.expectEqual(@as(u64, 0x8a6c_000a), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x20, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a non-canonical Unreal allocator head takes the slow allocation path" {
+    if (can_use_native_bridge) {
+        var address_space = try memory.AddressSpace.init(std.testing.allocator);
+        defer address_space.deinit();
+
+        const allocator = memory.system_managed.start + 0x20_000;
+        try address_space.mapFixed(
+            allocator,
+            memory.page_size,
+            .read_write,
+            .private,
+            null,
+        );
+        const bucket_offset: u64 = 0x40;
+        const bucket = allocator + bucket_offset;
+        const invalid_head: u64 = 0x3f80_0000_0000_0000;
+        try address_space.writeInt(u64, bucket, invalid_head);
+        try address_space.writeInt(u32, bucket + 8, 4);
+
+        const code = [_]u8{
+            0x48, 0x8b, 0x01,
+            0x48, 0x89, 0x06,
+            0x48, 0x89, 0xc8,
+            0x48, 0x83, 0xc4,
+            0x08, 0x5b, 0x41,
+            0x5e, 0x41, 0x5f,
+            0x5d, 0xc3, 0x4c,
+            0x89, 0xff, 0x48,
+            0x89, 0xde, 0x44,
+            0x89, 0xf2, 0x48,
+            0x83, 0xc4, 0x08,
+            0x5b, 0x41, 0x5e,
+            0x41, 0x5f, 0x5d,
+            0xe9,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = allocator;
+        context.Rbx = 0x1700;
+        context.Rcx = invalid_head;
+        context.Rdx = bucket_offset;
+        context.Rsi = bucket;
+        context.R14 = 4;
+        context.R15 = memory.system_managed.start + 0x100;
+
+        try std.testing.expect(WindowsX64Machine.tryFallbackInvalidAllocatorHead(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x14, context.Rip);
+        try std.testing.expectEqual(@as(u32, 0), @as(*const u32, @ptrFromInt(bucket + 8)).*);
+        try std.testing.expectEqual(@as(u64, 0), @as(*const u64, @ptrFromInt(bucket)).*);
+
+        const canonical_invalid_head: u64 = 0x3f80_0000;
+        try address_space.writeInt(u64, bucket, canonical_invalid_head);
+        try address_space.writeInt(u32, bucket + 8, 7);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = canonical_invalid_head;
+        try std.testing.expect(WindowsX64Machine.tryFallbackInvalidAllocatorHead(
+            &context,
+            canonical_invalid_head,
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x14, context.Rip);
+        try std.testing.expectEqual(@as(u32, 0), @as(*const u32, @ptrFromInt(bucket + 8)).*);
+        try std.testing.expectEqual(@as(u64, 0), @as(*const u64, @ptrFromInt(bucket)).*);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an invalid Unity frame index retries through its inactive slot" {
+    if (can_use_native_bridge) {
+        var address_space = try memory.AddressSpace.init(std.testing.allocator);
+        defer address_space.deinit();
+
+        const object_address = memory.system_managed.start + 0x20_000;
+        try address_space.mapFixed(
+            object_address,
+            memory.page_size * 2,
+            .read_write,
+            .private,
+            null,
+        );
+
+        const code = [_]u8{
+            0x41, 0xc7, 0x06, 0x01, 0x00, 0x00, 0x00,
+            0x48, 0x8b, 0x7b, 0x50, 0x48, 0x83, 0xc3,
+            0x50, 0x48, 0x83, 0xc7, 0x48,
+        };
+        const invalid_index: u32 = 0x27d7_de90;
+        const index_address = object_address + 0x7410;
+        const inactive_slot = object_address + 0x7628;
+        try address_space.writeInt(u32, index_address, invalid_index);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = invalid_index;
+        context.Rdi = object_address;
+        context.R13 = object_address;
+        context.R14 = object_address + @as(u64, invalid_index) * 16 + 0x7638;
+        try std.testing.expect(WindowsX64Machine.tryRepairInvalidFrameSlot(
+            &context,
+            context.R14,
+        ));
+        const stored_index: *const u32 = @ptrFromInt(index_address);
+        try std.testing.expectEqual(@as(u32, 3), stored_index.*);
+        try std.testing.expectEqual(@as(u64, 3), context.Rax);
+        try std.testing.expectEqual(inactive_slot, context.R14);
+        try std.testing.expectEqual(@intFromPtr(&code), context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a mapped false Unity frame slot rebinds cleanup to the inactive slot" {
+    if (can_use_native_bridge) {
+        var address_space = try memory.AddressSpace.init(std.testing.allocator);
+        defer address_space.deinit();
+
+        const object_address = memory.system_managed.start + 0x20_000;
+        try address_space.mapFixed(
+            object_address,
+            memory.page_size * 4,
+            .read_write,
+            .private,
+            null,
+        );
+
+        const code = [_]u8{
+            0x49, 0x8b, 0x76, 0x08,
+            0x48, 0x85, 0xf6, 0x74,
+            0x54, 0xf0, 0xff, 0x4e,
+            0x28, 0x75, 0x46, 0x48,
+            0x8b, 0x3d, 0xfb, 0xfd,
+            0xd1, 0x00, 0x48, 0x85,
+            0xff,
+        };
+        const invalid_index: u32 = 0x242;
+        const invalid_reference: u64 = 0x4_0000_01c5;
+        const index_address = object_address + 0x7410;
+        const inactive_slot = object_address + 0x7628;
+        const false_slot = object_address + @as(u64, invalid_index) * 16 + 0x7638;
+        const valid_reference = object_address + 0xb000;
+        try address_space.writeInt(u32, index_address, invalid_index);
+        try address_space.writeInt(u64, false_slot + 8, invalid_reference);
+        try address_space.writeInt(u64, inactive_slot + 8, valid_reference);
+        try address_space.writeInt(u32, valid_reference + 0x28, 1);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code) + 9;
+        context.R13 = object_address;
+        context.R14 = false_slot;
+        context.Rsi = invalid_reference;
+        try std.testing.expect(WindowsX64Machine.tryRepairInvalidFrameSlotReference(
+            &context,
+            invalid_reference + 0x28,
+        ));
+
+        const stored_index: *const u32 = @ptrFromInt(index_address);
+        const inactive_marker: *const u32 = @ptrFromInt(inactive_slot);
+        try std.testing.expectEqual(@as(u32, 3), stored_index.*);
+        try std.testing.expectEqual(@as(u32, 1), inactive_marker.*);
+        try std.testing.expectEqual(inactive_slot, context.R14);
+        try std.testing.expectEqual(@intFromPtr(&code), context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a corrupt allocator header abandons the exact command-buffer free" {
+    if (can_use_native_bridge) {
+        var code: [0x182]u8 = @splat(0);
+        const pattern = [_]u8{
+            0x48, 0x89, 0x1c, 0x30,
+            0x80, 0x4c, 0x30, 0x08,
+            0x02, 0x48, 0x8b, 0x46,
+            0xf8, 0x48, 0x89, 0xc1,
+        };
+        @memcpy(code[0..pattern.len], &pattern);
+        const epilogue = [_]u8{ 0x5b, 0x41, 0x5e, 0x5d, 0xc3 };
+        @memcpy(code[0x17d..][0..epilogue.len], &epilogue);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = memory.user.end - 0x20_000;
+        context.Rsi = memory.system_managed.start;
+        context.Rbx = context.Rsi - 0x10;
+        context.Rsp = 0x1000;
+        context.Rbp = context.Rsp + 0x10;
+        const address = context.Rax + context.Rsi;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAllocatorFree(
+            &context,
+            address,
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x17d, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an invalid allocator insert leaves the bucket empty" {
+    if (can_use_native_bridge) {
+        var address_space = try memory.AddressSpace.init(std.testing.allocator);
+        defer address_space.deinit();
+
+        const bucket = memory.system_managed.start + 0x20_000;
+        try address_space.mapFixed(
+            bucket,
+            memory.page_size,
+            .read_write,
+            .private,
+            null,
+        );
+        try address_space.writeInt(u64, bucket, memory.system_managed.start + 0x40_000);
+        try address_space.writeInt(u32, bucket + 8, 9);
+        const code = [_]u8{
+            0x49, 0x89, 0x45, 0x00,
+            0x49, 0xc7, 0x45, 0x08,
+            0x00, 0x00, 0x00, 0x00,
+            0x4c, 0x89, 0x2b,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        // The invalid node can carry a non-null next pointer. It is still
+        // unsafe to insert when the node itself is outside writable memory.
+        context.Rax = memory.system_managed.start + 0x60_000;
+        context.Rbx = bucket;
+        context.R13 = memory.system_managed.start + 0x40_000;
+        context.Rsp = 0x1000;
+        context.Rbp = context.Rsp + 0x70;
+
+        try std.testing.expect(WindowsX64Machine.tryDropInvalidAllocatorInsert(
+            &context,
+            context.R13,
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+        try std.testing.expectEqual(@as(u64, 0), @as(*const u64, @ptrFromInt(bucket)).*);
+        try std.testing.expectEqual(@as(u32, 0), @as(*const u32, @ptrFromInt(bucket + 8)).*);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an absolute allocator size abandons the exact free-list unlink" {
+    if (can_use_native_bridge) {
+        var code: [0xcf]u8 = @splat(0);
+        const pattern = [_]u8{
+            0x48, 0x8b, 0x4c, 0x16, 0x10,
+            0xf6, 0xc1, 0x01, 0x0f, 0x84,
+            0xc0, 0x00, 0x00, 0x00,
+        };
+        @memcpy(code[0..pattern.len], &pattern);
+        code[0xce] = 0xc3;
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rsi = memory.system_managed.start + 0x20_000;
+        context.Rdx = memory.user.end - 0x20_000;
+        context.Rax = context.Rsi;
+        const address = context.Rsi +% context.Rdx +% 0x10;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAllocatorUnlink(
+            &context,
+            address,
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0xce, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+extern fn ps5NativeCallWindowsX64(
+    frame: *NativeCallFrame,
+    entry_point: u64,
+    stack_pointer: u64,
+) callconv(.winapi) u64;
+
+extern fn ps5NativeEscapeWindowsX64(frame: *NativeCallFrame) callconv(.winapi) noreturn;
+
+comptime {
+    if (can_use_native_bridge) asm (
+        \\.text
+        \\.p2align 4
+        \\.globl ps5NativeCallWindowsX64
+        \\ps5NativeCallWindowsX64:
+        \\  movq %rsp, 0(%rcx)
+        \\  rdfsbase %rax
+        \\  movq %rax, 8(%rcx)
+        \\  movq %rbx, 16(%rcx)
+        \\  movq %rbp, 24(%rcx)
+        \\  movq %rsi, 32(%rcx)
+        \\  movq %rdi, 40(%rcx)
+        \\  movq %r12, 48(%rcx)
+        \\  movq %r13, 56(%rcx)
+        \\  movq %r14, 64(%rcx)
+        \\  movq %r15, 72(%rcx)
+        \\  stmxcsr 100(%rcx)
+        \\  fnstcw 104(%rcx)
+        \\  movdqu %xmm6, 112(%rcx)
+        \\  movdqu %xmm7, 128(%rcx)
+        \\  movdqu %xmm8, 144(%rcx)
+        \\  movdqu %xmm9, 160(%rcx)
+        \\  movdqu %xmm10, 176(%rcx)
+        \\  movdqu %xmm11, 192(%rcx)
+        \\  movdqu %xmm12, 208(%rcx)
+        \\  movdqu %xmm13, 224(%rcx)
+        \\  movdqu %xmm14, 240(%rcx)
+        \\  movdqu %xmm15, 256(%rcx)
+        \\  movq %rdx, %r11
+        \\  movq %rcx, %r15
+        \\  movq 80(%r15), %r10
+        \\  wrfsbase %r10
+        \\  testq %r8, %r8
+        \\  jz 1f
+        \\  movq %r8, %rsp
+        \\1:
+        \\  andq $-16, %rsp
+        \\  movq 288(%r15), %rdi
+        \\  movq 296(%r15), %rsi
+        \\  movq 304(%r15), %rdx
+        \\  movq 312(%r15), %rcx
+        \\  movq 320(%r15), %r8
+        \\  movq 328(%r15), %r9
+        \\  xorl %eax, %eax
+        \\  callq *%r11
+        \\  movq %rax, 88(%r15)
+        \\  movq 8(%r15), %r10
+        \\  wrfsbase %r10
+        \\  movq %r15, %r10
+        \\  movq 0(%r10), %rsp
+        \\  ldmxcsr 100(%r10)
+        \\  fldcw 104(%r10)
+        \\  movdqu 112(%r10), %xmm6
+        \\  movdqu 128(%r10), %xmm7
+        \\  movdqu 144(%r10), %xmm8
+        \\  movdqu 160(%r10), %xmm9
+        \\  movdqu 176(%r10), %xmm10
+        \\  movdqu 192(%r10), %xmm11
+        \\  movdqu 208(%r10), %xmm12
+        \\  movdqu 224(%r10), %xmm13
+        \\  movdqu 240(%r10), %xmm14
+        \\  movdqu 256(%r10), %xmm15
+        \\  movq 88(%r10), %rax
+        \\  movq 16(%r10), %rbx
+        \\  movq 24(%r10), %rbp
+        \\  movq 32(%r10), %rsi
+        \\  movq 40(%r10), %rdi
+        \\  movq 48(%r10), %r12
+        \\  movq 56(%r10), %r13
+        \\  movq 64(%r10), %r14
+        \\  movq 72(%r10), %r15
+        \\  retq
+        \\.p2align 4
+        \\.globl ps5NativeEscapeWindowsX64
+        \\ps5NativeEscapeWindowsX64:
+        \\  movq $0, 88(%rcx)
+        \\  movq 8(%rcx), %r10
+        \\  wrfsbase %r10
+        \\  movq %rcx, %r10
+        \\  movq 0(%r10), %rsp
+        \\  ldmxcsr 100(%r10)
+        \\  fldcw 104(%r10)
+        \\  movdqu 112(%r10), %xmm6
+        \\  movdqu 128(%r10), %xmm7
+        \\  movdqu 144(%r10), %xmm8
+        \\  movdqu 160(%r10), %xmm9
+        \\  movdqu 176(%r10), %xmm10
+        \\  movdqu 192(%r10), %xmm11
+        \\  movdqu 208(%r10), %xmm12
+        \\  movdqu 224(%r10), %xmm13
+        \\  movdqu 240(%r10), %xmm14
+        \\  movdqu 256(%r10), %xmm15
+        \\  xorl %eax, %eax
+        \\  movq 16(%r10), %rbx
+        \\  movq 24(%r10), %rbp
+        \\  movq 32(%r10), %rsi
+        \\  movq 40(%r10), %rdi
+        \\  movq 48(%r10), %r12
+        \\  movq 56(%r10), %r13
+        \\  movq 64(%r10), %r14
+        \\  movq 72(%r10), %r15
+        \\  retq
+    );
+}
+
+const KeyState = struct {
+    used: bool = false,
+    key: u64 = 0,
+    wake_epoch: u32 align(@alignOf(u32)) = 1,
+    latest_sequence: u64 = 0,
+    pending_wakes: usize = 0,
+};
+
+const PendingException = struct {
+    target_thread: u64 = 0,
+    handler: u64 = 0,
+    exception_type: i32 = 0,
+};
+
+const Worker = struct {
+    dispatcher: *Dispatcher,
+    request: threading.StartRequest,
+    host_thread: ?std.Thread = null,
+    result: u64 = 0,
+    finished: bool = false,
+    detached: bool,
+    joining: bool = false,
+    interrupt_sent: bool = false,
+    execution_failed: bool = false,
+};
+
+const ActiveExecution = struct {
+    dispatcher: *Dispatcher,
+    thread_handle: u64,
+    context: threading.ThreadContext,
+    stack_address: u64,
+    stack_size: u64,
+    guard_size: u64,
+    exit_requested: bool = false,
+    exit_result: u64 = 0,
+};
+
+threadlocal var active_execution: ?ActiveExecution = null;
+
+/// PS5 exception callbacks receive mcontext directly: RSP is at +0xf8,
+/// including the reserved words between RFLAGS and RSP. Firmware executes on
+/// a different stack, so its locals cannot stand in for the interrupted RSP.
+fn writeGuestSignalContext(
+    context: *[0x4c0]u8,
+    suspended: ?*const hle.host_stack.SuspendedStack,
+    fs_base: u64,
+) void {
+    @memset(context, 0);
+    if (suspended) |saved| {
+        inline for (.{
+            .{ 0x40, "rbx" },            .{ 0x48, "rbp" }, .{ 0x60, "r12" },
+            .{ 0x68, "r13" },            .{ 0x70, "r14" }, .{ 0x78, "r15" },
+            .{ 0xa0, "return_address" },
+        }) |field| std.mem.writeInt(u64, context[field[0]..][0..8], @field(saved, field[1]), .little);
+    }
+    // Without a switched firmware stack, delivery already runs below the
+    // guest frames. With one, include both the saved GPRs and every guest frame.
+    const stack_pointer = if (suspended) |saved| @intFromPtr(saved) else @intFromPtr(context);
+    std.mem.writeInt(u64, context[0xf8..][0..8], stack_pointer, .little);
+    std.mem.writeInt(u64, context[0x108..][0..8], context.len, .little);
+    std.mem.writeInt(u64, context[0x480..][0..8], fs_base, .little);
+}
+
+pub const Dispatcher = struct {
+    allocator: std.mem.Allocator = undefined,
+    io: std.Io = undefined,
+    manager: *threading.Manager = undefined,
+    bridge: Bridge = undefined,
+    workers: std.ArrayList(*Worker) = .empty,
+    key_states: []KeyState = &.{},
+    pending_exceptions: [pending_exception_capacity]PendingException =
+        [_]PendingException{.{}} ** pending_exception_capacity,
+    lock: Lock = .{},
+    wake_epoch: u32 align(@alignOf(u32)) = 1,
+    saturated_keys: bool = false,
+    shutting_down: bool = false,
+    wait_diagnostics_enabled: bool = false,
+    initialized: bool = false,
+
+    /// Initializes a stable, caller-owned dispatcher and attaches its pthread
+    /// backend. The value must not move while guest execution is active.
+    pub fn init(
+        self: *Dispatcher,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        manager: *threading.Manager,
+        bridge: Bridge,
+    ) Error!void {
+        if (self.initialized) return error.AlreadyInitialized;
+        if (manager.hasBackend()) return error.DispatcherBusy;
+        const states = try allocator.alloc(KeyState, key_state_capacity);
+        @memset(states, .{});
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .manager = manager,
+            .bridge = bridge,
+            .key_states = states,
+            .initialized = true,
+        };
+        manager.setBackend(self.backend());
+    }
+
+    /// Enables deliberately noisy scheduler diagnostics for a title run.
+    /// Normal gameplay keeps them off: many parked engine workers can reach a
+    /// diagnostic threshold together and serialize on the host console.
+    pub fn setWaitDiagnostics(self: *Dispatcher, enabled: bool) void {
+        self.wait_diagnostics_enabled = enabled;
+    }
+
+    /// Stops accepting work, requests every bridge execution to unwind, then
+    /// joins all host workers before detaching from the pthread manager.
+    pub fn deinit(self: *Dispatcher) void {
+        if (!self.initialized) return;
+        self.manager.setBackend(null);
+
+        self.lock.lock();
+        self.shutting_down = true;
+        self.lock.unlock();
+        self.publishAllKeyWakes();
+
+        // Do not call bridge code under the dispatcher lock. An interrupt may
+        // synchronously unwind through HLE and finish the same worker.
+        while (true) {
+            self.lock.lock();
+            var handle: ?u64 = null;
+            for (self.workers.items) |worker| {
+                if (worker.finished or worker.interrupt_sent) continue;
+                worker.interrupt_sent = true;
+                handle = worker.request.thread_handle;
+                break;
+            }
+            self.lock.unlock();
+            const thread_handle = handle orelse break;
+            self.bridge.interrupt(thread_handle);
+        }
+
+        while (true) {
+            self.lock.lock();
+            const worker = if (self.workers.items.len == 0)
+                null
+            else
+                self.workers.pop();
+            self.lock.unlock();
+            const current = worker orelse break;
+            if (current.host_thread) |host_thread| host_thread.join();
+            self.allocator.destroy(current);
+        }
+
+        self.workers.deinit(self.allocator);
+        self.allocator.free(self.key_states);
+        self.* = .{};
+    }
+
+    pub fn backend(self: *Dispatcher) threading.Backend {
+        return .{
+            .context = self,
+            .start_fn = &start,
+            .join_fn = &join,
+            .detach_fn = &detach,
+            .yield_fn = &yield,
+            .sleep_fn = &sleep,
+            .wait_fn = &wait,
+            .wake_fn = &wake,
+            .call_fn = &call,
+            .raise_exception_fn = &raiseGuestException,
+            .request_exit_fn = &requestExit,
+        };
+    }
+
+    pub fn isInitialized(self: *const Dispatcher) bool {
+        return self.initialized;
+    }
+
+    /// Executes the initial process thread on the caller's host worker.
+    /// Callers retain ownership of `prepared` and release it afterwards.
+    pub fn dispatchInitial(
+        self: *Dispatcher,
+        prepared: threading.PreparedThread,
+        entry_point: u64,
+        arguments: []const u64,
+    ) Error!u64 {
+        return self.dispatchPrepared(
+            prepared,
+            .process_entry,
+            entry_point,
+            arguments,
+            null,
+            true,
+        );
+    }
+
+    /// Executes the process entry with a caller-built initial stack frame.
+    pub fn dispatchInitialAtStack(
+        self: *Dispatcher,
+        prepared: threading.PreparedThread,
+        entry_point: u64,
+        arguments: []const u64,
+        stack_pointer: u64,
+    ) Error!u64 {
+        return self.dispatchPrepared(
+            prepared,
+            .process_entry,
+            entry_point,
+            arguments,
+            stack_pointer,
+            true,
+        );
+    }
+
+    /// Runs a module initializer on the prepared initial thread without
+    /// finalizing that thread's POSIX TLS-key values after the call returns.
+    pub fn dispatchInitializer(
+        self: *Dispatcher,
+        prepared: threading.PreparedThread,
+        entry_point: u64,
+        arguments: []const u64,
+    ) Error!u64 {
+        return self.dispatchPrepared(
+            prepared,
+            .module_initializer,
+            entry_point,
+            arguments,
+            null,
+            false,
+        );
+    }
+
+    fn dispatchPrepared(
+        self: *Dispatcher,
+        prepared: threading.PreparedThread,
+        kind: EntryKind,
+        entry_point: u64,
+        arguments: []const u64,
+        stack_pointer: ?u64,
+        finalize_thread: bool,
+    ) Error!u64 {
+        if (!self.initialized) return error.NotInitialized;
+        if (entry_point == 0 or arguments.len > maximum_arguments or active_execution != null) {
+            return error.InvalidArgument;
+        }
+
+        try self.manager.enter(prepared.handle);
+        defer self.manager.leave();
+        active_execution = .{
+            .dispatcher = self,
+            .thread_handle = @intFromPtr(prepared.handle.?),
+            .context = prepared.context,
+            .stack_address = prepared.stack_address,
+            .stack_size = prepared.stack_size,
+            .guard_size = prepared.guard_size,
+        };
+        defer active_execution = null;
+
+        var request = ExecuteRequest{
+            .kind = kind,
+            .entry_point = entry_point,
+            .thread_handle = active_execution.?.thread_handle,
+            .context = prepared.context,
+            .stack_address = prepared.stack_address,
+            .stack_size = prepared.stack_size,
+            .guard_size = prepared.guard_size,
+            .argument_count = @intCast(arguments.len),
+            .stack_pointer = stack_pointer,
+        };
+        @memcpy(request.arguments[0..arguments.len], arguments);
+        const returned = self.bridge.execute(request) catch |err| {
+            if (err == error.Interrupted and active_execution.?.exit_requested) {
+                if (finalize_thread) return active_execution.?.exit_result;
+            }
+            return err;
+        };
+        if (active_execution.?.exit_requested) {
+            if (finalize_thread) return active_execution.?.exit_result;
+            return error.Interrupted;
+        }
+        if (finalize_thread) try self.manager.runSpecificDestructors();
+        return returned;
+    }
+
+    fn start(raw: ?*anyopaque, request: threading.StartRequest) threading.BackendError!void {
+        const self = fromContext(raw) orelse return error.Unsupported;
+        self.reapDetachedFinished();
+
+        const worker = self.allocator.create(Worker) catch return error.StartFailed;
+        worker.* = .{
+            .dispatcher = self,
+            .request = request,
+            .detached = request.detached,
+        };
+        errdefer self.allocator.destroy(worker);
+
+        self.lock.lock();
+        if (self.shutting_down) {
+            self.lock.unlock();
+            return error.StartFailed;
+        }
+        self.workers.append(self.allocator, worker) catch {
+            self.lock.unlock();
+            return error.StartFailed;
+        };
+        self.lock.unlock();
+        errdefer self.removeWorker(worker);
+
+        worker.host_thread = std.Thread.spawn(.{}, workerMain, .{worker}) catch
+            return error.StartFailed;
+    }
+
+    fn join(raw: ?*anyopaque, thread_handle: u64) threading.BackendError!u64 {
+        const self = fromContext(raw) orelse return error.Unsupported;
+        self.lock.lock();
+        const worker = self.findWorkerLocked(thread_handle) orelse {
+            self.lock.unlock();
+            return error.ThreadNotFound;
+        };
+        if (worker.joining) {
+            self.lock.unlock();
+            return error.JoinFailed;
+        }
+        worker.joining = true;
+        const host_thread = worker.host_thread orelse {
+            self.lock.unlock();
+            return error.JoinFailed;
+        };
+        self.lock.unlock();
+
+        host_thread.join();
+        self.lock.lock();
+        const result = worker.result;
+        _ = self.removeWorkerLocked(worker);
+        self.lock.unlock();
+        self.allocator.destroy(worker);
+        return result;
+    }
+
+    fn detach(raw: ?*anyopaque, thread_handle: u64) threading.BackendError!void {
+        const self = fromContext(raw) orelse return error.Unsupported;
+        self.lock.lock();
+        const worker = self.findWorkerLocked(thread_handle) orelse {
+            self.lock.unlock();
+            return error.ThreadNotFound;
+        };
+        worker.detached = true;
+        self.lock.unlock();
+        self.reapDetachedFinished();
+    }
+
+    fn yield(raw: ?*anyopaque) void {
+        if (fromContext(raw)) |self| {
+            _ = self.deliverPendingGuestException() catch |err| std.debug.print(
+                "[cpu] guest exception delivery at yield failed: {s}\n",
+                .{@errorName(err)},
+            );
+        }
+        std.Thread.yield() catch {};
+    }
+
+    fn sleep(raw: ?*anyopaque, microseconds: u64) threading.BackendError!void {
+        const self = fromContext(raw) orelse return error.Unsupported;
+        _ = try self.deliverPendingGuestException();
+        const duration = std.Io.Clock.Duration{
+            .clock = .awake,
+            .raw = .fromNanoseconds(@as(i96, microseconds) * std.time.ns_per_us),
+        };
+        self.lock.lock();
+        const shutting_down = self.shutting_down;
+        self.lock.unlock();
+        if (shutting_down) return error.WaitFailed;
+
+        // `wake_epoch` belongs to mutex/condition scheduling. Waiting on it for
+        // a plain timed sleep makes every unrelated guest wake a spurious
+        // wakeup; audio render loops then spend the entire timeout repeatedly
+        // entering RtlWaitOnAddress/ZwYieldExecution and burn a CPU core.
+        //
+        // The threaded-I/O sleep is cancelable and a guest worker can inherit
+        // a pending I/O cancellation, making it return immediately forever.
+        // NtDelayExecution is the primitive a firmware-style synchronous
+        // usleep needs here: a private, relative, non-alertable deadline.
+        if (builtin.os.tag == .windows) {
+            const maximum_us: u64 = @intCast(std.math.maxInt(i64) / 10);
+            var remaining_us = @min(microseconds, maximum_us);
+            while (remaining_us != 0) {
+                // Guest signals must interrupt long sleeps so Unity can stop
+                // every worker for GC. Keep NtDelayExecution non-alertable —
+                // Windows and Zig use alert state internally — and poll at a
+                // bounded interval instead.
+                const slice_us: i64 = @intCast(@min(remaining_us, 10 * std.time.us_per_ms));
+                const interval: std.os.windows.LARGE_INTEGER = -slice_us * 10;
+                const status = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+                if (status != .SUCCESS and status != .TIMEOUT) return error.WaitFailed;
+                if (try self.deliverPendingGuestException()) return;
+                remaining_us -= @intCast(slice_us);
+            }
+            return;
+        }
+        duration.sleep(self.io) catch return error.WaitFailed;
+        _ = try self.deliverPendingGuestException();
+    }
+
+    fn wait(
+        raw: ?*anyopaque,
+        request: threading.WaitRequest,
+    ) threading.BackendError!threading.WaitResult {
+        const self = fromContext(raw) orelse return error.Unsupported;
+        _ = try self.deliverPendingGuestException();
+        const current_name_storage = self.manager.currentName();
+        const current_name = std.mem.sliceTo(&current_name_storage, 0);
+        const main_long_wait = self.wait_diagnostics_enabled and
+            std.mem.eql(u8, current_name, "eboot-main") and
+            request.absolute_deadline_ns == null and
+            (request.timeout_microseconds == null or
+                request.timeout_microseconds.? >= std.time.us_per_s);
+        if (main_long_wait) {
+            std.debug.print(
+                "[cpu wait] main wait key=0x{x} sequence={d} host={d} relative_us={?d} deadline_ns={?d} clock={d}\n",
+                .{
+                    request.key,
+                    request.observed_sequence,
+                    std.Thread.getCurrentId(),
+                    request.timeout_microseconds,
+                    request.absolute_deadline_ns,
+                    request.clock_id,
+                },
+            );
+            printWaitKeyInfo(request.key);
+        }
+        if (self.wait_diagnostics_enabled and wait_repeat_diagnostic.observe(request)) {
+            std.debug.print(
+                "[cpu wait] repeated 1000 times key=0x{x} sequence={d} thread=0x{x}/{s} host={d} relative_us={?d} deadline_ns={?d} clock={d}\n",
+                .{
+                    request.key,
+                    request.observed_sequence,
+                    threading.currentThreadId(),
+                    current_name,
+                    std.Thread.getCurrentId(),
+                    request.timeout_microseconds,
+                    request.absolute_deadline_ns,
+                    request.clock_id,
+                },
+            );
+            printWaitKeyInfo(request.key);
+        }
+        const timeout = makeTimeout(self.io, request);
+        const deadline = timeout.toTimestamp(self.io);
+        // An absent relative timeout is only indefinite when there is no
+        // absolute deadline either. Treating every absolute pthread deadline
+        // as an indefinite wait rounds millisecond frame timers up to the
+        // five-second watchdog interval and intermittently starves the game
+        // thread between submissions.
+        const monitor_wait = request.absolute_deadline_ns == null and
+            (request.timeout_microseconds == null or
+                request.timeout_microseconds.? >= 10 * std.time.us_per_s);
+        const scheduler_watchdog = std.mem.startsWith(u8, current_name, "TaskGraphThread") or
+            std.mem.eql(u8, current_name, "RenderThread 1") or
+            std.mem.eql(u8, current_name, "RHIThread");
+        const monitored_timeout: std.Io.Timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromSeconds(5),
+        } };
+        var wait_attempts: u32 = 0;
+
+        while (true) {
+            _ = try self.deliverPendingGuestException();
+            wait_attempts +|= 1;
+            if (self.wait_diagnostics_enabled and wait_attempts == 100_000) std.debug.print(
+                "[cpu wait] futex churn key=0x{x} sequence={d} thread=0x{x} relative_us={?d} deadline_ns={?d} clock={d}\n",
+                .{
+                    request.key,
+                    request.observed_sequence,
+                    threading.currentThreadId(),
+                    request.timeout_microseconds,
+                    request.absolute_deadline_ns,
+                    request.clock_id,
+                },
+            );
+            self.lock.lock();
+            if (self.shutting_down) {
+                self.lock.unlock();
+                return error.WaitFailed;
+            }
+            if (self.consumeWakeLocked(request)) {
+                self.lock.unlock();
+                return .awoken;
+            }
+            const key_state = self.findOrCreateKeyLocked(request.key) orelse {
+                self.lock.unlock();
+                return .awoken;
+            };
+            const epoch = @atomicLoad(u32, &key_state.wake_epoch, .acquire);
+            self.lock.unlock();
+
+            if (deadline) |end| {
+                const now = std.Io.Clock.Timestamp.now(self.io, end.clock);
+                if (std.Io.Clock.Timestamp.compare(end, .lte, now)) return .timed_out;
+            }
+            waitOnEpoch(
+                self.io,
+                &key_state.wake_epoch,
+                epoch,
+                if (monitor_wait) monitored_timeout else timeout,
+            );
+            if (monitor_wait and wait_attempts == 2) {
+                if (self.wait_diagnostics_enabled and scheduler_watchdog) {
+                    const name_storage = self.manager.currentName();
+                    std.debug.print(
+                        "[cpu wait] watchdog spurious wake after 10s key=0x{x} sequence={d} thread=0x{x}/{s} host={d} relative_us={?d} deadline_ns={?d} clock={d}\n",
+                        .{
+                            request.key,
+                            request.observed_sequence,
+                            threading.currentThreadId(),
+                            std.mem.sliceTo(&name_storage, 0),
+                            std.Thread.getCurrentId(),
+                            request.timeout_microseconds,
+                            request.absolute_deadline_ns,
+                            request.clock_id,
+                        },
+                    );
+                    printWaitKeyInfo(request.key);
+                }
+                // POSIX condition waits are explicitly allowed to wake
+                // spuriously. Returning here gives guest schedulers a chance
+                // to re-check a ready predicate after a lost notification;
+                // mutexes, rwlocks and event queues already loop on their
+                // concrete state and therefore simply park again.
+                return .awoken;
+            }
+        }
+    }
+
+    fn wake(
+        raw: ?*anyopaque,
+        key: u64,
+        sequence: u64,
+        maximum_waiters: usize,
+    ) void {
+        const self = fromContext(raw) orelse return;
+        self.lock.lock();
+        const key_state = if (!self.shutting_down)
+            self.recordWakeLocked(key, sequence, maximum_waiters)
+        else
+            null;
+        if (key_state) |state| {
+            _ = @atomicRmw(u32, &state.wake_epoch, .Add, 1, .release);
+        }
+        self.lock.unlock();
+        if (key_state) |state| {
+            const wake_count: u32 = if (maximum_waiters == wake_all)
+                std.math.maxInt(u32)
+            else
+                @intCast(@min(maximum_waiters, std.math.maxInt(u32)));
+            wakeEpoch(self.io, &state.wake_epoch, wake_count);
+        }
+    }
+
+    fn raiseGuestException(
+        raw: ?*anyopaque,
+        target_thread: u64,
+        handler: u64,
+        exception_type: i32,
+    ) threading.BackendError!void {
+        const self = fromContext(raw) orelse return error.Unsupported;
+        if (target_thread == 0 or handler == 0) return error.ThreadNotFound;
+
+        self.lock.lock();
+        if (self.shutting_down) {
+            self.lock.unlock();
+            return error.WaitFailed;
+        }
+        var free: ?*PendingException = null;
+        for (&self.pending_exceptions) |*pending| {
+            if (pending.target_thread == target_thread) {
+                // One process signal is enough until the target reaches a safe
+                // delivery point. Unity never needs duplicate SIGUSR1 entries.
+                pending.handler = handler;
+                pending.exception_type = exception_type;
+                self.lock.unlock();
+                self.publishAllKeyWakes();
+                return;
+            }
+            if (pending.target_thread == 0 and free == null) free = pending;
+        }
+        const slot = free orelse {
+            self.lock.unlock();
+            return error.WaitFailed;
+        };
+        slot.* = .{
+            .target_thread = target_thread,
+            .handler = handler,
+            .exception_type = exception_type,
+        };
+        self.lock.unlock();
+
+        // A target already parked in RtlWaitOnAddress must return to the
+        // dispatcher before it can run the callback on its own guest stack.
+        self.publishAllKeyWakes();
+    }
+
+    fn takePendingGuestException(self: *Dispatcher, target_thread: u64) ?PendingException {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.pending_exceptions) |*pending| {
+            if (pending.target_thread != target_thread) continue;
+            const result = pending.*;
+            pending.* = .{};
+            return result;
+        }
+        return null;
+    }
+
+    fn deliverPendingGuestException(self: *Dispatcher) threading.BackendError!bool {
+        if (delivering_guest_exception) return false;
+        const active = active_execution orelse return false;
+        if (active.dispatcher != self) return false;
+        const pending = self.takePendingGuestException(active.thread_handle) orelse return false;
+
+        var context: [0x4c0]u8 align(16) = undefined;
+        writeGuestSignalContext(&context, hle.host_stack.suspendedStack(), active.context.fs_base);
+
+        delivering_guest_exception = true;
+        defer delivering_guest_exception = false;
+        _ = call(self, .{
+            .entry_point = pending.handler,
+            .thread_handle = active.thread_handle,
+            .arguments = .{ @bitCast(@as(i64, pending.exception_type)), @intFromPtr(&context), 0, 0, 0, 0 },
+            .argument_count = 2,
+        }) catch |err| {
+            std.debug.print(
+                "[cpu] guest exception delivery failed target=0x{x} type={d} handler=0x{x}: {s}\n",
+                .{ active.thread_handle, pending.exception_type, pending.handler, @errorName(err) },
+            );
+            return error.CallFailed;
+        };
+        return true;
+    }
+
+    fn call(raw: ?*anyopaque, guest_call: threading.GuestCall) threading.BackendError!u64 {
+        const self = fromContext(raw) orelse return error.Unsupported;
+        const active = active_execution orelse return error.CallFailed;
+        if (active.dispatcher != self or active.thread_handle != guest_call.thread_handle) {
+            return error.CallFailed;
+        }
+        var request = ExecuteRequest{
+            .kind = .guest_callback,
+            .entry_point = guest_call.entry_point,
+            .thread_handle = guest_call.thread_handle,
+            .argument_count = guest_call.argument_count,
+            .context = active.context,
+            .stack_address = active.stack_address,
+            .stack_size = active.stack_size,
+            .guard_size = active.guard_size,
+        };
+        @memcpy(request.arguments[0..guest_call.argument_count], guest_call.arguments[0..guest_call.argument_count]);
+        return self.bridge.execute(request) catch |err| {
+            if (err == error.Unsupported) return error.Unsupported;
+            if (err == error.Interrupted and active_execution.?.exit_requested) return 0;
+            return error.CallFailed;
+        };
+    }
+
+    fn requestExit(raw: ?*anyopaque, thread_handle: u64, result: u64) void {
+        const self = fromContext(raw) orelse return;
+        if (active_execution) |*active| {
+            if (active.dispatcher != self or active.thread_handle != thread_handle) return;
+            active.exit_requested = true;
+            active.exit_result = result;
+            self.bridge.interrupt(thread_handle);
+        }
+    }
+
+    fn workerMain(worker: *Worker) void {
+        const self = worker.dispatcher;
+        const handle: threading.ThreadHandle = @ptrFromInt(worker.request.thread_handle);
+        const worker_name = std.mem.sliceTo(&worker.request.name, 0);
+        var result: u64 = 0;
+        var failed = false;
+        var failure: ?anyerror = null;
+        var exit_requested = false;
+
+        self.manager.enter(handle) catch |err| {
+            failed = true;
+            failure = err;
+        };
+        if (!failed) {
+            active_execution = .{
+                .dispatcher = self,
+                .thread_handle = worker.request.thread_handle,
+                .context = worker.request.context,
+                .stack_address = worker.request.stack_address,
+                .stack_size = worker.request.stack_size,
+                .guard_size = worker.request.guard_size,
+            };
+            const request = ExecuteRequest{
+                .kind = .pthread_entry,
+                .entry_point = worker.request.entry_point,
+                .thread_handle = worker.request.thread_handle,
+                .arguments = .{ worker.request.argument, 0, 0, 0, 0, 0 },
+                .argument_count = 1,
+                .context = worker.request.context,
+                .stack_address = worker.request.stack_address,
+                .stack_size = worker.request.stack_size,
+                .guard_size = worker.request.guard_size,
+            };
+            result = self.bridge.execute(request) catch |err| blk: {
+                if (err == error.Interrupted and active_execution.?.exit_requested) {
+                    break :blk active_execution.?.exit_result;
+                }
+                failed = true;
+                failure = err;
+                break :blk 0;
+            };
+            exit_requested = active_execution.?.exit_requested;
+            if (active_execution.?.exit_requested) {
+                result = active_execution.?.exit_result;
+            } else if (!failed) {
+                self.manager.runSpecificDestructors() catch |err| {
+                    failed = true;
+                    failure = err;
+                };
+            }
+            active_execution = null;
+            self.manager.leave();
+        }
+
+        self.manager.complete(handle, result) catch |err| {
+            failed = true;
+            failure = err;
+        };
+        if (failed or std.mem.eql(u8, worker_name, "UnityGfxDeviceWorker")) {
+            std.debug.print(
+                "[cpu thread] finished guest=0x{x} host={d} name={s} result=0x{x} exit_requested={any} failure={s}\n",
+                .{
+                    worker.request.thread_handle,
+                    std.Thread.getCurrentId(),
+                    worker_name,
+                    result,
+                    exit_requested,
+                    if (failure) |err| @errorName(err) else "none",
+                },
+            );
+        }
+        self.lock.lock();
+        worker.result = result;
+        worker.execution_failed = failed;
+        worker.finished = true;
+        self.lock.unlock();
+        self.publishWake();
+    }
+
+    fn reapDetachedFinished(self: *Dispatcher) void {
+        while (true) {
+            self.lock.lock();
+            var found: ?*Worker = null;
+            for (self.workers.items) |worker| {
+                if (worker.detached and worker.finished and !worker.joining) {
+                    worker.joining = true;
+                    found = worker;
+                    _ = self.removeWorkerLocked(worker);
+                    break;
+                }
+            }
+            self.lock.unlock();
+            const worker = found orelse return;
+            if (worker.host_thread) |host_thread| host_thread.join();
+            self.allocator.destroy(worker);
+        }
+    }
+
+    fn removeWorker(self: *Dispatcher, worker: *Worker) void {
+        self.lock.lock();
+        _ = self.removeWorkerLocked(worker);
+        self.lock.unlock();
+    }
+
+    fn removeWorkerLocked(self: *Dispatcher, worker: *Worker) bool {
+        for (self.workers.items, 0..) |known, index| {
+            if (known != worker) continue;
+            _ = self.workers.orderedRemove(index);
+            return true;
+        }
+        return false;
+    }
+
+    fn findWorkerLocked(self: *Dispatcher, thread_handle: u64) ?*Worker {
+        for (self.workers.items) |worker| {
+            if (worker.request.thread_handle == thread_handle) return worker;
+        }
+        return null;
+    }
+
+    fn findKeyLocked(self: *Dispatcher, key: u64) ?*KeyState {
+        const first = keyStateIndex(key);
+        for (0..self.key_states.len) |probe| {
+            const state = &self.key_states[(first + probe) & key_state_mask];
+            if (!state.used) return null;
+            if (state.key == key) return state;
+        }
+        return null;
+    }
+
+    fn findOrCreateKeyLocked(self: *Dispatcher, key: u64) ?*KeyState {
+        const first = keyStateIndex(key);
+        for (0..self.key_states.len) |probe| {
+            const state = &self.key_states[(first + probe) & key_state_mask];
+            if (state.used) {
+                if (state.key == key) return state;
+                continue;
+            }
+            state.* = .{ .used = true, .key = key };
+            return state;
+        }
+        if (!self.saturated_keys) {
+            self.saturated_keys = true;
+            std.debug.print(
+                "[cpu] synchronization key table saturated at {d} entries; new keys use polling fallback\n",
+                .{self.key_states.len},
+            );
+        }
+        return null;
+    }
+
+    fn consumeWakeLocked(self: *Dispatcher, request: threading.WaitRequest) bool {
+        // Saturation degrades to polling rather than risking a permanent lost
+        // wakeup for the one unknown key. Known keys retain normal blocking;
+        // one exhausted slot must never disable scheduling process-wide.
+        const state = self.findOrCreateKeyLocked(request.key) orelse return true;
+        if (state.pending_wakes == 0 or
+            !sequenceAfter(state.latest_sequence, request.observed_sequence)) return false;
+        state.pending_wakes -= 1;
+        return true;
+    }
+
+    fn recordWakeLocked(
+        self: *Dispatcher,
+        key: u64,
+        sequence: u64,
+        maximum_waiters: usize,
+    ) ?*KeyState {
+        if (maximum_waiters == 0) return null;
+        const state = self.findOrCreateKeyLocked(key) orelse return null;
+        state.latest_sequence = sequence;
+        state.pending_wakes +|= maximum_waiters;
+        return state;
+    }
+
+    fn publishWake(self: *Dispatcher) void {
+        _ = @atomicRmw(u32, &self.wake_epoch, .Add, 1, .release);
+        wakeEpoch(self.io, &self.wake_epoch, std.math.maxInt(u32));
+    }
+
+    fn publishAllKeyWakes(self: *Dispatcher) void {
+        for (self.key_states) |*state| {
+            if (!state.used) continue;
+            _ = @atomicRmw(u32, &state.wake_epoch, .Add, 1, .release);
+            wakeEpoch(self.io, &state.wake_epoch, std.math.maxInt(u32));
+        }
+    }
+};
+
+fn fromContext(raw: ?*anyopaque) ?*Dispatcher {
+    const pointer = raw orelse return null;
+    const self: *Dispatcher = @ptrCast(@alignCast(pointer));
+    return if (self.initialized) self else null;
+}
+
+fn sequenceAfter(candidate: u64, observed: u64) bool {
+    if (candidate == 0 or candidate == observed) return false;
+    return candidate -% observed < (@as(u64, 1) << 63);
+}
+
+fn keyStateIndex(key: u64) usize {
+    var mixed = key ^ (key >> 33);
+    mixed *%= 0xff51_afd7_ed55_8ccd;
+    mixed ^= mixed >> 33;
+    mixed *%= 0xc4ce_b9fe_1a85_ec53;
+    mixed ^= mixed >> 33;
+    return @intCast(mixed & @as(u64, key_state_mask));
+}
+
+fn guestClock(clock_id: i32) std.Io.Clock {
+    return switch (clock_id) {
+        0, 9, 10, 13 => .real,
+        else => .awake,
+    };
+}
+
+fn makeTimeout(io: std.Io, request: threading.WaitRequest) std.Io.Timeout {
+    if (request.absolute_deadline_ns) |nanoseconds| {
+        const host_nanoseconds = if (guestClock(request.clock_id) == .awake)
+            hle.libs.kernel_runtime.hostMonotonicDeadline(nanoseconds)
+        else
+            nanoseconds;
+        return .{ .deadline = .{
+            .clock = guestClock(request.clock_id),
+            .raw = .fromNanoseconds(@intCast(host_nanoseconds)),
+        } };
+    }
+    if (request.timeout_microseconds) |microseconds| {
+        const duration = std.Io.Clock.Duration{
+            .clock = .awake,
+            .raw = .fromNanoseconds(@as(i96, microseconds) * std.time.ns_per_us),
+        };
+        return .{ .deadline = std.Io.Clock.Timestamp.fromNow(io, duration) };
+    }
+    return .none;
+}
+
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const loader = @import("loader");
+
+const TestBridge = struct {
+    manager: *threading.Manager,
+    calls: std.atomic.Value(usize) = .init(0),
+    callbacks: std.atomic.Value(usize) = .init(0),
+    last_fs_base: std.atomic.Value(u64) = .init(0),
+    saw_stack: std.atomic.Value(bool) = .init(false),
+    invoke_callback: bool = false,
+    request_exit_result: ?u64 = null,
+
+    fn execute(raw: ?*anyopaque, request: ExecuteRequest) ExecutionError!u64 {
+        const self: *TestBridge = @ptrCast(@alignCast(raw.?));
+        _ = self.calls.fetchAdd(1, .acq_rel);
+        self.last_fs_base.store(request.context.fs_base, .release);
+        self.saw_stack.store(request.stack_address != 0 and request.stack_size != 0, .release);
+        if (request.kind == .guest_callback) {
+            _ = self.callbacks.fetchAdd(1, .acq_rel);
+            return 0;
+        }
+        if (self.invoke_callback) {
+            self.manager.callGuest(0xfeed, &.{0xbeef}) catch return error.ExecutionFailed;
+        }
+        if (self.request_exit_result) |result| {
+            threading.scePthreadExit(@ptrFromInt(result));
+        }
+        return request.arguments[0] + 1;
+    }
+
+    fn value(self: *TestBridge) Bridge {
+        return .{ .context = self, .execute_fn = &execute };
+    }
+};
+
+const TestContext = struct {
+    address_space: memory.AddressSpace = undefined,
+    tls_registry: loader.TlsRegistry = .{},
+    manager: threading.Manager = .{},
+    bridge: TestBridge = undefined,
+    dispatcher: Dispatcher = .{},
+
+    fn init(self: *TestContext) !void {
+        self.* = .{};
+        self.address_space = try memory.AddressSpace.init(testing.allocator);
+        self.manager.init(testing.allocator, &self.address_space, &self.tls_registry);
+        self.bridge = .{ .manager = &self.manager };
+        try self.dispatcher.init(
+            testing.allocator,
+            testing.io,
+            &self.manager,
+            self.bridge.value(),
+        );
+        threading.attachManager(&self.manager);
+    }
+
+    fn deinit(self: *TestContext) void {
+        threading.attachManager(null);
+        self.dispatcher.deinit();
+        self.manager.deinit();
+        self.tls_registry.deinit(testing.allocator);
+        self.address_space.deinit();
+    }
+};
+
+test "initial dispatch carries FS, stack, arguments, and nested callbacks" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    context.bridge.invoke_callback = true;
+
+    const prepared = try context.manager.prepareInitialThread("eboot-main");
+    defer context.manager.releaseInitialThread(prepared.handle) catch {};
+    const stack_mapping_address = prepared.stack_address - prepared.guard_size;
+    const stack_mapping_size = prepared.guard_size +
+        (try alignForwardForTest(prepared.stack_size, memory.page_size));
+    const guard = context.address_space.query(stack_mapping_address, false).?;
+    const stack = context.address_space.query(prepared.stack_address, false).?;
+    try testing.expectEqual(memory.Protection.none, guard.protection);
+    try testing.expect(stack.protection.write);
+    const result = try context.dispatcher.dispatchInitial(prepared, 0x1234, &.{41});
+
+    try testing.expectEqual(@as(u64, 42), result);
+    try testing.expect(context.bridge.last_fs_base.load(.acquire) != 0);
+    try testing.expect(context.bridge.saw_stack.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), context.bridge.callbacks.load(.acquire));
+    try context.manager.releaseInitialThread(prepared.handle);
+    try testing.expect(!context.address_space.isMapped(stack_mapping_address, stack_mapping_size));
+}
+
+test "pthread start and join run on a dispatcher host worker" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+
+    var handle: threading.ThreadHandle = null;
+    try context.manager.create(&handle, .{}, 0x4567, 9, "guest-worker");
+    const result = try context.manager.join(handle);
+
+    try testing.expectEqual(@as(u64, 10), result);
+    try testing.expect(context.bridge.last_fs_base.load(.acquire) != 0);
+    try testing.expect(context.bridge.saw_stack.load(.acquire));
+}
+
+test "scePthreadExit overrides a pthread entry return value" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    context.bridge.request_exit_result = 0x55;
+
+    var handle: threading.ThreadHandle = null;
+    try context.manager.create(&handle, .{}, 0x4567, 9, "guest-exit");
+    try testing.expectEqual(@as(u64, 0x55), try context.manager.join(handle));
+}
+
+test "wake before park is consumed exactly once" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+
+    Dispatcher.wake(&context.dispatcher, 0x1000, 2, 1);
+    try testing.expectEqual(
+        threading.WaitResult.awoken,
+        try Dispatcher.wait(&context.dispatcher, .{
+            .key = 0x1000,
+            .observed_sequence = 1,
+            .timeout_microseconds = 0,
+        }),
+    );
+    try testing.expectEqual(
+        threading.WaitResult.timed_out,
+        try Dispatcher.wait(&context.dispatcher, .{
+            .key = 0x1000,
+            .observed_sequence = 1,
+            .timeout_microseconds = 0,
+        }),
+    );
+}
+
+test "new waiters do not consume stale signal tokens" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+
+    Dispatcher.wake(&context.dispatcher, 0x2000, 2, 1);
+    Dispatcher.wake(&context.dispatcher, 0x2000, 3, 1);
+    try testing.expectEqual(
+        threading.WaitResult.awoken,
+        try Dispatcher.wait(&context.dispatcher, .{
+            .key = 0x2000,
+            .observed_sequence = 2,
+            .timeout_microseconds = 0,
+        }),
+    );
+    try testing.expectEqual(
+        threading.WaitResult.timed_out,
+        try Dispatcher.wait(&context.dispatcher, .{
+            .key = 0x2000,
+            .observed_sequence = 3,
+            .timeout_microseconds = 0,
+        }),
+    );
+}
+
+test "key-table saturation does not turn known waits into polling" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+
+    const key: u64 = 0x3456_7000;
+    _ = context.dispatcher.findOrCreateKeyLocked(key) orelse return error.TestUnexpectedResult;
+    context.dispatcher.saturated_keys = true;
+    try testing.expect(!context.dispatcher.consumeWakeLocked(.{
+        .key = key,
+        .observed_sequence = 1,
+    }));
+    _ = context.dispatcher.recordWakeLocked(key, 2, 1);
+    try testing.expect(context.dispatcher.consumeWakeLocked(.{
+        .key = key,
+        .observed_sequence = 1,
+    }));
+}
+
+test "broadcast wake tokens are limited to current waiters" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+
+    const key: u64 = 0x4567_8000;
+    _ = context.dispatcher.recordWakeLocked(key, 2, 3);
+    for (0..3) |_| try testing.expect(context.dispatcher.consumeWakeLocked(.{
+        .key = key,
+        .observed_sequence = 1,
+    }));
+    try testing.expect(!context.dispatcher.consumeWakeLocked(.{
+        .key = key,
+        .observed_sequence = 1,
+    }));
+}
+
+test "guest signal context scans the interrupted stack across firmware calls" {
+    if (!hle.host_stack.supported) return error.SkipZigTest;
+    defer hle.host_stack.release();
+    const Probe = struct {
+        fn capture(root: *u64) !void {
+            var context: [0x4c0]u8 align(16) = undefined;
+            const saved = hle.host_stack.suspendedStack().?;
+            writeGuestSignalContext(&context, saved, 0x12345000);
+            const rsp = std.mem.readInt(u64, context[0xf8..][0..8], .little);
+            // The live caller root must be in the scan interval. A pointer to
+            // `context` would instead start in the unrelated firmware stack.
+            try testing.expect(rsp < @intFromPtr(root));
+            try testing.expect(@intFromPtr(root) - rsp < 64 * 1024);
+            try testing.expect(@intFromPtr(&context) < rsp or @intFromPtr(&context) > @intFromPtr(root));
+            try testing.expectEqual(saved.r12, std.mem.readInt(u64, context[0x60..][0..8], .little));
+            try testing.expectEqual(@as(u64, 0x4c0), std.mem.readInt(u64, context[0x108..][0..8], .little));
+            try testing.expectEqual(@as(u64, 0x12345000), std.mem.readInt(u64, context[0x480..][0..8], .little));
+        }
+        fn nested(root: *u64) !void {
+            const saved = hle.host_stack.suspendedStack();
+            try hle.host_stack.call(anyerror!void, capture, .{root});
+            try testing.expectEqual(saved, hle.host_stack.suspendedStack());
+        }
+    };
+    var root: u64 = 0x1122334455667788;
+    try hle.host_stack.call(anyerror!void, Probe.nested, .{&root});
+    try testing.expect(hle.host_stack.suspendedStack() == null);
+    try testing.expectEqual(@as(u64, 0x1122334455667788), root);
+}
+
+test "native bridge installs FS, SysV arguments, and the guest stack" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+
+    const code_address = memory.system_managed.start;
+    const tls_address = code_address + memory.page_size;
+    const stack_address = tls_address + memory.page_size;
+    try address_space.mapFixed(
+        code_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+    try address_space.mapFixed(
+        tls_address,
+        memory.page_size,
+        .read_write,
+        .private,
+        null,
+    );
+    try address_space.mapFixed(
+        stack_address,
+        memory.page_size,
+        .read_write,
+        .private,
+        null,
+    );
+    try address_space.writeInt(u64, tls_address, tls_address);
+
+    // Read FS:[0] and add all six System V integer argument registers.
+    const fs_program = [_]u8{
+        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x01, 0xf8, 0x48, 0x01, 0xf0, 0x48, 0x01, 0xd0,
+        0x48, 0x01, 0xc8, 0x4c, 0x01, 0xc0, 0x4c, 0x01, 0xc8,
+        0xc3,
+    };
+    // mov rax, rsp; ret
+    const stack_program = [_]u8{ 0x48, 0x89, 0xe0, 0xc3 };
+    try address_space.write(code_address, &fs_program);
+    try address_space.write(code_address + 0x20, &stack_program);
+    try address_space.protect(code_address, memory.page_size, .read_execute);
+
+    var native = NativeBridge{};
+    try native.init(testing.allocator, &address_space);
+    defer native.deinit();
+    const machine = native.bridge();
+    const context = threading.ThreadContext{
+        .tls_mapping_address = tls_address,
+        .tls_mapping_size = memory.page_size,
+        .fs_base = tls_address,
+        .dtv_address = tls_address + 0x100,
+        .tls_generation = 1,
+    };
+    const host_fs_before = NativeMachine.readFsBase();
+    const result = try machine.execute(.{
+        .kind = .process_entry,
+        .entry_point = code_address,
+        .thread_handle = 1,
+        .arguments = .{ 1, 2, 3, 4, 5, 6 },
+        .argument_count = 6,
+        .context = context,
+        .stack_address = stack_address,
+        .stack_size = memory.page_size,
+        .guard_size = 0,
+    });
+    try testing.expectEqual(tls_address + 21, result);
+    try testing.expectEqual(host_fs_before, NativeMachine.readFsBase());
+
+    const requested_stack_pointer = stack_address + memory.page_size - 0x100;
+    const observed_rsp = try machine.execute(.{
+        .kind = .process_entry,
+        .entry_point = code_address + 0x20,
+        .thread_handle = 1,
+        .context = context,
+        .stack_address = stack_address,
+        .stack_size = memory.page_size,
+        .guard_size = 0,
+        .stack_pointer = requested_stack_pointer,
+    });
+    try testing.expectEqual(requested_stack_pointer - 8, observed_rsp);
+    try testing.expectEqual(@as(u64, 8), observed_rsp & 0xf);
+}
+
+test "Windows context compatibility advances AMD wait instructions" {
+    if (can_use_native_bridge) {
+        const monitorx = [_]u8{ 0x0f, 0x01, 0xfa };
+        const mwaitx = [_]u8{ 0x0f, 0x01, 0xfb };
+        const unknown = [_]u8{ 0x0f, 0x0b };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+
+        context.Rip = @intFromPtr(&monitorx);
+        try testing.expect(WindowsX64Machine.tryEmulateIllegalInstruction(&context));
+        try testing.expectEqual(@intFromPtr(&monitorx) + monitorx.len, context.Rip);
+
+        context.Rip = @intFromPtr(&mwaitx);
+        try testing.expect(WindowsX64Machine.tryEmulateIllegalInstruction(&context));
+        try testing.expectEqual(@intFromPtr(&mwaitx) + mwaitx.len, context.Rip);
+
+        context.Rip = @intFromPtr(&unknown);
+        try testing.expect(!WindowsX64Machine.tryEmulateIllegalInstruction(&context));
+        try testing.expectEqual(@intFromPtr(&unknown), context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "native bridge restores firmware state after escapes and nested callbacks" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+    defer hle.host_stack.release();
+    const Probe = struct {
+        fn escape(frame: *NativeCallFrame) void {
+            NativeMachine.escape(frame);
+        }
+        fn entry(frame: *NativeCallFrame) callconv(.{ .x86_64_sysv = .{} }) u64 {
+            hle.host_stack.call(void, escape, .{frame});
+            unreachable;
+        }
+        fn check() !void {
+            const before = hle.host_stack.CallState.capture();
+            var frame: NativeCallFrame align(16) = .{};
+            frame.guest_arguments[0] = @intFromPtr(&frame);
+            try testing.expectEqual(@as(u64, 0), NativeMachine.call(&frame, @intFromPtr(&entry), 0));
+            try testing.expectEqualDeep(before, hle.host_stack.CallState.capture());
+        }
+    };
+    try Probe.check();
+    try hle.host_stack.call(anyerror!void, Probe.check, .{});
+}
+
+test "native bridge contains guest access and illegal instruction faults" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+
+    const code_address = memory.system_managed.start;
+    const tls_address = code_address + memory.page_size;
+    const stack_address = tls_address + memory.page_size;
+    try address_space.mapFixed(
+        code_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+    try address_space.mapFixed(
+        tls_address,
+        memory.page_size,
+        .read_write,
+        .private,
+        null,
+    );
+    try address_space.mapFixed(
+        stack_address,
+        memory.page_size,
+        .read_write,
+        .private,
+        null,
+    );
+
+    // mov rax, qword ptr [0]; ret
+    try address_space.write(
+        code_address,
+        &.{ 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0xc3 },
+    );
+    // ud2; ret
+    try address_space.write(code_address + 0x20, &.{ 0x0f, 0x0b, 0xc3 });
+    // mov eax, 42; ret
+    try address_space.write(
+        code_address + 0x40,
+        &.{ 0xb8, 42, 0, 0, 0, 0xc3 },
+    );
+    // mov rax, value; movq xmm1, rax; extrq xmm1, 8, 8;
+    // movq rax, xmm1; ret
+    var extrq_program = [_]u8{
+        0x48, 0xb8, 0,    0,    0,    0,    0,    0,    0,    0,
+        0x66, 0x48, 0x0f, 0x6e, 0xc8, 0x66, 0x0f, 0x78, 0xc1, 0x08,
+        0x08, 0x66, 0x48, 0x0f, 0x7e, 0xc8, 0xc3,
+    };
+    std.mem.writeInt(u64, extrq_program[2..10], 0x0123_4567_89ab_cdef, .little);
+    try address_space.write(code_address + 0x80, &extrq_program);
+
+    // movq xmm1, destination; movq xmm2, source;
+    // insertq xmm1, xmm2, 8, 16; movq rax, xmm1; ret
+    var insertq_program = [_]u8{
+        0x48, 0xb8, 0,    0,    0,    0,    0,    0,    0,    0,
+        0x66, 0x48, 0x0f, 0x6e, 0xc8, 0x48, 0xb8, 0,    0,    0,
+        0,    0,    0,    0,    0,    0x66, 0x48, 0x0f, 0x6e, 0xd0,
+        0xf2, 0x0f, 0x78, 0xca, 0x08, 0x10, 0x66, 0x48, 0x0f, 0x7e,
+        0xc8, 0xc3,
+    };
+    std.mem.writeInt(u64, insertq_program[2..10], 0xaaaa_bbbb_ccdd_eeee, .little);
+    std.mem.writeInt(u64, insertq_program[17..25], 0x1234, .little);
+    try address_space.write(code_address + 0xc0, &insertq_program);
+    try address_space.protect(code_address, memory.page_size, .read_execute);
+
+    var native = NativeBridge{};
+    try native.init(testing.allocator, &address_space);
+    defer native.deinit();
+    const machine = native.bridge();
+    const thread_handle = 0x1234;
+    const context = threading.ThreadContext{
+        .tls_mapping_address = tls_address,
+        .tls_mapping_size = memory.page_size,
+        .fs_base = tls_address,
+        .dtv_address = tls_address + 0x100,
+        .tls_generation = 1,
+    };
+    const base_request = ExecuteRequest{
+        .kind = .process_entry,
+        .entry_point = code_address,
+        .thread_handle = thread_handle,
+        .context = context,
+        .stack_address = stack_address,
+        .stack_size = memory.page_size,
+        .guard_size = 0,
+    };
+    const host_fs_before = NativeMachine.readFsBase();
+
+    try testing.expectError(error.GuestFault, machine.execute(base_request));
+    const access_fault = native.lastFault().?;
+    try testing.expectEqual(thread_handle, access_fault.thread_handle);
+    try testing.expectEqual(FaultKind.access_violation, access_fault.info.kind);
+    try testing.expectEqual(FaultAccess.read, access_fault.info.access);
+    try testing.expectEqual(
+        @as(u32, std.os.windows.EXCEPTION_ACCESS_VIOLATION),
+        access_fault.info.exception_code,
+    );
+    try testing.expectEqual(code_address, access_fault.info.instruction_address);
+    try testing.expectEqual(@as(u64, 0), access_fault.info.memory_address);
+    try testing.expect(access_fault.info.registers.rsp >= stack_address);
+    try testing.expect(
+        access_fault.info.registers.rsp < stack_address + memory.page_size,
+    );
+    try testing.expectEqual(host_fs_before, NativeMachine.readFsBase());
+
+    var illegal_request = base_request;
+    illegal_request.entry_point = code_address + 0x20;
+    try testing.expectError(error.GuestFault, machine.execute(illegal_request));
+    const illegal_fault = native.lastFault().?;
+    try testing.expectEqual(FaultKind.illegal_instruction, illegal_fault.info.kind);
+    try testing.expectEqual(FaultAccess.unknown, illegal_fault.info.access);
+    try testing.expectEqual(code_address + 0x20, illegal_fault.info.registers.rip);
+    try testing.expectEqual(host_fs_before, NativeMachine.readFsBase());
+
+    var valid_request = base_request;
+    valid_request.entry_point = code_address + 0x40;
+    try testing.expectEqual(@as(u64, 42), try machine.execute(valid_request));
+    try testing.expect(native.lastFault() == null);
+
+    var extract_request = base_request;
+    extract_request.entry_point = code_address + 0x80;
+    try testing.expectEqual(@as(u64, 0xcd), try machine.execute(extract_request));
+    try testing.expect(native.lastFault() == null);
+
+    var insert_request = base_request;
+    insert_request.entry_point = code_address + 0xc0;
+    try testing.expectEqual(
+        @as(u64, 0xaaaa_bbbb_cc34_eeee),
+        try machine.execute(insert_request),
+    );
+    try testing.expect(native.lastFault() == null);
+}
+
+test "native bridge executes a pthread on its dispatcher worker" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    const code_address = memory.system_managed.start;
+    try address_space.mapFixed(
+        code_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+    // lea rax, [rdi + 1]; ret
+    try address_space.write(code_address, &.{ 0x48, 0x8d, 0x47, 0x01, 0xc3 });
+    try address_space.protect(code_address, memory.page_size, .read_execute);
+
+    var tls_registry: loader.TlsRegistry = .{};
+    defer tls_registry.deinit(testing.allocator);
+    var manager = threading.Manager{};
+    manager.init(testing.allocator, &address_space, &tls_registry);
+    defer manager.deinit();
+    var native = NativeBridge{};
+    try native.init(testing.allocator, &address_space);
+    defer native.deinit();
+    var dispatcher = Dispatcher{};
+    try dispatcher.init(
+        testing.allocator,
+        testing.io,
+        &manager,
+        native.bridge(),
+    );
+    defer dispatcher.deinit();
+
+    var handle: threading.ThreadHandle = null;
+    try manager.create(&handle, .{}, code_address, 41, "native-worker");
+    try testing.expectEqual(@as(u64, 42), try manager.join(handle));
+}
+
+test "native bridge unwinds scePthreadExit to the dispatcher" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    const code_address = memory.system_managed.start;
+    try address_space.mapFixed(
+        code_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+
+    // mov rdi, 0x55; mov rax, scePthreadExit; call rax; ud2
+    var program = [_]u8{
+        0x48, 0xbf, 0,    0,    0, 0, 0, 0, 0, 0,
+        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0,
+        0xff, 0xd0, 0x0f, 0x0b,
+    };
+    std.mem.writeInt(u64, program[2..10], 0x55, .little);
+    std.mem.writeInt(
+        u64,
+        program[12..20],
+        @intFromPtr(&threading.scePthreadExit),
+        .little,
+    );
+    try address_space.write(code_address, &program);
+    try address_space.protect(code_address, memory.page_size, .read_execute);
+
+    var tls_registry: loader.TlsRegistry = .{};
+    defer tls_registry.deinit(testing.allocator);
+    var manager = threading.Manager{};
+    manager.init(testing.allocator, &address_space, &tls_registry);
+    defer manager.deinit();
+    var native = NativeBridge{};
+    try native.init(testing.allocator, &address_space);
+    defer native.deinit();
+    var dispatcher = Dispatcher{};
+    try dispatcher.init(
+        testing.allocator,
+        testing.io,
+        &manager,
+        native.bridge(),
+    );
+    defer dispatcher.deinit();
+    threading.attachManager(&manager);
+    defer threading.attachManager(null);
+
+    const prepared = try manager.prepareInitialThread("native-exit");
+    defer manager.releaseInitialThread(prepared.handle) catch {};
+    try testing.expectEqual(
+        @as(u64, 0x55),
+        try dispatcher.dispatchInitial(prepared, code_address, &.{}),
+    );
+}
+
+fn alignForwardForTest(value: u64, alignment: u64) !u64 {
+    return std.mem.alignForward(u64, value, alignment);
+}

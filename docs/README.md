@@ -1,0 +1,47 @@
+# PSPC5 Plus documentation
+
+This directory contains the detailed user, compatibility, architecture, and
+release documentation. The repository [README](../README.md) stays intentionally
+short and visual; implementation details live here.
+
+## Start here
+
+| Document | Purpose |
+|---|---|
+| [Building and command-line usage](getting-started.md) | Build PSPC5 Plus, run its tools, package Windows releases, or integrate the RDNA2 module |
+| [Project status and compatibility](project-status.md) | See the development captures and the measured milestone reached in each observed title |
+| [Implementation status](implementation-status.md) | Read what the emulator can do, subsystem by subsystem |
+| [Latest release notes](release-notes/v0.3.3.md) | See the changes and requirements for the current prototype |
+| [License and legal note](legal.md) | Understand GPL obligations, dependency licensing, and project scope |
+
+## Architecture
+
+| Subsystem | Document |
+|---|---|
+| Module map, developer tools, launcher/runtime behavior, and build profiles | [Architecture and toolchain overview](architecture/overview.md) |
+| RDNA2 instruction decoding, typed IR, CFG/SSA, and SPIR-V | [`rdna2`](architecture/rdna2.md) |
+| AGC/PM4 command streams, retained state, scheduling, and execution | [`gpu`](architecture/gpu.md) |
+| Parallel graphics/compute command decoding and ordered backend execution | [Command processors](architecture/command-processors.md) |
+| Host device, resources, synchronization, caches, and presentation | [`vulkan`](architecture/vulkan.md) |
+| Fixed guest ranges, sparse mappings, protection, and page tracking | [`memory`](architecture/memory.md) |
+| ELF64/SELF parsing, imports, mapping, relocation, and TLS | [`loader`](architecture/loader.md) |
+| Firmware interfaces, files, media, savedata, networking, and synchronization | [`hle`](architecture/hle.md) |
+| Native x86-64 dispatch, stacks, TLS, and Windows exception handling | [`cpu`](architecture/cpu.md) |
+| Address attribution, call tracing, and contained fault reports | [`diag`](architecture/diagnostics.md) |
+| End-to-end composition of memory, loader, HLE, CPU, and process startup | [`runtime`](architecture/runtime.md) |
+
+## Releases and media
+
+- [Release notes](release-notes/)
+- [Screenshots and captures](images/)
+- [1080p startup and buffer reuse, 27 September 2026](development/1080p-buffer-reuse-2026-09-27.md)
+- [GPU submission and Yotei performance report, 24 September 2026](development/yotei-performance-2026-09-24.md)
+- [PSPC5 Plus GitHub Releases](https://github.com/gurjotsenghww/pspc5-plus/releases)
+- [Upstream PS5PCEM Releases](https://github.com/iStark/PS5PCEM/releases)
+
+## Project boundaries
+
+PSPC5 Plus is experimental and incomplete. Compatibility milestones describe only
+the furthest repeatable point observed with legally supplied local content; they
+are not general compatibility ratings. No games, firmware, keys, system
+libraries, or console software are distributed by this repository.

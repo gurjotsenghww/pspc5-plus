@@ -1,0 +1,1276 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Ordered graphics/compute submission around the PM4 executor.
+//!
+//! Each queue advances independently until `WAIT_REG_MEM` blocks it. The root
+//! DCB and its complete indirect-buffer continuation are retained, later work
+//! on that same queue stays FIFO-ordered, and progress on the other queue gets
+//! a chance to publish the real release label. No wait value is synthesized.
+
+const std = @import("std");
+const executor = @import("executor.zig");
+const gpu_state = @import("state.zig");
+const command_workers = @import("command_workers.zig");
+
+var live_indirect_refresh_reports = std.atomic.Value(u32).init(0);
+
+fn reportRefreshedStream(address: u64, bytes: []const u8) void {
+    if (bytes.len & 3 != 0) return;
+    const aligned_bytes: []align(@alignOf(u32)) const u8 = @alignCast(bytes);
+    const words = std.mem.bytesAsSlice(u32, aligned_bytes);
+    var walker = pm4.Walker.init(words);
+    var packets: usize = 0;
+    var draws: usize = 0;
+    var dispatches: usize = 0;
+    var indirects: usize = 0;
+    var opcodes: [256]u32 = @splat(0);
+    while (true) {
+        const packet = walker.next() catch |err| {
+            std.debug.print(
+                "[gpu scheduler] refreshed stream census @0x{x} words={d} stopped={s} at={d}\n",
+                .{ address, words.len, @errorName(err), walker.index },
+            );
+            return;
+        } orelse break;
+        packets += 1;
+        if (packet.kind != .command) continue;
+        opcodes[packet.opcode] += 1;
+        if (pm4.isDraw(packet.opcode)) draws += 1;
+        if (pm4.isDispatch(packet.opcode)) dispatches += 1;
+        if (packet.opcode == pm4.indirect_buffer) indirects += 1;
+    }
+    std.debug.print(
+        "[gpu scheduler] refreshed stream census @0x{x} words={d} packets={d} draws={d} dispatches={d} indirects={d}:",
+        .{ address, words.len, packets, draws, dispatches, indirects },
+    );
+    for (opcodes, 0..) |count, opcode| {
+        if (count == 0) continue;
+        if (pm4.opcodeName(@intCast(opcode))) |name| {
+            std.debug.print(" {s}={d}", .{ name, count });
+        } else {
+            std.debug.print(" 0x{x:0>2}={d}", .{ opcode, count });
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+pub const Error = executor.Error;
+
+pub const QueueKind = enum { graphics, compute };
+
+pub const PumpReport = struct {
+    completed_submissions: usize = 0,
+    blocked_checks: usize = 0,
+    packets: usize = 0,
+    draws: usize = 0,
+    dispatches: usize = 0,
+
+    fn record(self: *PumpReport, result: executor.Result) void {
+        self.packets += result.packets;
+        self.draws += result.draws;
+        self.dispatches += result.dispatches;
+        if (result.status == .blocked) self.blocked_checks += 1;
+    }
+};
+
+const Submission = struct {
+    words: []u32,
+    backend: executor.Backend,
+    snapshots: std.ArrayList(Snapshot) = .empty,
+    continuation: ?executor.Continuation = null,
+    gpu_work_seen: bool = false,
+
+    fn deinit(self: *Submission, allocator: std.mem.Allocator) void {
+        allocator.free(self.words);
+        for (self.snapshots.items) |snapshot| allocator.free(snapshot.words);
+        self.snapshots.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Guest ranges referenced by a command stream must live as long as the root
+/// DCB. AGC is free to recycle both indirect command buffers and indirect
+/// register lists immediately after submit returns.
+const Snapshot = struct {
+    address: u64,
+    words: []u32,
+    /// An indirect command buffer with no submitted draw/dispatch may be filled
+    /// by an earlier dispatch in the same submission. Refresh it at execution
+    /// time after GPU work has run. Normal CPU-authored work streams and
+    /// indirect register lists stay immutable.
+    live_after_gpu_work: bool = false,
+};
+
+const Queue = struct {
+    state: gpu_state.State = .{},
+    active: ?Submission = null,
+    pending: std.ArrayList(Submission) = .empty,
+    forced_read: ?ForcedRead = null,
+};
+
+const ForcedRead = struct {
+    address: u64,
+    length: u8,
+    bytes: [8]u8 = @splat(0),
+};
+
+pub const Scheduler = struct {
+    allocator: std.mem.Allocator,
+    backend: executor.Backend,
+    graphics: Queue = .{},
+    compute: Queue = .{},
+    parallel_commands: bool = false,
+    command_pool: command_workers.Pool = .{},
+    snapshot_lock: std.Io.Mutex = .init,
+
+    pub fn init(allocator: std.mem.Allocator, backend: executor.Backend) Scheduler {
+        return .{ .allocator = allocator, .backend = backend };
+    }
+
+    pub fn deinit(self: *Scheduler) void {
+        self.command_pool.deinit();
+        self.deinitQueue(&self.graphics);
+        self.deinitQueue(&self.compute);
+    }
+
+    pub fn state(self: *Scheduler, kind: QueueKind) *gpu_state.State {
+        return &self.queueFor(kind).state;
+    }
+
+    pub fn isBlocked(self: *const Scheduler, kind: QueueKind) bool {
+        const queue = self.queueForConst(kind);
+        return if (queue.active) |active| active.continuation != null else false;
+    }
+
+    pub fn continuation(self: *const Scheduler, kind: QueueKind) ?executor.Continuation {
+        const queue = self.queueForConst(kind);
+        return if (queue.active) |active| active.continuation else null;
+    }
+
+    /// Work waiting behind the active submission on this queue.
+    pub fn pendingCount(self: *const Scheduler, kind: QueueKind) usize {
+        return self.queueForConst(kind).pending.items.len;
+    }
+
+    /// Bulk memory writes must retain word publication for any active command
+    /// snapshot, even after its arena leaves the caller's recent-alias ring.
+    pub fn overlapsActiveSnapshot(self: *Scheduler, address: u64, size: usize) bool {
+        if (size == 0) return false;
+        const end = std.math.add(u64, address, size) catch return true;
+        self.snapshot_lock.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.snapshot_lock.unlock(std.Io.Threaded.global_single_threaded.io());
+        for ([_]QueueKind{ .graphics, .compute }) |kind| {
+            const active = if (self.queueFor(kind).active) |*submission| submission else continue;
+            for (active.snapshots.items) |snapshot| {
+                const snapshot_end = std.math.add(u64, snapshot.address, snapshot.words.len * @sizeOf(u32)) catch return true;
+                if (address < snapshot_end and snapshot.address < end) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Mirrors an explicit label write into the active submission's retained
+    /// indirect-buffer snapshot. Command arenas may place synchronization
+    /// labels beside PM4 packets; reading only the immutable snapshot after a
+    /// host-side recovery write would otherwise observe the old label forever.
+    pub fn mirrorActiveWrite(
+        self: *Scheduler,
+        kind: QueueKind,
+        address: u64,
+        bytes: []const u8,
+    ) bool {
+        self.snapshot_lock.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.snapshot_lock.unlock(std.Io.Threaded.global_single_threaded.io());
+        const queue = self.queueFor(kind);
+        const active = if (queue.active) |*submission| submission else return false;
+        const requested_end = std.math.add(u64, address, bytes.len) catch return false;
+        for (active.snapshots.items) |*snapshot| {
+            if (address < snapshot.address) continue;
+            const destination = std.mem.sliceAsBytes(snapshot.words);
+            const snapshot_end = std.math.add(u64, snapshot.address, destination.len) catch continue;
+            if (requested_end > snapshot_end) continue;
+            const offset: usize = @intCast(address - snapshot.address);
+            @memcpy(destination[offset..][0..bytes.len], bytes);
+            return true;
+        }
+        return false;
+    }
+
+    /// Satisfies exactly one re-poll of the active WAIT_REG_MEM without
+    /// changing guest memory. This is used when the watched address overlaps
+    /// protected allocator metadata and publishing the synthetic recovery
+    /// value would corrupt the guest heap.
+    pub fn softSatisfyActiveWait(
+        self: *Scheduler,
+        kind: QueueKind,
+        wait: gpu_state.WaitRegMem,
+        forced_value: u64,
+    ) bool {
+        if (!wait.memory_space) return false;
+        const queue = self.queueFor(kind);
+        const active = queue.active orelse return false;
+        if (active.continuation == null) return false;
+        const blocked = queue.state.blocked_wait orelse return false;
+        if (!std.meta.eql(blocked, wait)) return false;
+
+        var forced = ForcedRead{ .address = wait.address, .length = switch (wait.width) {
+            .bits_32 => 4,
+            .bits_64 => 8,
+        } };
+        switch (wait.width) {
+            .bits_32 => std.mem.writeInt(u32, forced.bytes[0..4], @truncate(forced_value), .little),
+            .bits_64 => std.mem.writeInt(u64, &forced.bytes, forced_value, .little),
+        }
+        queue.forced_read = forced;
+        return true;
+    }
+
+    /// Rewrites the active retained WAIT_REG_MEM comparison to "always" so
+    /// the next resume advances past it. This is reserved for comparisons for
+    /// which no bit pattern can satisfy the encoded mask/reference pair: a
+    /// real producer cannot unblock those, and they arise when recycled DCB
+    /// allocation data is decoded as a trailing wait packet.
+    pub fn bypassImpossibleActiveWait(
+        self: *Scheduler,
+        kind: QueueKind,
+        wait: gpu_state.WaitRegMem,
+    ) bool {
+        const queue = self.queueFor(kind);
+        const active = if (queue.active) |*submission| submission else return false;
+        const resume_path = active.continuation orelse return false;
+        const blocked = queue.state.blocked_wait orelse return false;
+        if (!std.meta.eql(blocked, wait) or resume_path.frame_count == 0) return false;
+
+        const frame = resume_path.frames[resume_path.frame_count - 1];
+        const words: []u32 = if (frame.address == 0) blk: {
+            if (frame.word_count != active.words.len) return false;
+            break :blk active.words;
+        } else snapshot: {
+            for (active.snapshots.items) |candidate| {
+                if (candidate.address != frame.address or candidate.words.len != frame.word_count) continue;
+                break :snapshot candidate.words;
+            }
+            return false;
+        };
+        if (frame.resume_word >= words.len) return false;
+
+        var walker = pm4.Walker.init(words);
+        walker.index = frame.resume_word;
+        const packet = (walker.next() catch return false) orelse return false;
+        if (packet.kind != .command) return false;
+        const body_start = frame.resume_word + 1;
+        const control_word: usize = if (packet.opcode == pm4.wait_reg_mem) standard: {
+            if (packet.body.len < 6) return false;
+            break :standard body_start;
+        } else if (pm4.customCode(packet)) |code| custom: {
+            if (code == pm4.custom.wait_mem_64) {
+                if (packet.body.len < 8) return false;
+                break :custom body_start + 6;
+            }
+            if (code != pm4.custom.wait_mem_32) return false;
+            if (packet.body.len == 5) break :custom body_start + 3;
+            if (packet.body.len < 6) return false;
+            break :custom body_start + 4;
+        } else return false;
+        words[control_word] &= ~@as(u32, 0x7);
+        return true;
+    }
+
+    /// Owns a copy immediately: AGC may recycle the caller's command arena as
+    /// soon as submit returns, while a blocked queue must retain its root DCB
+    /// and every indirect command/register buffer reachable from it.
+    pub fn submit(self: *Scheduler, kind: QueueKind, stream: []const u32) Error!PumpReport {
+        return self.submitWithBackend(kind, stream, self.backend);
+    }
+
+    /// Retains the originating backend with the submission, including across
+    /// cross-queue waits. Its context must remain valid until completion.
+    pub fn submitWithBackend(self: *Scheduler, kind: QueueKind, stream: []const u32, backend: executor.Backend) Error!PumpReport {
+        if (stream.len == 0) return Error.InvalidPacket;
+        var submission = try self.copySubmission(stream, backend);
+        self.queueFor(kind).pending.append(self.allocator, submission) catch |err| {
+            submission.deinit(self.allocator);
+            return err;
+        };
+        return self.pump();
+    }
+
+    /// Rechecks blocked heads and drains newly runnable FIFO work. Callers use
+    /// this after a synchronous `RELEASE_MEM`, or after an asynchronous backend
+    /// reports that its release-label write has actually completed.
+    pub fn pump(self: *Scheduler) Error!PumpReport {
+        var report = PumpReport{};
+        while (true) {
+            var made_progress = false;
+            const steps: [2]Step = if (self.parallel_commands)
+                try self.stepQueuesParallel()
+            else
+                .{ try self.stepQueue(.graphics), try self.stepQueue(.compute) };
+            for (steps) |step| {
+                switch (step) {
+                    .idle => {},
+                    .blocked => |result| report.record(result),
+                    .completed => |result| {
+                        report.record(result);
+                        report.completed_submissions += 1;
+                        made_progress = true;
+                    },
+                }
+            }
+            if (!made_progress) return report;
+        }
+    }
+
+    const Step = union(enum) {
+        idle,
+        blocked: executor.Result,
+        completed: executor.Result,
+    };
+
+    fn stepQueuesParallel(self: *Scheduler) Error![2]Step {
+        var snapshots: [2]SnapshotBackend = undefined;
+        var vtables: [2]executor.Backend.VTable = undefined;
+        var executions: [2]command_workers.Execution = undefined;
+        var tasks: [2]?*command_workers.Execution = @splat(null);
+        defer for (tasks) |task| if (task) |current| current.deinit();
+        for ([_]QueueKind{ .graphics, .compute }, 0..) |kind, index| {
+            const queue = self.queueFor(kind);
+            if (queue.active == null) {
+                if (queue.pending.items.len == 0) continue;
+                queue.active = queue.pending.orderedRemove(0);
+            }
+            const active = &queue.active.?;
+            snapshots[index] = .{
+                .original = active.backend,
+                .snapshot_lock = &self.snapshot_lock,
+                .snapshots = active.snapshots.items,
+                .forced_read = queue.forced_read,
+                .gpu_work_seen = active.gpu_work_seen,
+            };
+            vtables[index] = snapshots[index].makeVtable();
+            executions[index] = .{
+                .registers = &queue.state,
+                .stream = active.words,
+                .continuation = active.continuation,
+                .backend = .{ .context = &snapshots[index], .vtable = &vtables[index] },
+            };
+            tasks[index] = &executions[index];
+        }
+        if (!self.command_pool.run(tasks)) return .{
+            try self.stepQueue(.graphics), try self.stepQueue(.compute),
+        };
+        var steps: [2]Step = @splat(.idle);
+        var failure: ?Error = null;
+        for ([_]QueueKind{ .graphics, .compute }, 0..) |kind, index| {
+            const task = tasks[index] orelse continue;
+            const queue = self.queueFor(kind);
+            queue.forced_read = null;
+            if (task.failure) |err| {
+                self.discardActive(queue);
+                failure = failure orelse err;
+                continue;
+            }
+            const result = task.result orelse return Error.InvalidContinuation;
+            const active = &queue.active.?;
+            active.gpu_work_seen = snapshots[index].gpu_work_seen;
+            if (result.status == .blocked) {
+                active.continuation = result.continuation orelse return Error.InvalidContinuation;
+                steps[index] = .{ .blocked = result };
+            } else {
+                self.discardActive(queue);
+                steps[index] = .{ .completed = result };
+            }
+        }
+        if (failure) |err| return err;
+        return steps;
+    }
+
+    fn stepQueue(self: *Scheduler, kind: QueueKind) Error!Step {
+        const queue = self.queueFor(kind);
+        if (queue.active == null) {
+            if (queue.pending.items.len == 0) return .idle;
+            queue.active = queue.pending.orderedRemove(0);
+        }
+
+        const active = &queue.active.?;
+        const forced_read = queue.forced_read;
+        queue.forced_read = null;
+        var snapshot_backend = SnapshotBackend{
+            .original = active.backend,
+            .snapshots = active.snapshots.items,
+            .forced_read = forced_read,
+            .gpu_work_seen = active.gpu_work_seen,
+        };
+        var snapshot_vtable = snapshot_backend.makeVtable();
+        var dcb_executor = executor.DcbExecutor{
+            .state = &queue.state,
+            .backend = .{ .context = &snapshot_backend, .vtable = &snapshot_vtable },
+            .allocator = self.allocator,
+        };
+        const result = (if (active.continuation) |resume_point|
+            dcb_executor.resumeFrom(active.words, resume_point)
+        else
+            dcb_executor.execute(active.words)) catch |err| {
+            self.discardActive(queue);
+            return err;
+        };
+        active.gpu_work_seen = snapshot_backend.gpu_work_seen;
+
+        if (result.status == .blocked) {
+            active.continuation = result.continuation orelse return Error.InvalidContinuation;
+            return .{ .blocked = result };
+        }
+
+        self.discardActive(queue);
+        return .{ .completed = result };
+    }
+
+    fn discardActive(self: *Scheduler, queue: *Queue) void {
+        var finished = queue.active orelse return;
+        queue.active = null;
+        finished.deinit(self.allocator);
+    }
+
+    fn deinitQueue(self: *Scheduler, queue: *Queue) void {
+        self.discardActive(queue);
+        for (queue.pending.items) |*submission| submission.deinit(self.allocator);
+        queue.pending.deinit(self.allocator);
+        queue.pending = .empty;
+    }
+
+    fn copySubmission(self: *Scheduler, stream: []const u32, backend: executor.Backend) Error!Submission {
+        var submission = Submission{ .words = try self.allocator.dupe(u32, stream), .backend = backend };
+        errdefer submission.deinit(self.allocator);
+
+        var active_addresses: [executor.maximum_stream_depth]u64 = undefined;
+        try self.snapshotStream(
+            &submission,
+            submission.words,
+            @intFromPtr(stream.ptr),
+            0,
+            &active_addresses,
+        );
+        return submission;
+    }
+
+    fn snapshotStream(
+        self: *Scheduler,
+        submission: *Submission,
+        stream: []const u32,
+        stream_address: u64,
+        depth: usize,
+        active_addresses: *[executor.maximum_stream_depth]u64,
+    ) Error!void {
+        var walker = pm4.Walker.init(stream);
+        var current_address = stream_address;
+        var current_stream = stream;
+        var chained_addresses = std.AutoHashMap(u64, void).init(self.allocator);
+        defer chained_addresses.deinit();
+        while (true) {
+            const packet = walker.next() catch |err| {
+                const offset = @min(walker.index, current_stream.len);
+                const header = if (offset < current_stream.len) current_stream[offset] else 0;
+                std.debug.print(
+                    "[gpu scheduler] {s} stream @0x{x} stopped at {d}/{d} header=0x{x:0>8}: {s}\n",
+                    .{
+                        if (depth == 0) "root" else "indirect",
+                        current_address,
+                        offset,
+                        current_stream.len,
+                        header,
+                        @errorName(err),
+                    },
+                );
+                return err;
+            } orelse break;
+            if (pm4.indirectRegisterSpaceOf(packet.opcode) != null and packet.body.len == 4) {
+                const address = (@as(u64, packet.body[1]) << 32) | (packet.body[0] & 0xffff_fffc);
+                const count: usize = packet.body[3] & 0x3fff;
+                if (address != 0 and count != 0) {
+                    const word_count = std.math.mul(usize, count, 2) catch return Error.InvalidPacket;
+                    _ = try self.captureWords(submission, address, word_count, false);
+                }
+            } else if (pm4.customCode(packet)) |code| {
+                const is_indirect_registers = code == pm4.custom.context_regs_indirect or
+                    code == pm4.custom.sh_regs_indirect or
+                    code == pm4.custom.uconfig_regs_indirect;
+                if (is_indirect_registers and packet.body.len >= 3) {
+                    const address = (@as(u64, packet.body[2]) << 32) | (packet.body[1] & 0xffff_fffc);
+                    const count: usize = packet.body[0] & 0x3fff;
+                    if (address != 0 and count != 0) {
+                        const word_count = std.math.mul(usize, count, 2) catch return Error.InvalidPacket;
+                        _ = try self.captureWords(submission, address, word_count, false);
+                    }
+                }
+            }
+
+            if (packet.kind != .command or packet.opcode != pm4.indirect_buffer) continue;
+            if (packet.body.len == 3) {
+                const address = (@as(u64, packet.body[1]) << 32) | packet.body[0];
+                const word_count: usize = packet.body[2] & 0x000f_ffff;
+                const chain = packet.body[2] & (1 << 20) != 0;
+                if (chain and depth != 0) {
+                    if (address == 0 or address & 3 != 0 or word_count == 0) return;
+                    for (active_addresses[0 .. depth - 1]) |active| {
+                        if (active == address) return;
+                    }
+                    try chained_addresses.put(current_address, {});
+                    if (chained_addresses.contains(address)) return;
+                    current_stream = try self.captureWords(submission, address, word_count, true);
+                    current_address = address;
+                    active_addresses[depth - 1] = address;
+                    walker = pm4.Walker.init(current_stream);
+                    continue;
+                }
+                try self.snapshotIndirectStream(submission, address, word_count, depth, active_addresses);
+                if (chain) return;
+            } else if (packet.body.len == 13) {
+                const then_address = (@as(u64, packet.body[8]) << 32) | packet.body[7];
+                const then_count: usize = packet.body[9] & 0x000f_ffff;
+                try self.snapshotIndirectStream(submission, then_address, then_count, depth, active_addresses);
+
+                const else_address = (@as(u64, packet.body[11]) << 32) | packet.body[10];
+                const else_count: usize = packet.body[12] & 0x000f_ffff;
+                try self.snapshotIndirectStream(submission, else_address, else_count, depth, active_addresses);
+            }
+        }
+    }
+
+    fn snapshotIndirectStream(
+        self: *Scheduler,
+        submission: *Submission,
+        address: u64,
+        word_count: usize,
+        depth: usize,
+        active_addresses: *[executor.maximum_stream_depth]u64,
+    ) Error!void {
+        if (address == 0 or address & 0x3 != 0 or word_count == 0) return;
+        if (depth + 1 >= executor.maximum_stream_depth) return;
+        for (active_addresses[0..depth]) |active| {
+            if (active == address) return;
+        }
+
+        const child = try self.captureWords(submission, address, word_count, true);
+        active_addresses[depth] = address;
+        try self.snapshotStream(submission, child, address, depth + 1, active_addresses);
+    }
+
+    fn captureWords(
+        self: *Scheduler,
+        submission: *Submission,
+        address: u64,
+        word_count: usize,
+        command_stream: bool,
+    ) Error![]const u32 {
+        const byte_count = std.math.mul(usize, word_count, @sizeOf(u32)) catch return Error.InvalidPacket;
+        const requested_end = std.math.add(u64, address, byte_count) catch return Error.InvalidPacket;
+
+        for (submission.snapshots.items) |*snapshot| {
+            if (address < snapshot.address) continue;
+            const snapshot_bytes = std.mem.sliceAsBytes(snapshot.words);
+            const snapshot_end = std.math.add(u64, snapshot.address, snapshot_bytes.len) catch continue;
+            if (requested_end > snapshot_end) continue;
+            const offset: usize = @intCast(address - snapshot.address);
+            if (offset & 0x3 != 0) return Error.InvalidPacket;
+            const selected = snapshot.words[offset / 4 ..][0..word_count];
+            if (command_stream and !containsGpuWork(selected)) snapshot.live_after_gpu_work = true;
+            return selected;
+        }
+
+        const words = try self.allocator.alloc(u32, word_count);
+        errdefer self.allocator.free(words);
+        if (!submission.backend.vtable.read(submission.backend.context, address, std.mem.sliceAsBytes(words))) {
+            return Error.MemoryReadFailed;
+        }
+        try submission.snapshots.append(self.allocator, .{
+            .address = address,
+            .words = words,
+            .live_after_gpu_work = command_stream and !containsGpuWork(words),
+        });
+        return words;
+    }
+
+    fn containsGpuWork(words: []const u32) bool {
+        var walker = pm4.Walker.init(words);
+        while (walker.next() catch return false) |packet| {
+            if (packet.kind == .command and
+                (pm4.isDraw(packet.opcode) or pm4.isDispatch(packet.opcode)))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn queueFor(self: *Scheduler, kind: QueueKind) *Queue {
+        return switch (kind) {
+            .graphics => &self.graphics,
+            .compute => &self.compute,
+        };
+    }
+
+    fn queueForConst(self: *const Scheduler, kind: QueueKind) *const Queue {
+        return switch (kind) {
+            .graphics => &self.graphics,
+            .compute => &self.compute,
+        };
+    }
+};
+
+/// Presents immutable submission snapshots at their original guest addresses
+/// while forwarding every other operation to the live renderer/backend.
+const SnapshotBackend = struct {
+    original: executor.Backend,
+    snapshot_lock: ?*std.Io.Mutex = null,
+    snapshots: []const Snapshot,
+    forced_read: ?ForcedRead,
+    gpu_work_seen: bool,
+
+    fn from(context: ?*anyopaque) *SnapshotBackend {
+        return @ptrCast(@alignCast(context.?));
+    }
+
+    fn makeVtable(self: *const SnapshotBackend) executor.Backend.VTable {
+        return .{
+            .read = read,
+            .write = write,
+            .read_live = readLive,
+            .read_wait = readWait,
+            .read_snapshot = if (self.snapshot_lock != null) readSnapshot else null,
+            .acquire = if (self.original.vtable.acquire != null) acquire else null,
+            .release = if (self.original.vtable.release != null) release else null,
+            .wait = if (self.original.vtable.wait != null) wait else null,
+            .write_data = if (self.original.vtable.write_data != null) writeData else null,
+            .dma_data = if (self.original.vtable.dma_data != null) dmaData else null,
+            .event = if (self.original.vtable.event != null) event else null,
+            .flip = if (self.original.vtable.flip != null) flip else null,
+            .draw = if (self.original.vtable.draw != null) draw else null,
+            .dispatch = if (self.original.vtable.dispatch != null) dispatch else null,
+        };
+    }
+
+    fn readSnapshot(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self = from(context);
+        const lock = self.snapshot_lock orelse return false;
+        lock.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer lock.unlock(std.Io.Threaded.global_single_threaded.io());
+        for (self.snapshots) |snapshot| {
+            // GPU-generated streams must observe preceding queued dispatches.
+            // They take the owner path even before the first producer runs.
+            if (address < snapshot.address) continue;
+            const source = std.mem.sliceAsBytes(snapshot.words);
+            const offset64 = address - snapshot.address;
+            if (offset64 > source.len) continue;
+            const offset: usize = @intCast(offset64);
+            if (bytes.len > source.len - offset) continue;
+            if (snapshot.live_after_gpu_work) return false;
+            @memcpy(bytes, source[offset..][0..bytes.len]);
+            return true;
+        }
+        return false;
+    }
+
+    fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self = from(context);
+        for (self.snapshots) |snapshot| {
+            if (address < snapshot.address) continue;
+            const source = std.mem.sliceAsBytes(snapshot.words);
+            const offset64 = address - snapshot.address;
+            if (offset64 > source.len) continue;
+            const offset: usize = @intCast(offset64);
+            if (bytes.len > source.len - offset) continue;
+            if (snapshot.live_after_gpu_work and self.gpu_work_seen and
+                self.original.vtable.read(self.original.context, address, bytes))
+            {
+                if (!std.mem.eql(u8, bytes, source[offset..][0..bytes.len]) and
+                    live_indirect_refresh_reports.fetchAdd(1, .monotonic) < 32)
+                {
+                    std.debug.print(
+                        "[gpu scheduler] refreshed GPU-generated indirect stream @0x{x} words={d}\n",
+                        .{ address, bytes.len / @sizeOf(u32) },
+                    );
+                    reportRefreshedStream(address, bytes);
+                }
+                return true;
+            }
+            @memcpy(bytes, source[offset..][0..bytes.len]);
+            return true;
+        }
+        return self.original.vtable.read(self.original.context, address, bytes);
+    }
+
+    fn readLive(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self = from(context);
+        const callback = self.original.vtable.read_live orelse self.original.vtable.read;
+        return callback(self.original.context, address, bytes);
+    }
+
+    fn readWait(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self = from(context);
+        if (self.forced_read) |forced| {
+            if (address == forced.address and bytes.len == forced.length) {
+                @memcpy(bytes, forced.bytes[0..forced.length]);
+                return true;
+            }
+        }
+        const callback = self.original.vtable.read_wait orelse self.original.vtable.read;
+        return callback(self.original.context, address, bytes);
+    }
+
+    fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+        const self = from(context);
+        return self.original.vtable.write(self.original.context, address, bytes);
+    }
+
+    fn acquire(context: ?*anyopaque, value: gpu_state.AcquireMem) bool {
+        const self = from(context);
+        return self.original.vtable.acquire.?(self.original.context, value);
+    }
+
+    fn release(context: ?*anyopaque, value: gpu_state.ReleaseMem) bool {
+        const self = from(context);
+        return self.original.vtable.release.?(self.original.context, value);
+    }
+
+    fn wait(context: ?*anyopaque, value: gpu_state.WaitRegMem, satisfied: bool) bool {
+        const self = from(context);
+        return self.original.vtable.wait.?(self.original.context, value, satisfied);
+    }
+
+    fn writeData(context: ?*anyopaque, value: gpu_state.WriteData, words: []const u32) bool {
+        const self = from(context);
+        return self.original.vtable.write_data.?(self.original.context, value, words);
+    }
+
+    fn dmaData(context: ?*anyopaque, value: gpu_state.DmaData) bool {
+        const self = from(context);
+        return self.original.vtable.dma_data.?(self.original.context, value);
+    }
+
+    fn event(context: ?*anyopaque, value: gpu_state.EventWrite) bool {
+        const self = from(context);
+        return self.original.vtable.event.?(self.original.context, value);
+    }
+
+    fn flip(context: ?*anyopaque, value: gpu_state.Flip) bool {
+        const self = from(context);
+        return self.original.vtable.flip.?(self.original.context, value);
+    }
+
+    fn draw(context: ?*anyopaque, state: *const gpu_state.State, packet: pm4.Packet) bool {
+        const self = from(context);
+        return self.original.vtable.draw.?(self.original.context, state, packet);
+    }
+
+    fn dispatch(context: ?*anyopaque, state: *const gpu_state.State, packet: pm4.Packet) bool {
+        const self = from(context);
+        const accepted = self.original.vtable.dispatch.?(self.original.context, state, packet);
+        if (accepted) self.gpu_work_seen = true;
+        return accepted;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+
+const pm4 = @import("pm4.zig");
+const testing = std.testing;
+
+const FakeBackend = struct {
+    base: u64 = 0x1000,
+    memory: [4096]u8 = [_]u8{0} ** 4096,
+    events: [8]u8 = [_]u8{0} ** 8,
+    event_count: usize = 0,
+    generated_stream_address: u64 = 0,
+    generated_event: u8 = 0,
+
+    fn interface(self: *FakeBackend) executor.Backend {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn putWords(self: *FakeBackend, address: u64, words: []const u32) void {
+        const offset: usize = @intCast(address - self.base);
+        for (words, 0..) |word, index| {
+            std.mem.writeInt(u32, self.memory[offset + index * 4 ..][0..4], word, .little);
+        }
+    }
+
+    const vtable = executor.Backend.VTable{
+        .read = read,
+        .write = write,
+        .event = event,
+        .dispatch = dispatch,
+    };
+
+    fn from(context: ?*anyopaque) *FakeBackend {
+        return @ptrCast(@alignCast(context.?));
+    }
+
+    fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self = from(context);
+        if (address < self.base) return false;
+        const offset: usize = @intCast(address - self.base);
+        if (offset + bytes.len > self.memory.len) return false;
+        @memcpy(bytes, self.memory[offset .. offset + bytes.len]);
+        return true;
+    }
+
+    fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+        const self = from(context);
+        if (address < self.base) return false;
+        const offset: usize = @intCast(address - self.base);
+        if (offset + bytes.len > self.memory.len) return false;
+        @memcpy(self.memory[offset .. offset + bytes.len], bytes);
+        return true;
+    }
+
+    fn event(context: ?*anyopaque, value: gpu_state.EventWrite) bool {
+        const self = from(context);
+        if (self.event_count >= self.events.len) return false;
+        self.events[self.event_count] = value.event_type;
+        self.event_count += 1;
+        return true;
+    }
+
+    fn dispatch(context: ?*anyopaque, _: *const gpu_state.State, _: pm4.Packet) bool {
+        const self = from(context);
+        if (self.generated_stream_address != 0) {
+            self.putWords(self.generated_stream_address, &.{
+                command(pm4.event_write, 1),
+                self.generated_event,
+            });
+        }
+        return true;
+    }
+};
+
+fn command(opcode: u8, body_words: u14) u32 {
+    return (@as(u32, 3) << 30) |
+        (@as(u32, body_words - 1) << 16) |
+        (@as(u32, opcode) << 8);
+}
+
+fn customCommand(code: u6, body_words: u14) u32 {
+    return command(pm4.nop, body_words) | (@as(u32, code) << 2);
+}
+
+test "COPY_DATA reads current data inside a retained command allocation" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{};
+        const child = [_]u32{
+            command(pm4.nop, 3),       0xcafe,                   0,                         0,
+            command(pm4.copy_data, 5), 2 | (2 << 8) | (1 << 16), 0x1108,                    0,
+            0x1200,                    0,                        command(pm4.copy_data, 5), 2 | (2 << 8) | (1 << 16),
+            0x1200,                    0,                        0x1210,                    0,
+        };
+        host.putWords(0x1100, &child);
+        const root = [_]u32{
+            customCommand(pm4.custom.wait_mem_32, 6), 0x1080, 0, 0xffff_ffff,             1, 0x13, 1,
+            command(pm4.indirect_buffer, 3),          0x1100, 0, 0x0f20_0000 | child.len,
+        };
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+        _ = try scheduler.submit(.graphics, &root);
+        try testing.expect(scheduler.isBlocked(.graphics));
+        // The retained child has zeroes here. Only data reads should see this
+        // later write; its PM4 instructions must still come from the snapshot.
+        host.putWords(0x1108, &.{ 0x1122_3344, 0x5566_7788 });
+        host.putWords(0x1080, &.{1});
+        const resumed = try scheduler.pump();
+        try testing.expectEqual(@as(usize, 1), resumed.completed_submissions);
+        for ([_]usize{ 0x200, 0x210 }) |offset| {
+            try testing.expectEqual(@as(u64, 0x5566_7788_1122_3344), std.mem.readInt(u64, host.memory[offset..][0..8], .little));
+        }
+    }
+}
+
+test "COPY_DATA cannot copy a synthetic wait recovery value" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{};
+        host.putWords(0x1200, &.{0xdead_beef});
+        const root = [_]u32{
+            customCommand(pm4.custom.wait_mem_32, 6), 0x1080,       0,      0xffff_ffff, 1,      0x13, 1,
+            command(pm4.copy_data, 5),                2 | (2 << 8), 0x1080, 0,           0x1200, 0,
+        };
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+        _ = try scheduler.submit(.graphics, &root);
+        try testing.expect(scheduler.isBlocked(.graphics));
+        try testing.expect(scheduler.softSatisfyActiveWait(.graphics, scheduler.state(.graphics).blocked_wait.?, 1));
+        const resumed = try scheduler.pump();
+        try testing.expectEqual(@as(usize, 1), resumed.completed_submissions);
+        // Recovery satisfies the wait without modifying guest data at 0x1080.
+        try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x200..][0..4], .little));
+    }
+}
+
+test "COPY_DATA memory selectors do not change meaning with engine selection" {
+    var host = FakeBackend{};
+    host.putWords(0x1100, &.{ 0x1122_3344, 0x5566_7788 });
+    // PM4 selectors are independent of engine bits 30..31. Destination 5
+    // is the legacy memory selector, not the source's immediate selector.
+    for ([_]u32{ 1, 2 }) |source| {
+        for ([_]u32{ 1, 2, 5 }) |destination| {
+            for ([_]u32{ 0, 1 }) |engine| {
+                host.putWords(0x1200, &.{ 0, 0 });
+                const stream = [_]u32{
+                    command(pm4.copy_data, 5), source | (destination << 8) | (1 << 16) | (engine << 30),
+                    0x1100,                    0,
+                    0x1200,                    0,
+                };
+                var state = gpu_state.State{};
+                var runner = executor.DcbExecutor{ .state = &state, .backend = host.interface(), .allocator = testing.allocator };
+                _ = try runner.execute(&stream);
+                try testing.expectEqual(@as(u64, 0x5566_7788_1122_3344), std.mem.readInt(u64, host.memory[0x200..][0..8], .little));
+            }
+        }
+    }
+}
+
+test "COPY_DATA rejects malformed packets and propagates memory failures" {
+    var host = FakeBackend{};
+    host.putWords(0x1100, &.{ 0x1122_3344, 0x5566_7788 });
+    host.putWords(0x1200, &.{ 0xdead_beef, 0xdead_beef });
+    const before = host.memory;
+    var state = gpu_state.State{};
+    var runner = executor.DcbExecutor{ .state = &state, .backend = host.interface(), .allocator = testing.allocator };
+    const valid = [_]u32{ command(pm4.copy_data, 5), 2 | (2 << 8) | (1 << 16), 0x1100, 0, 0x1200, 0 };
+    try testing.expectError(error.Truncated, runner.execute(valid[0..5]));
+    var malformed = valid;
+    malformed[0] = command(pm4.copy_data, 4);
+    try testing.expectError(error.InvalidPacket, runner.execute(malformed[0..5]));
+    for ([_]usize{ 2, 4 }) |address_word| {
+        malformed = valid;
+        malformed[address_word] = 0;
+        try testing.expectError(error.InvalidPacket, runner.execute(&malformed));
+        malformed[address_word] = 0x2000; // Just outside the backend's memory.
+        const expected: anyerror = if (address_word == 2) error.MemoryReadFailed else error.MemoryWriteFailed;
+        try testing.expectError(expected, runner.execute(&malformed));
+    }
+    try testing.expectEqualSlices(u8, &before, &host.memory);
+}
+
+test "long tail chains retain their submitted contents while the root waits" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{};
+        const link_count = executor.maximum_stream_depth + 22;
+        const tail_address = 0x1100 + link_count * 16;
+        const tail = [_]u32{
+            command(pm4.set_context_reg, 2), 0x318, 0x1234_5678,
+            command(pm4.event_write, 1),     0x2a,
+        };
+        for (0..link_count) |index| {
+            const address = 0x1100 + index * 16;
+            const next_count: u32 = if (index + 1 == link_count) tail.len else 4;
+            host.putWords(address, &.{ command(pm4.indirect_buffer, 3), @intCast(address + 16), 0, 0x0f30_0000 | next_count });
+        }
+        host.putWords(tail_address, &tail);
+        const root = [_]u32{
+            customCommand(pm4.custom.wait_mem_32, 6), 0x1080,
+            0,                                        0xffff_ffff,
+            1,                                        0x13,
+            1,                                        command(pm4.indirect_buffer, 3),
+            0x1100,                                   0,
+            0x0f30_0004, 0x4000_0000, // Unreachable, invalid packet after CHAIN.
+        };
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+        _ = try scheduler.submit(.graphics, &root);
+        try testing.expect(scheduler.isBlocked(.graphics));
+        @memset(host.memory[0x100..], 0xff);
+        std.mem.writeInt(u32, host.memory[0x80..0x84], 1, .little);
+        const resumed = try scheduler.pump();
+        try testing.expectEqual(@as(usize, 1), resumed.completed_submissions);
+        try testing.expectEqualSlices(u8, &.{0x2a}, host.events[0..host.event_count]);
+        try testing.expectEqual(@as(?u32, 0x1234_5678), scheduler.state(.graphics).readRegister(.context, 0x318));
+    }
+}
+
+test "synchronization labels inside retained command buffers stay live" {
+    for ([_]bool{ false, true }) |parallel| {
+        inline for (.{ false, true }) |wide| {
+            var host = FakeBackend{};
+            const child: []const u32 = if (wide) &.{
+                command(pm4.nop, 3),                      0xcafe,                      0,    0,
+                customCommand(pm4.custom.wait_mem_64, 8), 0x1108,                      0,    0xffff_ffff,
+                0xffff_ffff,                              1,                           1,    0x13,
+                1,                                        command(pm4.event_write, 1), 0x21,
+            } else &.{
+                command(pm4.nop, 3),                      0xcafe, 0, 0,
+                customCommand(pm4.custom.wait_mem_32, 6), 0x1108, 0, 0xffff_ffff,
+                1,                                        0x13,   1, command(pm4.event_write, 1),
+                0x21,
+            };
+            host.putWords(0x1100, child);
+            const graphics = [_]u32{ command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f20_0000 | @as(u32, @intCast(child.len)) };
+            const compute = [_]u32{
+                customCommand(pm4.custom.release_mem, 7), 0x28 | (5 << 8),
+                @as(u32, if (wide) 2 else 1) << 29,       0x1108,
+                0,                                        1,
+                if (wide) 1 else 0,                       0,
+            };
+            var scheduler = Scheduler.init(testing.allocator, host.interface());
+            defer scheduler.deinit();
+            scheduler.parallel_commands = parallel;
+            _ = try scheduler.submit(.graphics, &graphics);
+            try testing.expect(scheduler.isBlocked(.graphics));
+            // Recycling command bytes cannot alter the retained event. The label
+            // inside the same allocation must still see the other queue's write.
+            host.putWords(0x1100 + (child.len - 1) * 4, &.{0x7f});
+            const released = try scheduler.submit(.compute, &compute);
+            try testing.expectEqual(@as(usize, 2), released.completed_submissions);
+            try testing.expect(!scheduler.isBlocked(.graphics));
+            try testing.expectEqualSlices(u8, &.{0x21}, host.events[0..host.event_count]);
+            try testing.expectEqual(@as(u64, if (wide) 0x1_0000_0001 else 1), std.mem.readInt(u64, host.memory[0x108..0x110], .little));
+        }
+    }
+}
+
+test "an empty indirect command buffer is read live after a producing dispatch" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{
+            .generated_stream_address = 0x1100,
+            .generated_event = 0x2a,
+        };
+        const stream = [_]u32{
+            command(pm4.dispatch_direct, 4),
+            1,
+            1,
+            1,
+            0,
+            command(pm4.indirect_buffer, 3),
+            0x1100,
+            0,
+            0x0f20_0002,
+        };
+
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+
+        const report = try scheduler.submit(.graphics, &stream);
+        try testing.expectEqual(@as(usize, 1), report.completed_submissions);
+        try testing.expectEqual(@as(usize, 1), report.dispatches);
+        try testing.expectEqualSlices(u8, &.{0x2a}, host.events[0..host.event_count]);
+    }
+}
+
+test "release on compute resumes graphics and drains its FIFO without replay" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{};
+        const child = [_]u32{
+            command(pm4.event_write, 1),              0x20,
+            customCommand(pm4.custom.wait_mem_32, 6), 0x1080,
+            0,                                        0xffff_ffff,
+            1,                                        0x13,
+            1,                                        command(pm4.set_context_reg_indirect, 4),
+            0x1180,                                   0,
+            0,                                        1,
+            command(pm4.event_write, 1),              0x21,
+        };
+        host.putWords(0x1100, &child);
+        host.putWords(0x1180, &.{ 0x318, 0x1234_5678 });
+        var graphics = [_]u32{
+            command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f20_0000 | child.len,
+        };
+        const queued_graphics = [_]u32{ command(pm4.event_write, 1), 0x22 };
+        const compute = [_]u32{
+            customCommand(pm4.custom.release_mem, 7),
+            0x28 | (5 << 8),
+            (1 << 29),
+            0x1080,
+            0,
+            1,
+            0,
+            0,
+        };
+
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+
+        const blocked = try scheduler.submit(.graphics, &graphics);
+        try testing.expect(blocked.blocked_checks != 0);
+        try testing.expect(scheduler.isBlocked(.graphics));
+        try testing.expectEqual(@as(u8, 2), scheduler.continuation(.graphics).?.frame_count);
+        try testing.expectEqual(@as(usize, 1), host.event_count);
+        try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x80..0x84], .little));
+
+        // The scheduler owns the root DCB; recycling the caller's words cannot
+        // redirect the saved indirect continuation. The child command buffer and
+        // its indirect register list are equally immutable after submission.
+        graphics[1] = 0x11c0;
+        host.putWords(0x1100 + (child.len - 1) * 4, &.{0x7f});
+        host.putWords(0x1180, &.{ 0x318, 0xdead_beef });
+        _ = try scheduler.submit(.graphics, &queued_graphics);
+        try testing.expectEqual(@as(usize, 1), scheduler.pendingCount(.graphics));
+
+        const released = try scheduler.submit(.compute, &compute);
+        try testing.expectEqual(@as(usize, 3), released.completed_submissions);
+        try testing.expect(!scheduler.isBlocked(.graphics));
+        try testing.expectEqual(@as(usize, 0), scheduler.pendingCount(.graphics));
+        try testing.expectEqualSlices(u8, &.{ 0x20, 0x21, 0x22 }, host.events[0..host.event_count]);
+        try testing.expectEqual(
+            @as(?u32, 0x1234_5678),
+            scheduler.state(.graphics).readRegister(.context, 0x318),
+        );
+        try testing.expectEqual(@as(u64, 3), scheduler.state(.graphics).event_count);
+        try testing.expectEqual(@as(u64, 1), scheduler.state(.compute).release_count);
+        if (parallel) try testing.expect(scheduler.command_pool.snapshot_reads != 0);
+        try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, host.memory[0x80..0x84], .little));
+    }
+}
+
+test "a resumed submission retains its originating backend" {
+    for ([_]bool{ false, true }) |parallel| {
+        var original = FakeBackend{};
+        var other = FakeBackend{};
+        const waiting = [_]u32{
+            customCommand(pm4.custom.wait_mem_32, 6), 0x1040, 0, 0xffff_ffff, 1, 0x13, 1,
+            command(pm4.event_write, 1),              0x20,
+        };
+        const ready = [_]u32{ command(pm4.event_write, 1), 0x21 };
+        var scheduler = Scheduler.init(testing.allocator, other.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+        _ = try scheduler.submitWithBackend(.graphics, &waiting, original.interface());
+        try testing.expect(scheduler.isBlocked(.graphics));
+        _ = try scheduler.submit(.compute, &ready);
+        try testing.expectEqual(@as(usize, 0), original.event_count);
+        original.putWords(0x1040, &.{1});
+        try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
+        try testing.expectEqualSlices(u8, &.{0x20}, original.events[0..original.event_count]);
+        try testing.expectEqualSlices(u8, &.{0x21}, other.events[0..other.event_count]);
+    }
+}
+
+test "an unsatisfied queue remains blocked without mutating its label" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{};
+        const wait = [_]u32{
+            customCommand(pm4.custom.wait_mem_32, 6),
+            0x1040,
+            0,
+            0xffff_ffff,
+            9,
+            0x13,
+            1,
+        };
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+
+        _ = try scheduler.submit(.graphics, &wait);
+        const retry = try scheduler.pump();
+        try testing.expectEqual(@as(usize, 0), retry.completed_submissions);
+        try testing.expectEqual(@as(usize, 1), retry.blocked_checks);
+        try testing.expect(scheduler.isBlocked(.graphics));
+        try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x40..0x44], .little));
+    }
+}
+
+test "a protected wait can be soft-satisfied without mutating guest memory" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{};
+        const wait_stream = [_]u32{
+            customCommand(pm4.custom.wait_mem_32, 6),
+            0x1040,
+            0,
+            0xffff_ffff,
+            9,
+            0x13,
+            1,
+        };
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+
+        _ = try scheduler.submit(.graphics, &wait_stream);
+        try testing.expect(scheduler.isBlocked(.graphics));
+        const wait = scheduler.state(.graphics).blocked_wait.?;
+        try testing.expect(scheduler.softSatisfyActiveWait(.graphics, wait, wait.reference));
+        try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
+        try testing.expect(!scheduler.isBlocked(.graphics));
+        try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x40..0x44], .little));
+    }
+}
+
+test "an impossible retained wait can be bypassed without mutating guest memory" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{};
+        const wait_stream = [_]u32{
+            customCommand(pm4.custom.wait_mem_32, 6),
+            0x1040,
+            0,
+            0,
+            1,
+            0x13,
+            1,
+            command(pm4.event_write, 1),
+            0x20,
+        };
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+
+        _ = try scheduler.submit(.graphics, &wait_stream);
+        try testing.expect(scheduler.isBlocked(.graphics));
+        const wait = scheduler.state(.graphics).blocked_wait.?;
+        try testing.expect(scheduler.bypassImpossibleActiveWait(.graphics, wait));
+        try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
+        try testing.expect(!scheduler.isBlocked(.graphics));
+        try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x40..0x44], .little));
+        try testing.expectEqualSlices(u8, &.{0x20}, host.events[0..host.event_count]);
+    }
+}
+
+test "mirroring a snapshot alone does not publish a live synchronization label" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{};
+        const label_address = 0x1128;
+        const child = [_]u32{
+            customCommand(pm4.custom.wait_mem_32, 6),
+            label_address,
+            0,
+            0xffff_ffff,
+            1,
+            0x13,
+            1,
+            command(pm4.event_write, 1),
+            0x20,
+            command(pm4.nop, 1),
+            0,
+        };
+        host.putWords(0x1100, &child);
+        const graphics = [_]u32{
+            command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f20_0000 | child.len,
+        };
+
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+
+        _ = try scheduler.submit(.graphics, &graphics);
+        try testing.expect(scheduler.isBlocked(.graphics));
+
+        var payload: [4]u8 = undefined;
+        try testing.expect(scheduler.overlapsActiveSnapshot(label_address, 4));
+        try testing.expect(scheduler.overlapsActiveSnapshot(0x10fc, 8));
+        try testing.expect(!scheduler.overlapsActiveSnapshot(0x10fc, 4));
+        try testing.expect(!scheduler.overlapsActiveSnapshot(0x1200, 64));
+        std.mem.writeInt(u32, &payload, 1, .little);
+        try testing.expect(scheduler.mirrorActiveWrite(.graphics, label_address, &payload));
+        // Only the snapshot changed. The other queue must publish the real label
+        // before WAIT_REG_MEM can resume; command retention cannot satisfy it.
+        try testing.expect((try scheduler.pump()).blocked_checks != 0);
+        try testing.expect(FakeBackend.vtable.write(&host, label_address, &payload));
+        try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
+        try testing.expect(!scheduler.isBlocked(.graphics));
+        try testing.expect(!scheduler.overlapsActiveSnapshot(label_address, 4));
+        try testing.expectEqualSlices(u8, &.{0x20}, host.events[0..host.event_count]);
+    }
+}

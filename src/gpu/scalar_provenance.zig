@@ -1,0 +1,3358 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Bounded scalar execution at a draw/dispatch boundary.
+//!
+//! The shader receives the exact USER_DATA snapshot captured from PM4. This
+//! evaluator follows its straight scalar prolog, performs checked SMEM reads,
+//! and records which roots contributed to every value. It deliberately stops
+//! at an instruction family whose length/semantics are not known yet.
+
+const std = @import("std");
+const rdna2 = @import("rdna2");
+const shaders = @import("shaders.zig");
+const bit_sets = @import("bit_sets.zig");
+
+pub const maximum_scalar_registers = 128;
+// Dense lighting shaders contain more than 250 distinct scalar loads. Keep
+// their late coefficients even when many instructions reuse the same SGPRs.
+pub const maximum_loads = 512;
+/// A scalar load can write sixteen SGPRs. Keep every recovered write, rather
+/// than only the final value of each physical register, because shaders reuse
+/// the same SGPR window for several descriptors and constant blocks.
+pub const maximum_scalar_specializations = maximum_loads * 16 + maximum_scalar_registers * 2;
+pub const maximum_instructions = 4096;
+const maximum_resource_instructions = 16 * 1024;
+const address_mask: u64 = 0x0000_ffff_ffff_ffff;
+
+pub const Sources = packed struct(u8) {
+    user_data: bool = false,
+    immediate: bool = false,
+    memory: bool = false,
+    program_counter: bool = false,
+    _reserved: u4 = 0,
+
+    pub fn merge(a: Sources, b: Sources) Sources {
+        return @bitCast(@as(u8, @bitCast(a)) | @as(u8, @bitCast(b)));
+    }
+};
+
+pub const ScalarValue = struct {
+    known: bool = false,
+    value: u32 = 0,
+    sources: Sources = .{},
+    producer_pc: u32 = 0,
+    /// Which USER_DATA words reached this register. Bit i is word i.
+    user_bits: u64 = 0,
+};
+
+pub const ScalarRegisters = [maximum_scalar_registers]ScalarValue;
+
+// Uniform SGPR spills use different lanes of the same VGPR as independent
+// slots. This belongs to the representative resource walk, not the CFG proof:
+// per-lane values and writes on paths the walk did not execute stay unknown.
+const LaneSpills = struct {
+    const Slot = struct { vgpr: u32 = 256, lane: u32 = 0, value: ScalarValue = .{} };
+    // Only occupied slots are read. Most walks never spill a scalar register,
+    // so starting/resetting one must not initialize all 128 spill records.
+    slots: [128]Slot = undefined,
+    occupied: u128 = 0,
+
+    fn invalidate(self: *LaneSpills, first: u32, count: u32) void {
+        var remaining = self.occupied;
+        while (remaining != 0) {
+            const index: u7 = @intCast(@ctz(remaining));
+            remaining &= remaining - 1;
+            const slot = &self.slots[index];
+            if (slot.vgpr >= first and slot.vgpr < first + count) {
+                slot.* = .{};
+                self.occupied &= ~(@as(u128, 1) << index);
+            }
+        }
+    }
+
+    fn lane(result: *const Evaluation, op: rdna2.Operand) ?u32 {
+        if (op.absolute or op.negate or op.dpp) return null;
+        return if (source(result, op)) |value| value.value & 63 else null;
+    }
+
+    fn store(self: *LaneSpills, result: *const Evaluation, inst: rdna2.Instruction) void {
+        if (inst.dst.kind != .vgpr) return;
+        const index = lane(result, inst.src1) orelse {
+            self.invalidate(inst.dst.reg, 1);
+            return;
+        };
+        var free: ?usize = null;
+        var remaining = self.occupied;
+        while (remaining != 0) {
+            const slot_index: u7 = @intCast(@ctz(remaining));
+            remaining &= remaining - 1;
+            const slot = &self.slots[slot_index];
+            if (slot.vgpr == inst.dst.reg and slot.lane == index) {
+                free = slot_index;
+                break;
+            }
+        }
+        if (free == null and self.occupied != std.math.maxInt(u128)) free = @intCast(@ctz(~self.occupied));
+        if (free) |slot_index| {
+            const value = if (inst.src0.absolute or inst.src0.negate or inst.src0.dpp) null else source(result, inst.src0);
+            self.slots[slot_index] = if (value) |known| .{ .vgpr = inst.dst.reg, .lane = index, .value = known } else .{};
+            const bit = @as(u128, 1) << @intCast(slot_index);
+            self.occupied = if (value != null) self.occupied | bit else self.occupied & ~bit;
+        }
+    }
+
+    fn restore(self: *const LaneSpills, result: *Evaluation, inst: rdna2.Instruction) void {
+        const index = lane(result, inst.src1);
+        if (inst.src0.kind == .vgpr and index != null) {
+            var remaining = self.occupied;
+            while (remaining != 0) {
+                const slot = self.slots[@ctz(remaining)];
+                remaining &= remaining - 1;
+                if (slot.vgpr == inst.src0.reg and slot.lane == index.?) {
+                    write(result, inst.dst, slot.value.value, slot.value.sources, inst.pc, slot.value.user_bits);
+                    return;
+                }
+            }
+        }
+        invalidateDestination(result, inst.dst, 1);
+    }
+
+    fn invalidateInstruction(self: *LaneSpills, inst: *const rdna2.Instruction) void {
+        if (self.occupied == 0) return;
+        const name = @tagName(inst.opcode);
+        const wide = std.mem.indexOf(u8, name, "64") != null;
+        const count: u32 = @max(inst.data_words, if (inst.family == .ds) @as(u8, 4) else if (wide) @as(u8, 2) else 1);
+        if (inst.dst.kind == .vgpr) self.invalidate(inst.dst.reg, count);
+        if (inst.dst2.kind == .vgpr) self.invalidate(inst.dst2.reg, count);
+    }
+};
+
+/// Most shaders do not need scalar-loop exit tracking. Initialize its bitsets
+/// only on the first recorded edge; reads before that are uniformly false.
+const BranchSites = struct {
+    bits: std.StaticBitSet(64 * 1024) = undefined,
+    initialized: bool = false,
+
+    fn capacity(_: *const BranchSites) usize {
+        return 64 * 1024;
+    }
+
+    fn isSet(self: *const BranchSites, index: usize) bool {
+        return self.initialized and bit_sets.contains(&self.bits, index);
+    }
+
+    fn set(self: *BranchSites, index: usize) void {
+        if (!self.initialized) {
+            self.bits = .initEmpty();
+            self.initialized = true;
+        }
+        self.bits.set(index);
+    }
+};
+
+test "lane spills recycle invalidated slots and preserve occupied lanes" {
+    var spills = LaneSpills{};
+    var evaluation = Evaluation{};
+    var store_instruction = rdna2.Instruction{
+        .opcode = .v_writelane_b32,
+        .dst = .{ .kind = .vgpr },
+        .src0 = .{ .kind = .sgpr, .reg = 1 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0 },
+    };
+    for (0..128) |index| {
+        evaluation.registers[1] = .{ .known = true, .value = @intCast(index + 1) };
+        store_instruction.dst.reg = @intCast(index);
+        spills.store(&evaluation, store_instruction);
+    }
+    try std.testing.expectEqual(@as(u128, std.math.maxInt(u128)), spills.occupied);
+    store_instruction.dst.reg = 128;
+    evaluation.registers[1].value = 999;
+    spills.store(&evaluation, store_instruction);
+    var restore_instruction = rdna2.Instruction{
+        .opcode = .v_readlane_b32,
+        .dst = .{ .kind = .sgpr, .reg = 10 },
+        .src0 = .{ .kind = .vgpr, .reg = 128 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0 },
+    };
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expect(!evaluation.registers[10].known);
+
+    spills.invalidate(0, 1);
+    spills.store(&evaluation, store_instruction);
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expectEqual(@as(?u32, 999), if (evaluation.registers[10].known) evaluation.registers[10].value else null);
+    restore_instruction.src0.reg = 127;
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expectEqual(@as(?u32, 128), if (evaluation.registers[10].known) evaluation.registers[10].value else null);
+
+    // Updating a live slot cannot consume a second slot. An unknown write
+    // invalidates that lane without disturbing other occupied spill records.
+    restore_instruction.src0.reg = 128;
+    evaluation.registers[1].value = 1000;
+    spills.store(&evaluation, store_instruction);
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expectEqual(@as(u32, 1000), evaluation.registers[10].value);
+    try std.testing.expectEqual(@as(u8, 128), @popCount(spills.occupied));
+    evaluation.registers[1].known = false;
+    spills.store(&evaluation, store_instruction);
+    spills.restore(&evaluation, restore_instruction);
+    try std.testing.expect(!evaluation.registers[10].known);
+    try std.testing.expectEqual(@as(u8, 127), @popCount(spills.occupied));
+}
+
+test "scalar branch tracking starts empty and clears previous walk edges" {
+    var sites = BranchSites{};
+    try std.testing.expect(!sites.isSet(0));
+    try std.testing.expect(!sites.isSet(sites.capacity() - 1));
+    sites.set(sites.capacity() - 1);
+    sites.set(31);
+    try std.testing.expect(sites.isSet(31));
+    try std.testing.expect(sites.isSet(sites.capacity() - 1));
+    try std.testing.expect(!sites.isSet(32));
+    sites = .{};
+    try std.testing.expect(!sites.isSet(31));
+    sites.set(32);
+    try std.testing.expect(sites.isSet(32));
+    try std.testing.expect(!sites.isSet(31));
+    try std.testing.expect(!sites.isSet(sites.capacity() - 1));
+}
+
+pub const ScalarLoad = struct {
+    pc: u32,
+    address: u64,
+    destination: u8,
+    word_count: u8,
+    buffer_descriptor: bool,
+    from_srt: bool,
+    base_sources: Sources,
+    offset_sources: Sources,
+    values: [16]u32,
+};
+
+pub const StopReason = enum {
+    prefix_complete,
+    end_program,
+    branch,
+    unknown_family,
+    unsupported_instruction,
+    inaccessible_code,
+    inaccessible_memory,
+    invalid_address,
+    instruction_limit,
+};
+
+pub const Evaluation = struct {
+    registers: ScalarRegisters = [_]ScalarValue{.{}} ** maximum_scalar_registers,
+    loads: [maximum_loads]ScalarLoad = undefined,
+    load_count: usize = 0,
+    /// High-water mark of recorded load PCs. A first forward visit cannot
+    /// duplicate an earlier load, so only revisits need a history search.
+    highest_load_pc: u32 = 0,
+    instruction_count: u32 = 0,
+    stop_pc: u32 = 0,
+    stop_reason: StopReason = .instruction_limit,
+    /// A scalar load failed. The address list then omits bytes the next
+    /// preparation might be able to read, so that walk must not be cached.
+    memory_read_failed: bool = false,
+    /// USER_DATA words needed by resource discovery or scalar control flow.
+    /// Only values consumed purely by vector arithmetic may change on reuse.
+    address_user_data_mask: u64 = 0,
+
+    /// Load storage is read only through load_count. Do not copy/clear all 512
+    /// records merely to start a fresh draw-local scalar walk.
+    pub fn reset(self: *Evaluation) void {
+        @memset(&self.registers, .{});
+        self.load_count = 0;
+        self.highest_load_pc = 0;
+        self.instruction_count = 0;
+        self.stop_pc = 0;
+        self.stop_reason = .instruction_limit;
+        self.memory_read_failed = false;
+        self.address_user_data_mask = 0;
+    }
+
+    pub fn copyFrom(self: *Evaluation, source_: *const Evaluation) void {
+        if (self == source_) return;
+        self.registers = source_.registers;
+        @memcpy(self.loads[0..source_.load_count], source_.loadSlice());
+        self.load_count = source_.load_count;
+        self.highest_load_pc = source_.highest_load_pc;
+        self.instruction_count = source_.instruction_count;
+        self.stop_pc = source_.stop_pc;
+        self.stop_reason = source_.stop_reason;
+        self.memory_read_failed = source_.memory_read_failed;
+        self.address_user_data_mask = source_.address_user_data_mask;
+    }
+
+    pub fn register(self: *const Evaluation, index: u8) ?ScalarValue {
+        const value = self.registers[index];
+        return if (value.known) value else null;
+    }
+
+    pub fn loadSlice(self: *const Evaluation) []const ScalarLoad {
+        return self.loads[0..self.load_count];
+    }
+};
+
+/// Propagate uniform constants through the dispatch's control-flow graph.
+/// Values survive a join only when every incoming path agrees, including loop
+/// backedges. The representative resource walk below is not a reachability
+/// proof and must not supply branch decisions here.
+pub fn pruneUniformBranches(
+    allocator: std.mem.Allocator,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    graph: *const rdna2.control_flow.Graph,
+) !?std.ArrayList(rdna2.Instruction) {
+    var has_guard = false;
+    var invariant = Evaluation{};
+    const scalar_base: usize = bindings.scalar_user_data_base;
+    const available = @min(@as(usize, bindings.user_data_count), maximum_scalar_registers - scalar_base);
+    for (bindings.user_data[0..available], 0..) |word, index| {
+        invariant.registers[scalar_base + index] = .{ .known = true, .value = word, .sources = .{ .user_data = true } };
+    }
+    for (instructions, 0..) |inst, index| {
+        if (inst.opcode == .unknown or inst.opcode == .unsupported) return null;
+        if (inst.opcode == .s_setpc_b64) {
+            const target = rdna2.control_flow.resolveSetpcTargetInstructions(instructions, index) orelse return null;
+            if (graph.blockForPc(target) == null) return null;
+        }
+        switch (inst.opcode) {
+            .s_cbranch_cdbgsys, .s_cbranch_cdbguser, .s_cbranch_cdbgsys_or_user, .s_cbranch_cdbgsys_and_user, .s_setreg_b32 => return null,
+            else => {},
+        }
+        if (std.mem.startsWith(u8, @tagName(inst.opcode), "s_movrel")) return null;
+        has_guard = has_guard or switch (inst.opcode) {
+            .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_execz, .s_cbranch_execnz, .s_cbranch_vccz, .s_cbranch_vccnz => true,
+            else => false,
+        };
+    }
+    if (!has_guard or graph.blocks.items.len == 0) return null;
+    for (invariant.registers[106..]) |*value| value.* = .{};
+
+    const State = struct { registers: ScalarRegisters, scc: ?bool = null, seen: bool = false };
+    const states = try allocator.alloc(State, graph.blocks.items.len);
+    defer allocator.free(states);
+    for (states) |*state| state.* = .{ .registers = [_]ScalarValue{.{}} ** maximum_scalar_registers };
+    states[0] = .{ .registers = invariant.registers, .seen = true };
+    const dirty = try allocator.alloc(bool, states.len);
+    defer allocator.free(dirty);
+    @memset(dirty, false);
+    dirty[0] = true;
+    const decisions = try allocator.alloc(?bool, graph.blocks.items.len);
+    defer allocator.free(decisions);
+    @memset(decisions, null);
+    var pending = true;
+    var budget: usize = maximum_resource_instructions * 256;
+    while (pending) {
+        pending = false;
+        for (graph.blocks.items) |block| {
+            if (!dirty[block.index]) continue;
+            dirty[block.index] = false;
+            var local = Evaluation{ .registers = states[block.index].registers };
+            var scc = states[block.index].scc;
+            decisions[block.index] = null;
+            const end = block.first_instruction + block.instruction_count;
+            for (instructions[block.first_instruction..end]) |inst| {
+                if (budget == 0) return null;
+                budget -= 1;
+                const clobbers = uniformClobbers(inst);
+                switch (inst.opcode) {
+                    .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {
+                        _ = executeSmem(&local, reader, bindings, &inst, true);
+                    },
+                    .s_mov_b32, .s_mov_b64, .s_movk_i32, .s_cselect_b32, .s_cselect_b64 => executeScalar(&local, bindings.program_address, &inst, &scc),
+                    .s_cmp_eq_i32,
+                    .s_cmp_lg_i32,
+                    .s_cmp_gt_i32,
+                    .s_cmp_ge_i32,
+                    .s_cmp_lt_i32,
+                    .s_cmp_le_i32,
+                    .s_cmp_eq_u32,
+                    .s_cmp_lg_u32,
+                    .s_cmp_gt_u32,
+                    .s_cmp_ge_u32,
+                    .s_cmp_lt_u32,
+                    .s_cmp_le_u32,
+                    .s_bitcmp0_b32,
+                    .s_bitcmp1_b32,
+                    .s_and_b32,
+                    .s_or_b32,
+                    .s_xor_b32,
+                    .s_andn2_b32,
+                    .s_orn2_b32,
+                    .s_nand_b32,
+                    .s_nor_b32,
+                    .s_xnor_b32,
+                    .s_not_b32,
+                    .s_wqm_b32,
+                    => executeScalar(&local, bindings.program_address, &inst, &scc),
+                    .s_nop, .s_waitcnt, .s_inst_prefetch, .s_branch, .s_endpgm, .s_code_end => {},
+                    .s_cbranch_scc0, .s_cbranch_scc1 => if (scc) |value| {
+                        decisions[block.index] = value == (inst.opcode == .s_cbranch_scc1);
+                    },
+                    .s_cbranch_execz, .s_cbranch_execnz, .s_cbranch_vccz, .s_cbranch_vccnz => {
+                        const is_exec = inst.opcode == .s_cbranch_execz or inst.opcode == .s_cbranch_execnz;
+                        const first: usize = if (is_exec) 126 else 106;
+                        const low = local.registers[first];
+                        const high = local.registers[first + 1];
+                        const zero: ?bool = if ((low.known and low.value != 0) or (high.known and high.value != 0)) false else if (low.known and high.known) true else null;
+                        if (zero) |value| decisions[block.index] = value == (inst.opcode == .s_cbranch_execz or inst.opcode == .s_cbranch_vccz);
+                    },
+                    else => {
+                        // Vector instructions usually leave all SGPRs intact.
+                        // Visit only written registers instead of scanning the
+                        // entire scalar register file for every instruction.
+                        var remaining = clobbers;
+                        while (remaining != 0) {
+                            const index = @ctz(remaining);
+                            local.registers[index] = .{};
+                            remaining &= remaining - 1;
+                        }
+                        switch (inst.family) {
+                            .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp, .mubuf, .mtbuf, .flat, .ds, .mimg, .exp => {
+                                // VALU and vector memory do not modify SCC or
+                                // unrelated SGPRs. Keep a uniform flag loaded
+                                // before lane setup, but forget any scalar mask
+                                // or readlane result written by that setup.
+                                // CMPX also writes EXEC, which need not appear
+                                // as an explicit destination in the decoder.
+                                if (std.mem.startsWith(u8, @tagName(inst.opcode), "v_cmpx_")) {
+                                    local.registers[126] = .{};
+                                    local.registers[127] = .{};
+                                }
+                            },
+                            else => {
+                                // Unknown scalar semantics may overwrite SCC or
+                                // address registers indirectly.
+                                if (std.mem.indexOf(u8, @tagName(inst.opcode), "exec") != null) {
+                                    local.registers[126] = .{};
+                                    local.registers[127] = .{};
+                                }
+                                scc = null;
+                            },
+                        }
+                    },
+                }
+            }
+            for (graph.edges.items) |edge| {
+                if (edge.from != block.index) continue;
+                if (decisions[block.index]) |taken| {
+                    if (taken != (edge.kind == .branch)) continue;
+                }
+                const target = &states[edge.to];
+                var updated = false;
+                if (!target.seen) {
+                    target.* = .{ .registers = local.registers, .scc = scc, .seen = true };
+                    updated = true;
+                } else {
+                    for (&target.registers, local.registers) |*old, incoming| {
+                        if (old.known and (!incoming.known or old.value != incoming.value)) {
+                            old.* = .{};
+                            updated = true;
+                        }
+                    }
+                    if (target.scc != null and target.scc != scc) {
+                        target.scc = null;
+                        updated = true;
+                    }
+                }
+                if (updated) {
+                    dirty[edge.to] = true;
+                    pending = true;
+                }
+            }
+        }
+    }
+    var proven: usize = 0;
+    for (decisions) |decision| if (decision != null) {
+        proven += 1;
+    };
+    if (proven == 0) {
+        // An unconditional edge can already make a resource block unreachable,
+        // even when every remaining conditional guard depends on live lanes.
+        // Preserve those unknown guards while dropping only disconnected code.
+        var all_seen = true;
+        for (states) |state| all_seen = all_seen and state.seen;
+        if (all_seen) return null;
+    }
+
+    const reachable = try allocator.alloc(bool, graph.blocks.items.len);
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    reachable[0] = true;
+    // Edges are emitted in source-block order. Revisit backedges until the
+    // reachable set stabilizes, retaining alternative entries into a region.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (graph.edges.items) |edge| {
+            if (!reachable[edge.from] or reachable[edge.to]) continue;
+            if (decisions[edge.from]) |taken| {
+                if (taken != (edge.kind == .branch)) continue;
+            }
+            reachable[edge.to] = true;
+            changed = true;
+        }
+    }
+    var result: std.ArrayList(rdna2.Instruction) = .empty;
+    errdefer result.deinit(allocator);
+    try result.appendSlice(allocator, instructions);
+    for (graph.blocks.items) |block| {
+        const end = block.first_instruction + block.instruction_count;
+        if (!reachable[block.index]) {
+            for (result.items[block.first_instruction..end]) |*inst| {
+                if (!inst.opcode.isProgramEnd()) makeNop(inst);
+            }
+        } else if (decisions[block.index]) |taken| {
+            const branch = &result.items[end - 1];
+            if (taken) branch.opcode = .s_branch else makeNop(branch);
+        }
+    }
+    return result;
+}
+
+fn uniformClobbers(inst: rdna2.Instruction) u128 {
+    var mask: u128 = 0;
+    // Over-approximate explicit multi-register definitions, including wide
+    // VALU masks. Implicit EXEC updates are invalidated by the transfer above.
+    for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |destination| {
+        const first = scalarRegisterIndex(destination) orelse continue;
+        for (first..@min(first + 16, maximum_scalar_registers)) |index| mask |= @as(u128, 1) << @intCast(index);
+    }
+    return mask;
+}
+
+fn makeNop(inst: *rdna2.Instruction) void {
+    // Keep byte positions and source encoding for branch targets/diagnostics.
+    inst.* = .{ .pc = inst.pc, .word = inst.word, .word_count = inst.word_count, .raw = inst.raw, .raw_count = inst.raw_count, .family = .sopp, .opcode = .s_nop };
+}
+
+pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
+    return evaluate(reader, bindings, null, false, null, null, null);
+}
+
+/// Evaluates scalar resource setup past lane-mask branches. EXEC/VCC branches
+/// only decide whether active lanes reach a memory operation; the descriptor
+/// used by lanes that do reach it is normally prepared on the fallthrough
+/// path. Following that path recovers late V#/T# loads without changing the
+/// strict prefix evaluator used for shader specialization.
+pub fn evaluateResourceState(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
+    return evaluate(reader, bindings, null, true, null, null, null);
+}
+
+/// Evaluates resource state using a shader which the backend has already
+/// decoded. Guest data loads remain live; only redundant instruction fetch and
+/// decode work is avoided at draw time.
+pub fn evaluateDecodedResourceState(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+) Evaluation {
+    return evaluate(reader, bindings, null, true, instructions, null, null);
+}
+
+pub fn evaluateDecodedResourceStateInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+) void {
+    evaluateInto(result, reader, bindings, null, true, instructions, null, null, true);
+}
+
+const RegisterCheckpointCollector = struct {
+    pcs: []const u32,
+    snapshots: []ScalarRegisters,
+    seen: std.StaticBitSet(maximum_resource_instructions) = .initEmpty(),
+    cursor: usize = 0,
+    previous_pc: u32 = 0,
+    secondary: ?*RegisterCheckpointCollector = null,
+
+    fn captureBefore(self: *RegisterCheckpointCollector, evaluation: *const Evaluation, pc: u32) void {
+        if (self.secondary) |collector| collector.captureBefore(evaluation, pc);
+        // Most instructions move forward, often between the same two resource
+        // sites. Search only when control flow jumps backwards; revisited
+        // checkpoints still merge through the existing seen-bit semantics.
+        if (pc < self.previous_pc) {
+            var low: usize = 0;
+            var high = self.pcs.len;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                if (self.pcs[middle] < pc) low = middle + 1 else high = middle;
+            }
+            self.cursor = low;
+        } else {
+            while (self.cursor < self.pcs.len and self.pcs[self.cursor] < pc) self.cursor += 1;
+        }
+        self.previous_pc = pc;
+        const low = self.cursor;
+        // A forward branch did not execute the instructions it skipped.
+        // Their registers must come from reaching definitions, never from
+        // whichever unrelated scalar values preceded the branch.
+        if (low == self.pcs.len or self.pcs[low] != pc or low >= self.seen.capacity()) return;
+        if (!bit_sets.contains(&self.seen, low)) {
+            self.snapshots[low] = evaluation.registers;
+            self.seen.set(low);
+        } else {
+            for (&self.snapshots[low], evaluation.registers) |*saved, current| {
+                if (!saved.known or !current.known or saved.value != current.value) {
+                    saved.* = .{};
+                } else saved.sources = Sources.merge(saved.sources, current.sources);
+            }
+        }
+    }
+
+    fn finish(self: *RegisterCheckpointCollector, evaluation: *const Evaluation) void {
+        if (self.secondary) |collector| collector.finish(evaluation);
+        // A checkpoint after END may query final state. Unvisited sites
+        // inside the program remain unknown, including after an early stop.
+        // Visited snapshots were initialized by their first capture. Clear
+        // only the remaining sites, avoiding a redundant full-array write.
+        for (self.pcs, self.snapshots, 0..) |pc, *snapshot, index| {
+            if (evaluation.stop_reason == .end_program and pc > evaluation.stop_pc) {
+                snapshot.* = evaluation.registers;
+            } else if (index >= self.seen.capacity() or !bit_sets.contains(&self.seen, index)) {
+                snapshot.* = @splat(.{});
+            }
+        }
+    }
+};
+
+/// Evaluates one decoded scalar program and captures its register state before
+/// every requested resource instruction. `checkpoint_pcs` must be sorted.
+/// This replaces the former O(resources * instructions) draw-time walk with a
+/// single pass while preserving SGPR reuse between descriptor loads.
+pub fn evaluateDecodedResourceStateAtCheckpoints(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    checkpoint_pcs: []const u32,
+    snapshots: []ScalarRegisters,
+    steps: ?[]const u32,
+) Evaluation {
+    var result: Evaluation = undefined;
+    evaluateDecodedResourceStateAtCheckpointsInto(&result, reader, bindings, instructions, checkpoint_pcs, snapshots, steps);
+    return result;
+}
+
+pub fn evaluateDecodedResourceStateAtCheckpointsInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    checkpoint_pcs: []const u32,
+    snapshots: []ScalarRegisters,
+    steps: ?[]const u32,
+) void {
+    evaluateResourceCheckpointsInto(result, reader, bindings, instructions, checkpoint_pcs, snapshots, steps, true);
+}
+
+/// Capture independent sampled/storage consumers and specialization history
+/// in the same full scalar walk. Each sorted checkpoint list retains its own
+/// skipped-block and revisited-register semantics.
+pub fn evaluateDecodedResourceStateAtTwoCheckpointsInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    first_pcs: []const u32,
+    first_snapshots: []ScalarRegisters,
+    second_pcs: []const u32,
+    second_snapshots: []ScalarRegisters,
+) void {
+    std.debug.assert(first_pcs.len == first_snapshots.len);
+    std.debug.assert(second_pcs.len == second_snapshots.len);
+    var second = RegisterCheckpointCollector{ .pcs = second_pcs, .snapshots = second_snapshots };
+    var first = RegisterCheckpointCollector{ .pcs = first_pcs, .snapshots = first_snapshots, .secondary = &second };
+    evaluateInto(result, reader, bindings, null, true, instructions, &first, null, true);
+    first.finish(result);
+}
+
+/// Resource discovery consumes the snapshots, not the specialization load
+/// history. Execute every read and control-flow step but omit that bookkeeping.
+pub fn evaluateDecodedResourceSnapshotsInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    checkpoint_pcs: []const u32,
+    snapshots: []ScalarRegisters,
+    steps: ?[]const u32,
+) void {
+    evaluateResourceCheckpointsInto(result, reader, bindings, instructions, checkpoint_pcs, snapshots, steps, false);
+}
+
+fn evaluateResourceCheckpointsInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    checkpoint_pcs: []const u32,
+    snapshots: []ScalarRegisters,
+    steps: ?[]const u32,
+    retain_load_history: bool,
+) void {
+    std.debug.assert(checkpoint_pcs.len == snapshots.len);
+    var collector = RegisterCheckpointCollector{
+        .pcs = checkpoint_pcs,
+        .snapshots = snapshots,
+    };
+    evaluateInto(result, reader, bindings, null, true, instructions, &collector, steps, retain_load_history);
+    collector.finish(result);
+}
+
+/// Recovers descriptor state immediately before one vector-memory instruction.
+/// Compute kernels may reload the same T#/S# SGPRs for several resources, so a
+/// final whole-program snapshot is not authoritative for an earlier sample.
+pub fn evaluateResourceStateUntil(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    end_pc: u32,
+) Evaluation {
+    return evaluate(reader, bindings, end_pc, true, null, null, null);
+}
+
+/// Recovers descriptor state before one instruction, from a shader the backend
+/// has already decoded.
+///
+/// A kernel resolves a descriptor once per instruction that names it, and each
+/// resolution walks the program from its start. Doing that from guest memory
+/// re-reads and re-decodes every earlier instruction every time, so a kernel
+/// with seventy resource references pays for its own prolog seventy times. The
+/// decoded program removes the fetch and the decode; the walk itself remains.
+pub fn evaluateDecodedResourceStateUntil(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    end_pc: u32,
+) Evaluation {
+    return evaluate(reader, bindings, end_pc, true, instructions, null, null);
+}
+
+/// Evaluates only the straight scalar region ending before `end_pc`. This is
+/// the dispatch-specialization entry point: later scalar writes must not alter
+/// descriptors captured for the first vector-memory instruction.
+pub fn evaluatePrefixUntil(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    end_pc: u32,
+) Evaluation {
+    return evaluate(reader, bindings, end_pc, false, null, null, null);
+}
+
+/// Scalar ALU, scalar memory, lane spills, and any instruction that writes a
+/// scalar register. Pure vector instructions do not change the checkpoint
+/// walk; an index of these steps replaces visiting every opcode.
+pub fn scalarWalkVisits(inst: rdna2.Instruction) bool {
+    switch (inst.family) {
+        .sop1, .sop2, .sopk, .sopc, .sopp, .smem => return true,
+        else => {},
+    }
+    if (inst.opcode == .v_readlane_b32 or inst.opcode == .v_writelane_b32) return true;
+    if (scalarRegisterIndex(inst.dst) != null or scalarRegisterIndex(inst.dst2) != null) return true;
+    return false;
+}
+
+fn stepIndexAtOrAfter(instructions: []const rdna2.Instruction, steps: []const u32, pc: u32) usize {
+    var low: usize = 0;
+    var high = steps.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (instructions[steps[middle]].pc < pc) low = middle + 1 else high = middle;
+    }
+    return low;
+}
+
+fn evaluate(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    end_pc: ?u32,
+    follow_lane_mask_fallthrough: bool,
+    decoded_instructions: ?[]const rdna2.Instruction,
+    checkpoint_collector: ?*RegisterCheckpointCollector,
+    steps: ?[]const u32,
+) Evaluation {
+    var result: Evaluation = undefined;
+    evaluateInto(&result, reader, bindings, end_pc, follow_lane_mask_fallthrough, decoded_instructions, checkpoint_collector, steps, true);
+    return result;
+}
+
+fn evaluateInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    end_pc: ?u32,
+    follow_lane_mask_fallthrough: bool,
+    decoded_instructions: ?[]const rdna2.Instruction,
+    checkpoint_collector: ?*RegisterCheckpointCollector,
+    steps: ?[]const u32,
+    retain_load_history: bool,
+) void {
+    result.reset();
+    const scalar_base: usize = bindings.scalar_user_data_base;
+    const available = @min(
+        @as(usize, bindings.user_data_count),
+        maximum_scalar_registers - scalar_base,
+    );
+    for (bindings.user_data[0..available], 0..) |word, index| {
+        result.registers[scalar_base + index] = .{
+            .known = true,
+            .value = word,
+            .sources = .{ .user_data = true },
+            .user_bits = if (index < 64) @as(u64, 1) << @intCast(index) else 0,
+        };
+    }
+
+    var scc: ?bool = null;
+    var pc: u32 = 0;
+    var decoded_cursor: usize = 0;
+    var lane_spills = LaneSpills{};
+    var setpc_follows: u8 = 0;
+    var unknown_scalar_exits = BranchSites{};
+    var revisited_loop_edges = BranchSites{};
+    var dense_walk = steps == null;
+    var current_step: usize = 0;
+    const instruction_limit: u32 = if (follow_lane_mask_fallthrough) bindings.resource_instruction_budget else maximum_instructions;
+    while (result.instruction_count < instruction_limit) {
+        if (steps) |list| {
+            const instructions = decoded_instructions orelse {
+                result.stop_reason = .end_program;
+                return;
+            };
+            // A writelane makes later vector destinations able to clobber a
+            // spill. Visit every instruction until that slot is gone, then
+            // resume the index. Backward branches binary-search it.
+            if (dense_walk and lane_spills.occupied == 0) dense_walk = false;
+            if (!dense_walk) {
+                const index = if (current_step < list.len and instructions[list[current_step]].pc == pc)
+                    current_step
+                else
+                    stepIndexAtOrAfter(instructions, list, pc);
+                if (index == list.len) {
+                    result.stop_reason = .end_program;
+                    return;
+                }
+                current_step = index;
+                const step_pc = instructions[list[index]].pc;
+                if (step_pc != pc) pc = step_pc;
+                decoded_cursor = list[index];
+            }
+        }
+        result.stop_pc = pc;
+        if (checkpoint_collector) |collector| collector.captureBefore(result, pc);
+        if (end_pc) |end| {
+            if (pc >= end) {
+                result.stop_reason = .prefix_complete;
+                return;
+            }
+        }
+        var live_instruction: rdna2.Instruction = undefined;
+        const inst: *const rdna2.Instruction = if (decoded_instructions) |instructions| decoded: {
+            // Most resource instructions are visited in order. Search only
+            // after a branch or a gap in the decoder's instruction stream.
+            if (decoded_cursor >= instructions.len or instructions[decoded_cursor].pc != pc) {
+                decoded_cursor = decodedInstructionIndexAtOrAfter(instructions, pc);
+            }
+            if (decoded_cursor == instructions.len) {
+                result.stop_reason = .end_program;
+                return;
+            }
+            const candidate = &instructions[decoded_cursor];
+            if (candidate.pc != pc) {
+                // The cached decoder omitted an unknown word. Resume at its
+                // next known instruction just as the live decoder skips an
+                // unsupported family.
+                pc = candidate.pc;
+                lane_spills = .{};
+                continue;
+            }
+            decoded_cursor += 1;
+            break :decoded candidate;
+        } else live: {
+            var words = [_]u32{ 0, 0 };
+            words[0] = reader.readU32(addProgramAddress(bindings.program_address, pc) orelse {
+                result.stop_reason = .invalid_address;
+                return;
+            }) catch {
+                result.stop_reason = .inaccessible_code;
+                return;
+            };
+
+            // Decode may need a second word; unknown major families are skipped so a
+            // later SMEM load of a V# still runs. Stopping the prolog at the first
+            // unrecognised packet was producing MissingStorageDescriptor on every
+            // resource the shader used after that point.
+            if (rdna2.decodeInstruction(pc, words[0..1], 0)) |decoded| {
+                live_instruction = decoded;
+                break :live &live_instruction;
+            } else |err| switch (err) {
+                error.MissingLiteralConstant, error.TruncatedInstruction => {
+                    words[1] = reader.readU32(addProgramAddress(bindings.program_address, pc + 4) orelse {
+                        result.stop_reason = .invalid_address;
+                        return;
+                    }) catch {
+                        result.stop_reason = .inaccessible_code;
+                        return;
+                    };
+                    if (rdna2.decodeInstruction(pc, &words, 0)) |decoded| {
+                        live_instruction = decoded;
+                        break :live &live_instruction;
+                    } else |_| {
+                        lane_spills = .{};
+                        pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
+                        result.instruction_count += 1;
+                        continue;
+                    }
+                },
+                else => {
+                    // Unknown family, operand decode failures, etc. — skip rather
+                    // than abort the whole prolog before SMEM V# loads.
+                    lane_spills = .{};
+                    pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
+                    result.instruction_count += 1;
+                    continue;
+                },
+            }
+        };
+        result.instruction_count += 1;
+
+        recordResourceUserData(result, inst);
+
+        if (inst.opcode != .v_writelane_b32) lane_spills.invalidateInstruction(inst);
+
+        if (inst.opcode == .unsupported) {
+            // Skip unknown opcodes inside a known family; do not abort the prolog.
+            invalidateDestination(result, inst.dst, @max(inst.data_words, 1));
+            pc +%= inst.word_count * 4;
+            continue;
+        }
+        if (inst.family == .smem) {
+            if (!executeSmem(result, reader, bindings, inst, retain_load_history)) {
+                result.memory_read_failed = true;
+                if (!follow_lane_mask_fallthrough) {
+                    if (result.stop_reason == .instruction_limit) result.stop_reason = .inaccessible_memory;
+                    return;
+                }
+                // A lane-dependent address may be unavailable to this scalar
+                // walk. It does not prevent a later, independent descriptor
+                // load from succeeding. Invalidate the failed load and keep
+                // walking instead of filling every remaining checkpoint with
+                // stale registers from before the failure.
+                invalidateDestination(result, inst.dst, inst.data_words);
+                result.stop_reason = .instruction_limit;
+            }
+        } else switch (inst.opcode) {
+            .s_endpgm, .s_code_end => {
+                result.stop_reason = .end_program;
+                return;
+            },
+            .s_setpc_b64 => {
+                if (setpc_follows < 8) {
+                    if (setpcDestinationPc(result, bindings.program_address, inst.*)) |dest_pc| {
+                        setpc_follows += 1;
+                        pc = dest_pc;
+                        continue;
+                    }
+                }
+                result.stop_reason = .branch;
+                return;
+            },
+            .s_branch,
+            .s_cbranch_scc0,
+            .s_cbranch_scc1,
+            .s_cbranch_vccz,
+            .s_cbranch_vccnz,
+            .s_cbranch_execz,
+            .s_cbranch_execnz,
+            => {
+                if (follow_lane_mask_fallthrough) {
+                    if (decoded_instructions) |instructions| {
+                        if (inst.opcode == .s_branch and resourceLoopHasUnresolvedExit(instructions, inst.branch_target, inst.pc, &unknown_scalar_exits)) {
+                            // A scalar walk cannot advance a VGPR induction
+                            // variable or a scalar mask obtained by readlane.
+                            // Forget every loop-carried write, then revisit
+                            // once with arbitrary recurrence inputs. This
+                            // preserves loads rebuilt from invariant inputs
+                            // while merging away first-iteration constants
+                            // from resource checkpoints inside the loop.
+                            const loop_begin = decodedInstructionIndexAtOrAfter(instructions, inst.branch_target);
+                            for (instructions[loop_begin..]) |loop_inst| {
+                                if (loop_inst.pc >= inst.pc) break;
+                                invalidateDestination(result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
+                                lane_spills.invalidateInstruction(&loop_inst);
+                            }
+                            scc = null;
+                            if (inst.pc / 4 < revisited_loop_edges.capacity() and !revisited_loop_edges.isSet(inst.pc / 4)) {
+                                revisited_loop_edges.set(inst.pc / 4);
+                                // These loads were observed only in the first
+                                // iteration. Rebuild proven invariant loads;
+                                // a varying address must stay a runtime load.
+                                var kept: usize = 0;
+                                for (result.loadSlice()) |load| {
+                                    if (load.pc >= inst.branch_target and load.pc < inst.pc) continue;
+                                    result.loads[kept] = load;
+                                    kept += 1;
+                                }
+                                result.load_count = @intCast(kept);
+                                pc = inst.branch_target;
+                                continue;
+                            }
+                            pc += inst.word_count * 4;
+                            continue;
+                        }
+                    }
+                }
+                const taken = switch (inst.opcode) {
+                    .s_branch => true,
+                    .s_cbranch_scc0 => if (scc) |value| !value else null,
+                    .s_cbranch_scc1 => scc,
+                    else => null,
+                };
+                if (taken) |is_taken| {
+                    pc = if (is_taken) inst.branch_target else pc + inst.word_count * 4;
+                    continue;
+                }
+                // Resource recovery follows the fallthrough of a conditional
+                // whose predicate depends on per-lane values. The translated
+                // shader will still make the real branch decision at runtime;
+                // we only need the descriptors/constants for the path when it
+                // is taken by at least one invocation.
+                if (follow_lane_mask_fallthrough and inst.opcode != .s_branch) {
+                    if ((inst.opcode == .s_cbranch_scc0 or inst.opcode == .s_cbranch_scc1) and
+                        inst.branch_target > inst.pc and inst.pc / 4 < unknown_scalar_exits.capacity())
+                    {
+                        unknown_scalar_exits.set(inst.pc / 4);
+                    }
+                    pc +%= inst.word_count * 4;
+                    continue;
+                }
+                result.stop_reason = .branch;
+                return;
+            },
+            .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => {},
+            .v_writelane_b32 => lane_spills.store(result, inst.*),
+            .v_readlane_b32 => lane_spills.restore(result, inst.*),
+            // Ordinary vector operations cannot change the scalar state.
+            // Dependency recording and spill invalidation still happen above;
+            // retain the normal path for scalar destinations, VCC/EXEC aliases,
+            // lane transfers and unknown instruction families.
+            else => if (inst.family == .unknown or scalarWalkVisits(inst.*))
+                executeScalar(result, bindings.program_address, inst, &scc),
+        }
+        if (steps != null and !dense_walk) {
+            if (lane_spills.occupied != 0) {
+                dense_walk = true;
+                pc +%= inst.word_count * 4;
+            } else {
+                const list = steps.?;
+                const instructions = decoded_instructions.?;
+                if (current_step + 1 >= list.len) {
+                    result.stop_pc = pc +% inst.word_count * 4;
+                    result.stop_reason = .end_program;
+                    return;
+                }
+                current_step += 1;
+                pc = instructions[list[current_step]].pc;
+            }
+        } else {
+            pc +%= inst.word_count * 4;
+        }
+    }
+
+    result.stop_pc = pc;
+    result.stop_reason = .instruction_limit;
+    return;
+}
+
+fn resourceLoopHasUnresolvedExit(instructions: []const rdna2.Instruction, loop_start: u32, back_edge: u32, unknown_scalar_exits: *const BranchSites) bool {
+    if (loop_start >= back_edge) return false;
+    const loop_begin = decodedInstructionIndexAtOrAfter(instructions, loop_start);
+    for (instructions[loop_begin..]) |inst| {
+        if (inst.pc >= back_edge) break;
+        if (inst.branch_target <= back_edge) continue;
+        switch (inst.opcode) {
+            .s_cbranch_execz, .s_cbranch_execnz, .s_cbranch_vccz, .s_cbranch_vccnz => return true,
+            .s_cbranch_scc0, .s_cbranch_scc1 => if (inst.pc / 4 < unknown_scalar_exits.capacity() and unknown_scalar_exits.isSet(inst.pc / 4)) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn decodedInstructionIndexAtOrAfter(instructions: []const rdna2.Instruction, pc: u32) usize {
+    var low: usize = 0;
+    var high = instructions.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (instructions[middle].pc < pc) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
+fn executeSmem(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    inst: *const rdna2.Instruction,
+    retain_load_history: bool,
+) bool {
+    const base_lo = source(result, inst.src0) orelse {
+        invalidateDestination(result, inst.dst, inst.data_words);
+        result.stop_reason = .invalid_address;
+        return false;
+    };
+    const base_index = scalarRegisterIndex(inst.src0) orelse {
+        result.stop_reason = .invalid_address;
+        return false;
+    };
+    if (base_index + 1 >= maximum_scalar_registers) {
+        result.stop_reason = .invalid_address;
+        return false;
+    }
+    const base_hi = result.registers[base_index + 1];
+    if (!base_hi.known) {
+        invalidateDestination(result, inst.dst, inst.data_words);
+        result.stop_reason = .invalid_address;
+        return false;
+    }
+
+    const is_buffer_load = switch (inst.opcode) {
+        .s_buffer_load_dword,
+        .s_buffer_load_dwordx2,
+        .s_buffer_load_dwordx4,
+        .s_buffer_load_dwordx8,
+        .s_buffer_load_dwordx16,
+        => true,
+        else => false,
+    };
+    // Only NULL disables SOFFSET; a register overlapping V# is still data.
+    const offset = source(result, inst.src1) orelse {
+        invalidateDestination(result, inst.dst, inst.data_words);
+        result.stop_reason = .invalid_address;
+        return false;
+    };
+    var buffer_size: ?u64 = null;
+    if (is_buffer_load) {
+        if (base_index + 2 >= maximum_scalar_registers or !result.registers[base_index + 2].known) {
+            invalidateDestination(result, inst.dst, inst.data_words);
+            result.stop_reason = .invalid_address;
+            return false;
+        }
+        // SMEM uses only BASE, STRIDE and NUM_RECORDS from V#. Check every
+        // dword, including partial loads at the end of the last record.
+        const stride = (base_hi.value >> 16) & 0x3fff;
+        buffer_size = @as(u64, @max(stride, 1)) * result.registers[base_index + 2].value;
+    }
+    if (!is_buffer_load and base_hi.value & 0xffff_0000 != 0) {
+        invalidateDestination(result, inst.dst, inst.data_words);
+        result.stop_reason = .invalid_address;
+        return false;
+    }
+    const base = @as(u64, base_lo.value) | (@as(u64, base_hi.value & 0xffff) << 32);
+    const displacement = @as(i64, inst.memory_offset) + @as(i64, offset.value);
+    const unaligned_address = addSigned(base, displacement) orelse {
+        invalidateDestination(result, inst.dst, inst.data_words);
+        result.stop_reason = .invalid_address;
+        return false;
+    };
+    // GFX10 scalar loads operate on dwords and ignore the low two address bits.
+    const address = unaligned_address & ~@as(u64, 3);
+    const load_bytes = @as(u64, inst.data_words) * 4;
+    if (address > address_mask or load_bytes > address_mask - address + 1) {
+        invalidateDestination(result, inst.dst, inst.data_words);
+        result.stop_reason = .invalid_address;
+        return false;
+    }
+    const destination = scalarRegisterIndex(inst.dst) orelse {
+        result.stop_reason = .invalid_address;
+        return false;
+    };
+    if (destination + inst.data_words > maximum_scalar_registers) {
+        result.stop_reason = .invalid_address;
+        return false;
+    }
+
+    var loaded: [16]u32 = @splat(0);
+    // A wide SMEM load is one contiguous read. Checking each dword separately
+    // repeats guest mapping queries and GPU metadata synchronization up to
+    // sixteen times for the same descriptor. Buffer OOB words remain zero;
+    // only the complete in-bounds dwords may reach the memory reader.
+    const readable_words: usize = if (buffer_size) |size| bounded: {
+        if (displacement < 0) break :bounded 0;
+        const byte_offset = @as(u64, @intCast(displacement)) & ~@as(u64, 3);
+        break :bounded @intCast(@min(inst.data_words, (size -| byte_offset) / 4));
+    } else inst.data_words;
+    if (readable_words != 0) {
+        var bytes: [16 * 4]u8 = undefined;
+        reader.read(address, bytes[0 .. readable_words * 4]) catch {
+            invalidateDestination(result, inst.dst, inst.data_words);
+            result.stop_reason = .inaccessible_memory;
+            return false;
+        };
+        for (loaded[0..readable_words], 0..) |*word, index| {
+            word.* = std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
+        }
+    }
+
+    const base_sources = Sources.merge(base_lo.sources, base_hi.sources);
+    const loaded_sources = Sources.merge(Sources.merge(base_sources, offset.sources), .{ .memory = true });
+    const address_bits = base_lo.user_bits | base_hi.user_bits | offset.user_bits;
+    result.address_user_data_mask |= address_bits;
+    for (loaded[0..inst.data_words], 0..) |word, index| {
+        result.registers[destination + index] = .{
+            .known = true,
+            .value = word,
+            .user_bits = address_bits,
+            .sources = loaded_sources,
+            .producer_pc = inst.pc,
+        };
+    }
+    if (!retain_load_history) return true;
+    const load = ScalarLoad{
+        .pc = inst.pc,
+        .address = address,
+        .destination = @intCast(destination),
+        .word_count = inst.data_words,
+        .buffer_descriptor = is_buffer_load,
+        .from_srt = addressInsideSrt(bindings, address, inst.data_words),
+        .base_sources = base_sources,
+        .offset_sources = offset.sources,
+        .values = loaded,
+    };
+    // A loop can revisit an invariant load hundreds of times. Retain its
+    // provenance once so those visits cannot crowd out loads after the loop.
+    // Distinct addresses, values or provenance still occupy separate entries.
+    if (inst.pc <= result.highest_load_pc) {
+        var previous = result.load_count;
+        while (previous != 0) {
+            previous -= 1;
+            if (result.loads[previous].pc == inst.pc and
+                std.meta.eql(result.loads[previous], load)) return true;
+        }
+    }
+    if (result.load_count < maximum_loads) {
+        result.loads[result.load_count] = load;
+        result.load_count += 1;
+        result.highest_load_pc = @max(result.highest_load_pc, inst.pc);
+    }
+    return true;
+}
+
+fn setpcDestinationPc(result: *const Evaluation, program_address: u64, inst: rdna2.Instruction) ?u32 {
+    const low = source(result, inst.src0) orelse return null;
+    const wide = wideSource(result, inst.src0, low) orelse return null;
+    const dest = wide.value & address_mask;
+    if (dest < program_address or dest % 4 != 0) return null;
+    const relative = dest - program_address;
+    if (relative > 256 * 1024) return null;
+    return @truncate(relative);
+}
+
+fn recordUserDataOperand(result: *Evaluation, operand: rdna2.Operand, count: usize) void {
+    const first = scalarRegisterIndex(operand) orelse return;
+    const end = @min(@as(usize, first) + count, maximum_scalar_registers);
+    for (result.registers[first..end]) |value| result.address_user_data_mask |= value.user_bits;
+}
+
+fn recordResourceUserData(result: *Evaluation, inst: *const rdna2.Instruction) void {
+    switch (inst.family) {
+        // Pin comparisons and carry producers as well as the eventual pointer.
+        // A selected pointer's value alone omits the condition that chose it.
+        .sop1, .sop2, .sopk, .sopc => {
+            recordUserDataOperand(result, inst.src0, 2);
+            if (inst.src_count >= 2) recordUserDataOperand(result, inst.src1, 2);
+        },
+        .smem => {
+            recordUserDataOperand(result, inst.src0, 4);
+            recordUserDataOperand(result, inst.src1, 1);
+        },
+        .mubuf, .mtbuf => {
+            recordUserDataOperand(result, inst.src1, 4);
+            recordUserDataOperand(result, inst.src2, 1);
+        },
+        .mimg => {
+            recordUserDataOperand(result, inst.src1, 8);
+            recordUserDataOperand(result, inst.src2, 4);
+        },
+        // Lane-dependent scalar/control values need a richer proof. Keep all
+        // entry words in the key instead of inferring their missing taint.
+        .vopc, .flat, .ds, .unknown => result.address_user_data_mask = std.math.maxInt(u64),
+        else => {},
+    }
+    if (inst.opcode == .unsupported or inst.opcode == .v_readlane_b32 or inst.opcode == .v_readfirstlane_b32 or
+        ((inst.family == .vop1 or inst.family == .vop2 or inst.family == .vop3 or inst.family == .vop3p) and
+            (scalarRegisterIndex(inst.dst) != null or scalarRegisterIndex(inst.dst2) != null)))
+        result.address_user_data_mask = std.math.maxInt(u64);
+}
+
+fn executeScalar(result: *Evaluation, program_address: u64, inst: *const rdna2.Instruction, scc: *?bool) void {
+    switch (inst.family) {
+        .vop1, .vop2, .vopc, .vop3, .vop3p => {
+            // Per-lane comparisons and carry outputs replace a scalar mask,
+            // including its upper word. They cannot retain a constant from
+            // an earlier scalar definition. Lane reads only replace one word;
+            // tracked readlane spills are handled by the walk before this.
+            const words: u8 = if (inst.opcode == .v_readfirstlane_b32 or inst.opcode == .v_readlane_b32) 1 else 2;
+            invalidateDestination(result, inst.dst, words);
+            invalidateDestination(result, inst.dst2, 2);
+            return;
+        },
+        else => {},
+    }
+    if (inst.opcode == .s_wqm_b32 or inst.opcode == .s_not_b32) {
+        const a = source(result, inst.src0) orelse {
+            invalidateDestination(result, inst.dst, 1);
+            scc.* = null;
+            return;
+        };
+        const value: u32 = if (inst.opcode == .s_not_b32) ~a.value else @truncate(wholeQuadMode64(a.value));
+        write(result, inst.dst, value, a.sources, inst.pc, a.user_bits);
+        scc.* = value != 0;
+        return;
+    }
+    if (isBitwise32(inst.opcode)) {
+        const a = source(result, inst.src0);
+        const b = source(result, inst.src1);
+        if (a == null or b == null) {
+            invalidateDestination(result, inst.dst, 1);
+            scc.* = null;
+            return;
+        }
+        const value = bitwise32(inst.opcode, a.?.value, b.?.value);
+        write(result, inst.dst, value, Sources.merge(a.?.sources, b.?.sources), inst.pc, a.?.user_bits | b.?.user_bits);
+        scc.* = value != 0;
+        return;
+    }
+    if (inst.opcode == .s_cselect_b32 or inst.opcode == .s_cselect_b64) {
+        const selected = if (scc.*) |condition| (if (condition) inst.src0 else inst.src1) else {
+            invalidateDestination(result, inst.dst, destinationWords(inst.opcode));
+            return;
+        };
+        const low = source(result, selected) orelse {
+            invalidateDestination(result, inst.dst, destinationWords(inst.opcode));
+            return;
+        };
+        if (inst.opcode == .s_cselect_b64) {
+            const wide = wideSource(result, selected, low) orelse {
+                invalidateDestination(result, inst.dst, 2);
+                return;
+            };
+            const destination = scalarRegisterIndex(inst.dst) orelse return;
+            if (destination + 1 >= maximum_scalar_registers) return;
+            write(result, inst.dst, @truncate(wide.value), wide.sources, inst.pc, wide.user_bits);
+            result.registers[destination + 1] = .{ .known = true, .value = @truncate(wide.value >> 32), .sources = wide.sources, .producer_pc = inst.pc, .user_bits = wide.user_bits };
+        } else write(result, inst.dst, low.value, low.sources, inst.pc, low.user_bits);
+        return;
+    }
+    if (inst.opcode == .s_getpc_b64 and inst.dst.kind == .sgpr and inst.dst.reg + 1 < maximum_scalar_registers) {
+        const address = program_address + inst.pc + 4;
+        const sources = Sources{ .program_counter = true };
+        result.registers[inst.dst.reg] = .{ .known = true, .value = @truncate(address), .sources = sources, .producer_pc = inst.pc };
+        result.registers[inst.dst.reg + 1] = .{ .known = true, .value = @truncate(address >> 32), .sources = sources, .producer_pc = inst.pc };
+        return;
+    }
+
+    if (isComparison(inst.opcode)) {
+        const a = source(result, inst.src0) orelse {
+            scc.* = null;
+            return;
+        };
+        const b = source(result, inst.src1) orelse {
+            scc.* = null;
+            return;
+        };
+        scc.* = compare(inst.opcode, a.value, b.value);
+        return;
+    }
+
+    // BITSET reads its destination as well as the bit index. AGC compute
+    // prologs use it to insert the stride into a pointer's descriptor word.
+    // Losing that old value here makes an otherwise valid V# unrecoverable.
+    if (inst.opcode == .s_bitset0_b32 or inst.opcode == .s_bitset1_b32) {
+        const current = source(result, inst.dst);
+        const bit = source(result, inst.src0);
+        if (current == null or bit == null) {
+            invalidateDestination(result, inst.dst, 1);
+            return;
+        }
+        const mask = @as(u32, 1) << @as(u5, @truncate(bit.?.value));
+        const value = if (inst.opcode == .s_bitset1_b32) current.?.value | mask else current.?.value & ~mask;
+        write(result, inst.dst, value, Sources.merge(current.?.sources, bit.?.sources), inst.pc, current.?.user_bits | bit.?.user_bits);
+        return; // Neither form modifies SCC.
+    }
+
+    // A failed wide logical operation must also forget its condition code.
+    // Otherwise a lane-dependent mask can reuse an earlier true comparison
+    // and keep the resource walk on a conditional back edge indefinitely.
+    if (isBitwise64(inst.opcode)) scc.* = null;
+    const a = source(result, inst.src0) orelse {
+        invalidateDestination(result, inst.dst, destinationWords(inst.opcode));
+        return;
+    };
+    const b = if (inst.src_count >= 2) source(result, inst.src1) else null;
+    const combined_sources = if (b) |value| Sources.merge(a.sources, value.sources) else a.sources;
+
+    if (destinationWords(inst.opcode) == 2) {
+        executeScalar64(result, inst, a, b, combined_sources, scc);
+        return;
+    }
+    if (inst.opcode == .s_ff1_i32_b64) {
+        const wide = wideSource(result, inst.src0, a) orelse {
+            invalidateDestination(result, inst.dst, 1);
+            return;
+        };
+        const value: u32 = if (wide.value == 0) 0xffff_ffff else @truncate(@ctz(wide.value));
+        write(result, inst.dst, value, Sources.merge(combined_sources, wide.sources), inst.pc, wide.user_bits);
+        return;
+    }
+
+    const bv = if (b) |value| value.value else 0;
+    const value: ?u32 = switch (inst.opcode) {
+        .s_mov_b32, .s_movk_i32 => a.value,
+        .s_abs_i32 => absolute: {
+            const signed: i32 = @bitCast(a.value);
+            break :absolute if (signed < 0) (0 -% a.value) else a.value;
+        },
+        .s_brev_b32 => @bitReverse(a.value),
+        .s_bcnt1_i32_b32 => @popCount(a.value),
+        .s_ff1_i32_b32 => if (a.value == 0) 0xffff_ffff else @ctz(a.value),
+        .s_add_u32 => add: {
+            const sum = @addWithOverflow(a.value, bv);
+            scc.* = sum[1] != 0;
+            break :add sum[0];
+        },
+        .s_add_i32 => signed_add: {
+            scc.* = null;
+            break :signed_add a.value +% bv;
+        },
+        .s_sub_u32 => sub: {
+            const difference = @subWithOverflow(a.value, bv);
+            scc.* = difference[1] == 0;
+            break :sub difference[0];
+        },
+        .s_sub_i32 => signed_sub: {
+            scc.* = null;
+            break :signed_sub a.value -% bv;
+        },
+        .s_addc_u32 => addc: {
+            const carry: u32 = @intFromBool(scc.* orelse false);
+            const first = @addWithOverflow(a.value, bv);
+            const second = @addWithOverflow(first[0], carry);
+            scc.* = first[1] != 0 or second[1] != 0;
+            break :addc second[0];
+        },
+        .s_subb_u32 => subb: {
+            const borrow: u32 = @intFromBool(!(scc.* orelse true));
+            const first = @subWithOverflow(a.value, bv);
+            const second = @subWithOverflow(first[0], borrow);
+            scc.* = first[1] == 0 and second[1] == 0;
+            break :subb second[0];
+        },
+        .s_cselect_b32 => if (scc.*) |condition|
+            if (condition) a.value else bv
+        else
+            null,
+        .s_bfe_u32 => bitfieldExtractUnsigned32(a.value, bv),
+        .s_bfe_i32 => bitfieldExtractSigned32(a.value, bv),
+        .s_bfm_b32 => bitfieldMask32(a.value, bv),
+        .s_pack_ll_b32_b16 => (a.value & 0xffff) | (bv << 16),
+        .s_pack_lh_b32_b16 => (a.value & 0xffff) | (bv & 0xffff_0000),
+        .s_pack_hh_b32_b16 => (a.value >> 16) | (bv & 0xffff_0000),
+        .s_lshl_b32 => a.value << @truncate(bv & 31),
+        .s_lshr_b32 => a.value >> @truncate(bv & 31),
+        .s_ashr_i32 => @bitCast(@as(i32, @bitCast(a.value)) >> @truncate(bv & 31)),
+        .s_mul_i32, .s_mulk_i32 => a.value *% bv,
+        .s_mul_hi_u32 => @truncate((@as(u64, a.value) * @as(u64, bv)) >> 32),
+        .s_lshl1_add_u32 => (a.value << 1) +% bv,
+        .s_lshl2_add_u32 => (a.value << 2) +% bv,
+        .s_lshl3_add_u32 => (a.value << 3) +% bv,
+        .s_lshl4_add_u32 => (a.value << 4) +% bv,
+        .s_min_u32 => @min(a.value, bv),
+        .s_max_u32 => @max(a.value, bv),
+        .s_min_i32 => @bitCast(@min(@as(i32, @bitCast(a.value)), @as(i32, @bitCast(bv)))),
+        .s_max_i32 => @bitCast(@max(@as(i32, @bitCast(a.value)), @as(i32, @bitCast(bv)))),
+        else => null,
+    };
+    if (value) |known| write(result, inst.dst, known, combined_sources, inst.pc, a.user_bits | if (b) |other| other.user_bits else 0) else invalidateDestination(result, inst.dst, 1);
+}
+
+/// The 64-bit reading of a source operand.
+///
+/// A register pair is the obvious case, but a 64-bit operation is equally free
+/// to name a constant, and each constant class widens differently: an integer
+/// inline constant carries its sign into the upper word, a literal occupies
+/// only the lower one, and a float inline constant denotes the double it names
+/// rather than the single its 32-bit encoding holds. Treating every constant
+/// source as unknown — as refusing to widen them amounts to — loses whole
+/// descriptors, because a sampler assembled from immediates in registers is
+/// built entirely out of operations of this shape.
+fn wideSource(
+    result: *const Evaluation,
+    operand: rdna2.Operand,
+    low: ScalarValue,
+) ?struct { value: u64, sources: Sources, user_bits: u64 } {
+    switch (operand.kind) {
+        .sgpr, .vcc_lo, .vcc_hi, .exec_lo, .exec_hi, .m0 => {
+            const index = scalarRegisterIndex(operand) orelse return null;
+            if (index + 1 >= maximum_scalar_registers) return null;
+            const high = result.registers[index + 1];
+            if (!high.known) return null;
+            return .{
+                .value = @as(u64, low.value) | (@as(u64, high.value) << 32),
+                .sources = Sources.merge(low.sources, high.sources),
+                .user_bits = low.user_bits | high.user_bits,
+            };
+        },
+        .integer_inline_constant => {
+            const signed: i64 = @as(i32, @bitCast(operand.value));
+            return .{ .value = @bitCast(signed), .sources = low.sources, .user_bits = low.user_bits };
+        },
+        .literal_constant => return .{ .value = operand.value, .sources = low.sources, .user_bits = low.user_bits },
+        .float_inline_constant => return .{
+            .value = @bitCast(@as(f64, operand.float_val)),
+            .sources = low.sources,
+            .user_bits = low.user_bits,
+        },
+        .null => return .{ .value = 0, .sources = low.sources, .user_bits = low.user_bits },
+        else => return null,
+    }
+}
+
+fn bitfieldMask64(width: u64, offset: u64) u64 {
+    const bits: u6 = @truncate(width & 63);
+    const shift: u6 = @truncate(offset & 63);
+    const mask = (@as(u64, 1) << bits) - 1;
+    return mask << shift;
+}
+
+fn bitfieldExtractUnsigned64(value: u64, control: u64) u64 {
+    const offset: u6 = @truncate(control & 63);
+    const width: u32 = @truncate((control >> 16) & 0x7f);
+    if (width == 0) return 0;
+    if (width >= 64) return value >> offset;
+    const bits: u6 = @truncate(width);
+    return (value >> offset) & ((@as(u64, 1) << bits) - 1);
+}
+
+/// Each bit of the low word placed into both bits of its own pair.
+fn bitReplicate64(value: u64) u64 {
+    var replicated: u64 = 0;
+    var index: u6 = 0;
+    while (index < 32) : (index += 1) {
+        if (value & (@as(u64, 1) << index) == 0) continue;
+        replicated |= @as(u64, 0b11) << @as(u6, @truncate(@as(u32, index) * 2));
+    }
+    return replicated;
+}
+
+/// Whole-quad mode: any live lane in a group of four makes all four live.
+fn wholeQuadMode64(value: u64) u64 {
+    var expanded: u64 = 0;
+    var group: u6 = 0;
+    while (group < 16) : (group += 1) {
+        const shift: u6 = @truncate(@as(u32, group) * 4);
+        if (value & (@as(u64, 0xf) << shift) == 0) continue;
+        expanded |= @as(u64, 0xf) << shift;
+    }
+    return expanded;
+}
+
+test "whole quad mode preserves neighbouring registers and updates SCC" {
+    const inst = try rdna2.decodeInstruction(0, &.{0xbeeb_090a}, 0);
+    for ([_]u32{ 0, 1, 0x8000_0000, 0x1020_4800, 0xffff_ffff }) |input| {
+        var result = Evaluation{};
+        result.registers[10] = .{ .known = true, .value = input };
+        result.registers[106] = .{ .known = true, .value = 0x1234_5678 };
+        result.registers[108] = .{ .known = true, .value = 0x8765_4321 };
+        var scc: ?bool = input == 0;
+        executeScalar(&result, 0, &inst, &scc);
+        var expected: u32 = 0;
+        for (0..32) |bit| {
+            const quad: u5 = @intCast(bit & ~@as(usize, 3));
+            if (input & (@as(u32, 15) << quad) != 0) expected |= @as(u32, 1) << @intCast(bit);
+        }
+        try std.testing.expectEqual(expected, result.register(107).?.value);
+        try std.testing.expectEqual(input != 0, scc.?);
+        try std.testing.expectEqual(@as(u32, 0x1234_5678), result.register(106).?.value);
+        try std.testing.expectEqual(@as(u32, 0x8765_4321), result.register(108).?.value);
+    }
+    var unknown = Evaluation{};
+    unknown.registers[107] = .{ .known = true, .value = 1 };
+    var scc: ?bool = true;
+    executeScalar(&unknown, 0, &inst, &scc);
+    try std.testing.expect(unknown.register(107) == null);
+    try std.testing.expect(scc == null);
+}
+
+fn executeScalar64(
+    result: *Evaluation,
+    inst: *const rdna2.Instruction,
+    a: ScalarValue,
+    b: ?ScalarValue,
+    sources: Sources,
+    scc: *?bool,
+) void {
+    const destination = scalarRegisterIndex(inst.dst) orelse return;
+    if (destination + 1 >= maximum_scalar_registers) {
+        invalidateDestination(result, inst.dst, 2);
+        return;
+    }
+    const wide_a = wideSource(result, inst.src0, a) orelse {
+        invalidateDestination(result, inst.dst, 2);
+        return;
+    };
+    var all_sources = Sources.merge(sources, wide_a.sources);
+    const av = wide_a.value;
+    if (inst.src_count >= 2 and b == null) {
+        invalidateDestination(result, inst.dst, 2);
+        return;
+    }
+    var bv: u64 = 0;
+    if (b) |low| {
+        // BFE's data is 64-bit, but its packed offset/width is one SGPR.
+        // In vertex fetch prologs that control often lives in VCC_HI;
+        // requiring s108 makes an otherwise complete V# format unknown.
+        if (inst.opcode == .s_bfe_u64) {
+            bv = low.value;
+        } else {
+            const wide_b = wideSource(result, inst.src1, low) orelse {
+                invalidateDestination(result, inst.dst, 2);
+                return;
+            };
+            bv = wide_b.value;
+            all_sources = Sources.merge(all_sources, wide_b.sources);
+        }
+    }
+    const value: ?u64 = switch (inst.opcode) {
+        .s_mov_b64 => av,
+        .s_cselect_b64 => if (scc.*) |condition|
+            if (condition) av else bv
+        else
+            null,
+        .s_not_b64 => ~av,
+        .s_and_b64 => av & bv,
+        .s_or_b64 => av | bv,
+        .s_xor_b64 => av ^ bv,
+        .s_andn2_b64 => av & ~bv,
+        .s_orn2_b64 => av | ~bv,
+        .s_nand_b64 => ~(av & bv),
+        .s_nor_b64 => ~(av | bv),
+        .s_xnor_b64 => ~(av ^ bv),
+        .s_lshl_b64 => av << @truncate(bv & 63),
+        .s_lshr_b64 => av >> @truncate(bv & 63),
+        .s_bfm_b64 => bitfieldMask64(av, bv),
+        .s_bfe_u64 => bitfieldExtractUnsigned64(av, bv),
+        .s_bitreplicate_b64_b32 => bitReplicate64(av),
+        .s_wqm_b64, .s_quadmask_b64 => wholeQuadMode64(av),
+        else => null,
+    };
+    if (value) |known| {
+        if (isBitwise64(inst.opcode)) scc.* = known != 0;
+        const bits = a.user_bits | if (b) |other| other.user_bits else 0;
+        write(result, inst.dst, @truncate(known), all_sources, inst.pc, bits);
+        result.registers[destination + 1] = .{ .known = true, .value = @truncate(known >> 32), .sources = all_sources, .producer_pc = inst.pc, .user_bits = bits };
+    } else invalidateDestination(result, inst.dst, 2);
+}
+
+test "64-bit BFE takes one control SGPR and retains both data words" {
+    var result = Evaluation{};
+    result.registers[14] = .{ .known = true, .value = 0x022c0204 };
+    result.registers[15] = .{ .known = true, .value = 0x0fac03ac };
+    result.registers[107] = .{ .known = true, .value = 0x000c0020 };
+    var scc: ?bool = null;
+    const inst = rdna2.Instruction{
+        .pc = 0xc4,
+        .opcode = .s_bfe_u64,
+        .dst = .{ .kind = .sgpr, .reg = 26 },
+        .src0 = .{ .kind = .sgpr, .reg = 14 },
+        .src1 = .{ .kind = .vcc_hi },
+        .src_count = 2,
+    };
+    executeScalar(&result, 0, &inst, &scc);
+    try std.testing.expectEqual(@as(u32, 0x3ac), result.register(26).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(27).?.value);
+    result.registers[108] = .{ .known = true, .value = 0xffffffff };
+    executeScalar(&result, 0, &inst, &scc);
+    try std.testing.expectEqual(@as(u32, 0x3ac), result.register(26).?.value);
+    result.registers[15] = .{};
+    executeScalar(&result, 0, &inst, &scc);
+    try std.testing.expect(result.register(26) == null);
+    try std.testing.expect(result.register(27) == null);
+}
+
+fn source(result: *const Evaluation, operand: rdna2.Operand) ?ScalarValue {
+    return switch (operand.kind) {
+        .sgpr, .vcc_lo, .vcc_hi, .exec_lo, .exec_hi, .m0 => if (scalarRegisterIndex(operand)) |index|
+            if (result.registers[index].known) result.registers[index] else null
+        else
+            null,
+        .integer_inline_constant, .float_inline_constant, .literal_constant => .{
+            .known = true,
+            .value = operand.value,
+            .sources = .{ .immediate = true },
+        },
+        .null => .{ .known = true, .value = 0, .sources = .{ .immediate = true } },
+        else => null,
+    };
+}
+
+fn bitfieldExtractUnsigned32(value: u32, control: u32) u32 {
+    const offset: u5 = @intCast(control & 0x1f);
+    const encoded_width: u32 = (control >> 16) & 0x7f;
+    const width: u6 = @intCast(@min(encoded_width, 32 - @as(u32, offset)));
+    if (width == 0) return 0;
+    if (width == 32) return value;
+    const shift_width: u5 = @intCast(width);
+    return (value >> offset) & ((@as(u32, 1) << shift_width) - 1);
+}
+
+fn bitfieldExtractSigned32(value: u32, control: u32) u32 {
+    const offset: u5 = @intCast(control & 0x1f);
+    const encoded_width: u32 = (control >> 16) & 0x7f;
+    const width: u6 = @intCast(@min(encoded_width, 32 - @as(u32, offset)));
+    if (width == 0) return 0;
+    const extracted = bitfieldExtractUnsigned32(value, control);
+    if (width == 32) return extracted;
+    const sign_shift: u5 = @intCast(width - 1);
+    if (extracted & (@as(u32, 1) << sign_shift) == 0) return extracted;
+    return extracted | ~((@as(u32, 1) << @intCast(width)) - 1);
+}
+
+fn bitfieldMask32(width: u32, offset: u32) u32 {
+    const bits: u5 = @truncate(width & 31);
+    const shift: u5 = @truncate(offset & 31);
+    const mask = (@as(u32, 1) << bits) - 1;
+    return mask << shift;
+}
+
+fn write(result: *Evaluation, destination: rdna2.Operand, value: u32, sources: Sources, pc: u32, user_bits: u64) void {
+    const index = scalarRegisterIndex(destination) orelse return;
+    result.registers[index] = .{ .known = true, .value = value, .sources = sources, .producer_pc = pc, .user_bits = user_bits };
+}
+
+fn invalidateDestination(result: *Evaluation, destination: rdna2.Operand, count: u8) void {
+    const first = scalarRegisterIndex(destination) orelse return;
+    const end = @min(maximum_scalar_registers, first + count);
+    for (result.registers[first..end]) |*value| value.* = .{};
+}
+
+/// Unified SGPR index, including scalar aliases such as VCC and EXEC.
+pub fn scalarRegisterIndex(value: rdna2.Operand) ?usize {
+    return switch (value.kind) {
+        .sgpr => if (value.reg < maximum_scalar_registers) @intCast(value.reg) else null,
+        .vcc_lo => 106,
+        .vcc_hi => 107,
+        .m0 => 124,
+        .exec_lo => 126,
+        .exec_hi => 127,
+        else => null,
+    };
+}
+
+fn destinationWords(opcode: rdna2.Opcode) u8 {
+    return switch (opcode) {
+        .s_mov_b64,
+        .s_not_b64,
+        .s_wqm_b64,
+        .s_cselect_b64,
+        .s_and_b64,
+        .s_or_b64,
+        .s_xor_b64,
+        .s_andn2_b64,
+        .s_orn2_b64,
+        .s_nand_b64,
+        .s_nor_b64,
+        .s_xnor_b64,
+        .s_lshl_b64,
+        .s_lshr_b64,
+        .s_bfm_b64,
+        .s_bfe_u64,
+        .s_bitreplicate_b64_b32,
+        .s_quadmask_b64,
+        => 2,
+        else => 1,
+    };
+}
+
+fn isComparison(opcode: rdna2.Opcode) bool {
+    return switch (opcode) {
+        .s_cmp_eq_i32, .s_cmp_lg_i32, .s_cmp_gt_i32, .s_cmp_ge_i32, .s_cmp_lt_i32, .s_cmp_le_i32, .s_cmp_eq_u32, .s_cmp_lg_u32, .s_cmp_gt_u32, .s_cmp_ge_u32, .s_cmp_lt_u32, .s_cmp_le_u32, .s_cmp_eq_u64, .s_cmp_lg_u64, .s_bitcmp0_b32, .s_bitcmp1_b32 => true,
+        else => false,
+    };
+}
+
+fn isBitwise64(opcode: rdna2.Opcode) bool {
+    return switch (opcode) {
+        .s_and_b64, .s_or_b64, .s_xor_b64, .s_andn2_b64, .s_orn2_b64, .s_nand_b64, .s_nor_b64, .s_xnor_b64 => true,
+        else => false,
+    };
+}
+
+fn isBitwise32(opcode: rdna2.Opcode) bool {
+    return switch (opcode) {
+        .s_and_b32, .s_or_b32, .s_xor_b32, .s_andn2_b32, .s_orn2_b32, .s_nand_b32, .s_nor_b32, .s_xnor_b32 => true,
+        else => false,
+    };
+}
+
+fn bitwise32(opcode: rdna2.Opcode, a: u32, b: u32) u32 {
+    return switch (opcode) {
+        .s_and_b32 => a & b,
+        .s_or_b32 => a | b,
+        .s_xor_b32 => a ^ b,
+        .s_andn2_b32 => a & ~b,
+        .s_orn2_b32 => a | ~b,
+        .s_nand_b32 => ~(a & b),
+        .s_nor_b32 => ~(a | b),
+        .s_xnor_b32 => ~(a ^ b),
+        else => unreachable,
+    };
+}
+
+fn compare(opcode: rdna2.Opcode, a: u32, b: u32) bool {
+    const ai: i32 = @bitCast(a);
+    const bi: i32 = @bitCast(b);
+    return switch (opcode) {
+        .s_cmp_eq_i32, .s_cmp_eq_u32 => a == b,
+        .s_cmp_lg_i32, .s_cmp_lg_u32 => a != b,
+        .s_cmp_gt_i32 => ai > bi,
+        .s_cmp_ge_i32 => ai >= bi,
+        .s_cmp_lt_i32 => ai < bi,
+        .s_cmp_le_i32 => ai <= bi,
+        .s_cmp_gt_u32 => a > b,
+        .s_cmp_ge_u32 => a >= b,
+        .s_cmp_lt_u32 => a < b,
+        .s_cmp_le_u32 => a <= b,
+        .s_bitcmp0_b32 => (a >> @as(u5, @truncate(b))) & 1 == 0,
+        .s_bitcmp1_b32 => (a >> @as(u5, @truncate(b))) & 1 != 0,
+        else => false,
+    };
+}
+
+fn addressInsideSrt(bindings: *const shaders.StageBindings, address: u64, words: u8) bool {
+    const start = bindings.srt_address orelse return false;
+    const metadata = bindings.metadata orelse return false;
+    const size = @as(u64, metadata.shader_resource_table_size_words) * 4;
+    const bytes = @as(u64, words) * 4;
+    return address >= start and address - start <= size and bytes <= size - (address - start);
+}
+
+fn addProgramAddress(base: u64, pc: u32) ?u64 {
+    return std.math.add(u64, base, pc) catch null;
+}
+
+fn addSigned(base: u64, offset: i64) ?u64 {
+    if (offset >= 0) return std.math.add(u64, base, @intCast(offset)) catch null;
+    return std.math.sub(u64, base, @intCast(-offset)) catch null;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+
+/// Exercise each checkpoint regression with and without specialization
+/// history. Both modes must issue the same ordered reads and produce the same
+/// register states, including skipped blocks, revisits and failed reads.
+fn testResourceCheckpoints(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    pcs: []const u32,
+    snapshots: []ScalarRegisters,
+    steps: ?[]const u32,
+) !Evaluation {
+    const Trace = struct {
+        source_reader: shaders.MemoryReader,
+        digest: std.hash.Wyhash = .init(0),
+        count: usize = 0,
+        fn read(raw: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.count += 1;
+            self.digest.update(std.mem.asBytes(&address));
+            const length: u64 = bytes.len;
+            self.digest.update(std.mem.asBytes(&length));
+            self.source_reader.read(address, bytes) catch {
+                self.digest.update(&.{0});
+                return false;
+            };
+            self.digest.update(&.{1});
+            self.digest.update(bytes);
+            return true;
+        }
+    };
+    var trace = Trace{ .source_reader = reader };
+    const traced = shaders.MemoryReader{ .context = &trace, .read_fn = Trace.read };
+    const complete = evaluateDecodedResourceStateAtCheckpoints(traced, bindings, instructions, pcs, snapshots, steps);
+    const read_count = trace.count;
+    const digest = trace.digest.final();
+    trace = .{ .source_reader = reader };
+    const without_history = try std.testing.allocator.alloc(ScalarRegisters, snapshots.len);
+    defer std.testing.allocator.free(without_history);
+    @memset(without_history, @splat(.{ .known = true, .value = 0xdeadbeef }));
+    var lightweight: Evaluation = undefined;
+    evaluateDecodedResourceSnapshotsInto(&lightweight, traced, bindings, instructions, pcs, without_history, steps);
+    try std.testing.expectEqual(read_count, trace.count);
+    try std.testing.expectEqual(digest, trace.digest.final());
+    try std.testing.expectEqualDeep(snapshots, without_history);
+    try std.testing.expectEqualDeep(complete.registers, lightweight.registers);
+    try std.testing.expectEqual(complete.instruction_count, lightweight.instruction_count);
+    try std.testing.expectEqual(complete.stop_pc, lightweight.stop_pc);
+    try std.testing.expectEqual(complete.stop_reason, lightweight.stop_reason);
+    try std.testing.expectEqual(complete.memory_read_failed, lightweight.memory_read_failed);
+    try std.testing.expectEqual(complete.address_user_data_mask, lightweight.address_user_data_mask);
+    try std.testing.expectEqual(@as(usize, 0), lightweight.load_count);
+    if (steps == null) {
+        // Two consumers may overlap and independently skip checkpoint sites.
+        // Reuse the regression cases for branches, loops and failed loads.
+        const second = try std.testing.allocator.alloc(ScalarRegisters, snapshots.len);
+        defer std.testing.allocator.free(second);
+        trace = .{ .source_reader = reader };
+        var shared: Evaluation = undefined;
+        evaluateDecodedResourceStateAtTwoCheckpointsInto(&shared, traced, bindings, instructions, pcs, without_history, pcs, second);
+        try std.testing.expectEqual(read_count, trace.count);
+        try std.testing.expectEqual(digest, trace.digest.final());
+        try std.testing.expectEqualDeep(snapshots, without_history);
+        try std.testing.expectEqualDeep(snapshots, second);
+        try std.testing.expectEqualDeep(complete.registers, shared.registers);
+        try std.testing.expectEqual(complete.stop_reason, shared.stop_reason);
+        try std.testing.expectEqual(complete.instruction_count, shared.instruction_count);
+        try std.testing.expectEqualDeep(complete.loadSlice(), shared.loadSlice());
+    }
+    return complete;
+}
+
+const TestMemory = struct {
+    base: u64,
+    bytes: []u8,
+    read_count: usize = 0,
+    last_read_size: usize = 0,
+
+    fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+        const self: *TestMemory = @ptrCast(@alignCast(context.?));
+        self.read_count += 1;
+        self.last_read_size = destination.len;
+        if (address < self.base) return false;
+        const offset: usize = @intCast(address - self.base);
+        if (offset > self.bytes.len or destination.len > self.bytes.len - offset) return false;
+        @memcpy(destination, self.bytes[offset .. offset + destination.len]);
+        return true;
+    }
+
+    fn reader(self: *TestMemory) shaders.MemoryReader {
+        return .{ .context = self, .read_fn = read };
+    }
+
+    fn write(self: *TestMemory, address: u64, value: u32) void {
+        const offset: usize = @intCast(address - self.base);
+        std.mem.writeInt(u32, self.bytes[offset..][0..4], value, .little);
+    }
+};
+
+fn testBindings(program: u64, srt: u64) shaders.StageBindings {
+    var user_data = [_]u32{0} ** 64;
+    user_data[0] = @truncate(srt);
+    user_data[1] = @truncate(srt >> 32);
+    return .{
+        .stage = .vertex,
+        .user_data_stage = .vertex,
+        .program_address = program,
+        .user_data_count = 2,
+        .scalar_user_data_base = 0,
+        .user_data = user_data,
+        .metadata = .{
+            .header_address = 0,
+            .user_data_address = 0,
+            .direct_offsets_address = 0,
+            .resource_offsets_addresses = .{ 0, 0, 0, 0 },
+            .extended_user_data_size_words = 0,
+            .shader_resource_table_size_words = 32,
+            .direct_resource_count = 0,
+            .resource_counts = .{ 0, 0, 0, 0 },
+            .input_semantics_address = 0,
+            .input_semantics_count = 0,
+        },
+        .srt_address = srt,
+        .direct_pointers = .{},
+    };
+}
+
+test "vector scalar fast path preserves loads, dependency masks and scalar clobbers" {
+    var storage = [_]u8{0} ** 32;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 123);
+    memory.write(0x4010, 456);
+    const bindings = testBindings(0x3000, 0x4000);
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .smem, .opcode = .s_load_dwordx8, .word_count = 2, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 8 },
+        .{ .pc = 8, .family = .sop1, .opcode = .s_mov_b64, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 12, .family = .vop3, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 16, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr, .reg = 8 } },
+        .{ .pc = 20, .family = .vop3, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 24, .family = .vop2, .opcode = .v_add_f32, .dst = .{ .kind = .vgpr }, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .vgpr, .reg = 1 } },
+        .{ .pc = 28, .family = .vopc, .opcode = .v_cmp_eq_f32, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .vgpr }, .src1 = .{ .kind = .vgpr, .reg = 1 } },
+        .{ .pc = 32, .family = .vop1, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .vgpr } },
+        .{ .pc = 36, .family = .sopp, .opcode = .s_endpgm },
+    };
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, instructions.len), result.instruction_count);
+    try std.testing.expectEqual(@as(usize, 1), memory.read_count);
+    try std.testing.expectEqual(@as(usize, 1), result.load_count);
+    try std.testing.expectEqual(@as(u32, 123), result.loads[0].values[0]);
+    try std.testing.expectEqual(@as(u32, 456), result.loads[0].values[4]);
+    try std.testing.expectEqual(@as(u32, 123), result.register(8).?.value);
+    try std.testing.expect(result.register(10) == null);
+    try std.testing.expect(result.register(12) == null);
+    try std.testing.expect(result.register(106) == null);
+    try std.testing.expectEqual(std.math.maxInt(u64), result.address_user_data_mask);
+}
+
+test "vector mask writes forget both scalar words without clobbering neighbours" {
+    const cases = [_]struct { code: [2]u32, words: usize, first: usize }{
+        .{ .code = .{ 0x7c04_0100, 0 }, .words = 1, .first = 106 }, // VOPC compare -> VCC
+        .{ .code = .{ 0x7daa_0e83, 0 }, .words = 1, .first = 126 }, // CMPX -> EXEC
+        .{ .code = .{ 0xd402_000c, 0x0002_0108 }, .words = 2, .first = 12 }, // VOP3 compare -> s[12:13]
+        .{ .code = .{ 0xd70f_0c00, 0x0002_0108 }, .words = 2, .first = 12 }, // VOP3B carry -> s[12:13]
+        .{ .code = .{ 0xd528_6a00, 0x0032_0080 }, .words = 2, .first = 106 }, // VOP3B addc -> VCC
+        .{ .code = .{ 0x5000_0100, 0 }, .words = 1, .first = 106 }, // VOP2 addc -> VCC
+    };
+    for (cases) |case| {
+        const inst = try rdna2.decodeInstruction(0, case.code[0..case.words], 0);
+        try std.testing.expect(scalarWalkVisits(inst));
+        var result = Evaluation{};
+        for (&result.registers, 0..) |*value, index| value.* = .{ .known = true, .value = @intCast(index + 1) };
+        var scc: ?bool = true;
+        executeScalar(&result, 0, &inst, &scc);
+        for (result.registers, 0..) |value, index| {
+            try std.testing.expectEqual(index != case.first and index != case.first + 1, value.known);
+            if (value.known) try std.testing.expectEqual(@as(u32, @intCast(index + 1)), value.value);
+        }
+        try std.testing.expectEqual(true, scc.?);
+    }
+}
+
+test "resource walk restores pointer halves from independent VGPR lane spills" {
+    var storage = [_]u8{0} ** 32;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0x1234_5678);
+    const bindings = testBindings(0x3000, 0x4000);
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 4, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr, .reg = 1 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .pc = 8, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 0 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 12, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 17 }, .src0 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 16, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 20, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 11 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .pc = 24, .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .sgpr, .reg = 10 }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .pc = 28, .opcode = .s_endpgm },
+    };
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), result.register(12).?.value);
+    try std.testing.expect(result.register(10).?.sources.user_data);
+    try std.testing.expectEqual(@as(u32, 16), result.register(10).?.producer_pc);
+}
+
+test "resource lane spills forget overwritten slots and unknown lane writes" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 4, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 18 } },
+        .{ .pc = 8, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 12, .opcode = .s_endpgm },
+    };
+    try std.testing.expect(evaluateDecodedResourceState(memory.reader(), &bindings, &instructions).register(10) == null);
+    instructions[1] = .{ .pc = 4, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .integer_inline_constant }, .src1 = .{ .kind = .sgpr, .reg = 9 } };
+    try std.testing.expect(evaluateDecodedResourceState(memory.reader(), &bindings, &instructions).register(10) == null);
+    instructions[1].src1 = .{ .kind = .integer_inline_constant };
+    instructions[1].src0 = .{ .kind = .sgpr, .reg = 9 };
+    try std.testing.expect(evaluateDecodedResourceState(memory.reader(), &bindings, &instructions).register(10) == null);
+}
+
+test "resource lane spills do not survive an unresolved loop overwrite" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_execz, .branch_target = 12 },
+        .{ .pc = 4, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 8, .opcode = .s_branch, .branch_target = 0 },
+        .{ .pc = 12, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expect(result.register(10) == null);
+}
+
+test "resource lane spills preserve full tables and reuse invalidated VGPR lanes" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    var instructions: [138]rdna2.Instruction = undefined;
+    for (instructions[0..128], 0..) |*inst, i| inst.* = .{
+        .opcode = .v_writelane_b32,
+        .dst = .{ .kind = .vgpr, .reg = @intCast(18 + i / 64) },
+        .src0 = .{ .kind = .sgpr },
+        .src1 = .{ .kind = .integer_inline_constant, .value = @intCast(i % 64) },
+    };
+    @memcpy(instructions[128..], &[_]rdna2.Instruction{
+        // Overflow must not evict a pointer from either fully occupied VGPR.
+        .{ .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 20 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 18 } },
+        .{ .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 20 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0xabc }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 11 }, .src0 = .{ .kind = .vgpr, .reg = 19 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .vgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 19 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .sgpr, .reg = 9 } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 13 }, .src0 = .{ .kind = .vgpr, .reg = 19 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 14 }, .src0 = .{ .kind = .vgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .opcode = .s_endpgm },
+    });
+    for (&instructions, 0..) |*inst, i| inst.pc = @intCast(i * 4);
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expect(result.register(10) == null);
+    try std.testing.expectEqual(@as(u32, 0x4000), result.register(11).?.value);
+    try std.testing.expectEqual(@as(u32, 0xabc), result.register(12).?.value);
+    try std.testing.expect(result.register(13) == null);
+    try std.testing.expectEqual(@as(u32, 0xabc), result.register(14).?.value);
+}
+
+test "uniform pruning removes disconnected resources without guessing unknown guards" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_scc1, .branch_target = 8 },
+        .{ .pc = 4, .opcode = .s_branch, .branch_target = 16 },
+        .{ .pc = 8, .opcode = .s_branch, .branch_target = 16 },
+        .{ .pc = 12, .opcode = .image_sample },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+    defer specialized.deinit(std.testing.allocator);
+    try std.testing.expectEqual(rdna2.Opcode.s_cbranch_scc1, specialized.items[0].opcode);
+    try std.testing.expectEqual(rdna2.Opcode.s_nop, specialized.items[3].opcode);
+    // A second live entry restores the resource, regardless of the unknown SCC.
+    instructions[2].branch_target = 12;
+    var alternate = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer alternate.deinit(std.testing.allocator);
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &alternate)) == null);
+}
+
+test "uniform resource guard is specialized independently for each dispatch" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    const code = [_]u32{
+        0xf400_1a80, 125 << 25, // s_load_dword vcc_lo, s0:s1
+        0xbefe_04c1, // s_mov_b64 exec, -1 (preserves SCC and VCC)
+        0xbf8c_007f, // s_waitcnt
+        0xbf07_6a80, // s_cmp_lg_u32 0, vcc_lo
+        0xbf84_0002, // s_cbranch_scc0 end
+        0xf020_0f28, 0x0002_0400, // conditional image_store
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var graph = try rdna2.buildControlFlow(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    for ([_]u32{ 0, 1, 0, 1 }) |enabled| {
+        memory.write(0x1000, enabled);
+        var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph)).?;
+        defer specialized.deinit(std.testing.allocator);
+        try std.testing.expectEqual(if (enabled == 0) rdna2.Opcode.s_nop else .image_store, specialized.items[5].opcode);
+        try std.testing.expectEqual(if (enabled == 0) rdna2.Opcode.s_branch else .s_nop, specialized.items[4].opcode);
+        try std.testing.expectEqual(rdna2.Opcode.image_store, program.instructions.items[5].opcode);
+    }
+    memory.base = 0x3000; // An unreadable flag cannot prove either successor.
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph)) == null);
+}
+
+test "uniform bit guards prune only the selected dispatch branch" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .integer_inline_constant }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+        .{ .pc = 4, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .pc = 8, .family = .sopc, .opcode = .s_bitcmp1_b32, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+        .{ .pc = 12, .opcode = .s_cbranch_scc0, .branch_target = 24 },
+        .{ .pc = 16, .opcode = .flat_load_dword, .dst = .{ .kind = .vgpr }, .src0 = .{ .kind = .vgpr }, .data_words = 1 },
+        .{ .pc = 20, .opcode = .s_branch, .branch_target = 28 },
+        .{ .pc = 24, .opcode = .image_store },
+        .{ .pc = 28, .opcode = .buffer_store_dword },
+        .{ .pc = 32, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    for ([_]rdna2.Opcode{ .s_bitcmp0_b32, .s_bitcmp1_b32, .s_and_b32, .s_not_b32 }) |opcode| {
+        instructions[2].opcode = opcode;
+        instructions[2].dst = .{ .kind = .sgpr, .reg = 10 };
+        for ([_]u32{ 0, 31, 32, 63 }) |bit| {
+            instructions[2].src1.value = if (opcode == .s_and_b32) @as(u32, 1) << @as(u5, @truncate(bit)) else bit;
+            for ([_]u32{ 0, 56, 1, 0x8000_0000, 0xffff_ffff }) |flags| {
+                memory.write(0x1000, flags);
+                const set = (flags & (@as(u32, 1) << @as(u5, @truncate(bit)))) != 0;
+                const execute_flat = if (opcode == .s_not_b32) flags != 0xffff_ffff else set == (opcode != .s_bitcmp0_b32);
+                var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+                defer specialized.deinit(std.testing.allocator);
+                try std.testing.expectEqual(if (execute_flat) rdna2.Opcode.flat_load_dword else .s_nop, specialized.items[4].opcode);
+                try std.testing.expectEqual(if (execute_flat) rdna2.Opcode.s_nop else .image_store, specialized.items[6].opcode);
+                try std.testing.expectEqual(rdna2.Opcode.buffer_store_dword, specialized.items[7].opcode);
+            }
+        }
+        // An unreadable flag must clear the preceding comparison's SCC.
+        memory.base = 0x3000;
+        try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
+        memory.base = 0x1000;
+        // The unary NOT has no bit selector.
+        if (opcode == .s_not_b32) continue;
+        // The bit selector can be unknown independently of the flag word.
+        instructions[2].src1 = .{ .kind = .sgpr, .reg = 9 };
+        try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
+        instructions[2].src1 = .{ .kind = .integer_inline_constant };
+    }
+}
+
+test "scalar logical results update SCC and forget unknown operands" {
+    const cases = [_]struct { opcode: rdna2.Opcode, a: u32, b: u32, value: u32 }{
+        .{ .opcode = .s_and_b32, .a = 56, .b = 1, .value = 0 },
+        .{ .opcode = .s_or_b32, .a = 1, .b = 2, .value = 3 },
+        .{ .opcode = .s_xor_b32, .a = 7, .b = 7, .value = 0 },
+        .{ .opcode = .s_andn2_b32, .a = 7, .b = 2, .value = 5 },
+        .{ .opcode = .s_orn2_b32, .a = 0, .b = 0xffff_ffff, .value = 0 },
+        .{ .opcode = .s_nand_b32, .a = 0xffff_ffff, .b = 0xffff_ffff, .value = 0 },
+        .{ .opcode = .s_nor_b32, .a = 1, .b = 2, .value = 0xffff_fffc },
+        .{ .opcode = .s_xnor_b32, .a = 0xffff_ffff, .b = 0, .value = 0 },
+    };
+    for (cases) |c| {
+        var state = Evaluation{};
+        var scc: ?bool = c.value == 0;
+        var inst = rdna2.Instruction{ .opcode = c.opcode, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .literal_constant, .value = c.a }, .src1 = .{ .kind = .literal_constant, .value = c.b }, .src_count = 2 };
+        executeScalar(&state, 0, &inst, &scc);
+        try std.testing.expectEqual(c.value, state.register(8).?.value);
+        try std.testing.expectEqual(@as(?bool, c.value != 0), scc);
+        inst.src1 = .{ .kind = .sgpr, .reg = 9 };
+        executeScalar(&state, 0, &inst, &scc);
+        try std.testing.expectEqual(@as(?bool, null), scc);
+        try std.testing.expect(state.register(8) == null);
+        inst.src1 = .{ .kind = .literal_constant, .value = c.b };
+        inst.src0 = .{ .kind = .sgpr, .reg = 9 };
+        scc = true;
+        executeScalar(&state, 0, &inst, &scc);
+        try std.testing.expectEqual(@as(?bool, null), scc);
+        try std.testing.expect(state.register(8) == null);
+    }
+}
+
+test "scalar NOT replaces SCC for select consumers and unknown input" {
+    for ([_]u32{ 0, 0xffff_ffff, 0x1234_5678 }) |input| {
+        for ([_]rdna2.OperandKind{ .sgpr, .null }) |destination_kind| {
+            var state = Evaluation{};
+            var scc: ?bool = input == 0xffff_ffff;
+            var inst = rdna2.Instruction{ .opcode = .s_not_b32, .dst = .{ .kind = destination_kind, .reg = 8 }, .src0 = .{ .kind = .literal_constant, .value = input }, .src_count = 1 };
+            const select = rdna2.Instruction{ .opcode = .s_cselect_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .integer_inline_constant, .value = 11 }, .src1 = .{ .kind = .integer_inline_constant, .value = 22 }, .src_count = 2 };
+            executeScalar(&state, 0, &inst, &scc);
+            try std.testing.expectEqual(@as(?bool, input != 0xffff_ffff), scc);
+            if (destination_kind == .sgpr) try std.testing.expectEqual(~input, state.register(8).?.value);
+            executeScalar(&state, 0, &select, &scc);
+            try std.testing.expectEqual(@as(u32, if (input != 0xffff_ffff) 11 else 22), state.register(10).?.value);
+
+            inst.src0 = .{ .kind = .sgpr, .reg = 9 };
+            executeScalar(&state, 0, &inst, &scc);
+            try std.testing.expectEqual(@as(?bool, null), scc);
+            try std.testing.expect(state.register(8) == null);
+            executeScalar(&state, 0, &select, &scc);
+            try std.testing.expect(state.register(10) == null);
+        }
+    }
+}
+
+test "64-bit bitwise operations replace SCC using both result words" {
+    const cases = [_]struct { opcode: rdna2.Opcode, a: u64, b: u64, expected: u64 }{
+        .{ .opcode = .s_and_b64, .a = 0x100000000, .b = 0x100000000, .expected = 0x100000000 },
+        .{ .opcode = .s_or_b64, .a = 0, .b = 0x8000000000000000, .expected = 0x8000000000000000 },
+        .{ .opcode = .s_xor_b64, .a = 0x100000001, .b = 0x100000001, .expected = 0 },
+        .{ .opcode = .s_andn2_b64, .a = 0x100000001, .b = 1, .expected = 0x100000000 },
+        .{ .opcode = .s_orn2_b64, .a = 0, .b = 0xffffffff, .expected = 0xffffffff00000000 },
+        .{ .opcode = .s_nand_b64, .a = 0xffffffffffffffff, .b = 0xffffffffffffffff, .expected = 0 },
+        .{ .opcode = .s_nor_b64, .a = 0xffffffff00000000, .b = 0xffffffff, .expected = 0 },
+        .{ .opcode = .s_xnor_b64, .a = 0xffffffff00000000, .b = 0, .expected = 0xffffffff },
+    };
+    for (cases) |case| {
+        const inst = rdna2.Instruction{ .opcode = case.opcode, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .sgpr, .reg = 6 }, .src_count = 2 };
+        var state = Evaluation{};
+        const words = [_]u32{ @truncate(case.a), @truncate(case.a >> 32), @truncate(case.b), @truncate(case.b >> 32) };
+        for (words, 4..) |word, index| state.registers[index] = .{ .known = true, .value = word };
+        var scc: ?bool = case.expected == 0;
+        executeScalar(&state, 0, &inst, &scc);
+        try std.testing.expectEqual(@as(u32, @truncate(case.expected)), state.register(8).?.value);
+        try std.testing.expectEqual(@as(u32, @truncate(case.expected >> 32)), state.register(9).?.value);
+        try std.testing.expectEqual(@as(?bool, case.expected != 0), scc);
+        for (4..8) |unknown| {
+            var partial = state;
+            partial.registers[unknown] = .{};
+            scc = true;
+            executeScalar(&partial, 0, &inst, &scc);
+            try std.testing.expect(scc == null);
+            try std.testing.expect(partial.register(8) == null and partial.register(9) == null);
+        }
+    }
+}
+
+test "unknown 64-bit loop masks cannot reuse an earlier true SCC" {
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0x3f800000);
+    var bindings = testBindings(0x3000, 0x4000);
+    bindings.resource_instruction_budget = 64;
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cmp_lg_u32, .src0 = .{ .kind = .integer_inline_constant, .value = 1 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2, .word_count = 1 },
+        .{ .pc = 4, .opcode = .s_andn2_b64, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .sgpr, .reg = 6 }, .src_count = 2, .word_count = 1 },
+        .{ .pc = 8, .opcode = .s_cbranch_scc1, .branch_target = 4, .word_count = 1 },
+        .{ .pc = 12, .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .null }, .data_words = 1, .word_count = 2 },
+        .{ .pc = 20, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var snapshots: [1]ScalarRegisters = undefined;
+    const result = try testResourceCheckpoints(memory.reader(), &bindings, &instructions, &.{20}, &snapshots, null);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), result.loadSlice().len);
+    try std.testing.expectEqual(@as(u32, 12), result.loadSlice()[0].pc);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), snapshots[0][106].value);
+}
+
+test "uniform guards survive unrelated vector masks without reusing overwritten masks" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_load_dword, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .pc = 4, .family = .vop3, .opcode = .v_cmp_ne_u32, .dst = .{ .kind = .sgpr, .reg = 2 } },
+        .{ .pc = 8, .opcode = .s_cmp_lg_u32, .src0 = .{ .kind = .vcc_lo }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+        .{ .pc = 12, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr } },
+        .{ .pc = 16, .opcode = .s_cbranch_scc0, .branch_target = 24 },
+        .{ .pc = 20, .opcode = .image_store },
+        .{ .pc = 24, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    for ([_]u32{ 0, 1 }) |enabled| {
+        memory.write(0x1000, enabled);
+        var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+        defer specialized.deinit(std.testing.allocator);
+        try std.testing.expectEqual(if (enabled == 0) rdna2.Opcode.s_nop else .image_store, specialized.items[5].opcode);
+    }
+    instructions[1].dst = .{ .kind = .vcc_lo };
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
+}
+
+test "uniform zero-count loop skips its texture and retains later outputs" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    const code = [_]u32{
+        0xbea0_0380, // s_mov_b32 s32, 0
+        0xf400_0840, 125 << 25, // s_load_dword s33, s0:s1
+        0xbf88_0009, // pc 12: EXECZ -> pc 52
+        0xbf0a_2120, // s_cmp_lt_u32 s32, s33
+        0x8584_807e, // s_cselect_b64 s4:s5, exec, 0
+        0xbeea_0404, // VCC = selected mask
+        0xbefe_0404, // EXEC = selected mask
+        0xbf86_0004, // pc 32: VCCZ -> pc 52
+        0xf080_0100, 0x0000_0100, // image_sample in loop body
+        0x8120_8120, // s_add_i32 s32, s32, 1
+        0xbf82_fff6, // pc 48: back edge -> pc 12
+        0xf020_0f28, 0x0002_0400, // later output must survive
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var graph = try rdna2.buildControlFlow(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    for ([_]u32{ 0, 1, 0 }) |count| {
+        memory.write(0x1000, count);
+        var specialized = try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph);
+        defer if (specialized) |*value| value.deinit(std.testing.allocator);
+        const actual = if (specialized) |value| value.items else program.instructions.items;
+        try std.testing.expectEqual(if (count == 0) rdna2.Opcode.s_nop else .image_sample, actual[8].opcode);
+        try std.testing.expectEqual(rdna2.Opcode.image_store, actual[11].opcode);
+    }
+    memory.base = 0x3000;
+    var unknown = try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph);
+    defer if (unknown) |*value| value.deinit(std.testing.allocator);
+    const retained = if (unknown) |value| value.items else program.instructions.items;
+    try std.testing.expectEqual(rdna2.Opcode.image_sample, retained[8].opcode);
+}
+
+test "uniform pruning keeps alternate entries and rejects stale or predecessor scalar values" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_execz, .branch_target = 16 },
+        .{ .pc = 4, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .pc = 8, .opcode = .s_cmp_lg_u32, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+        .{ .pc = 12, .opcode = .s_cbranch_scc0, .branch_target = 20 },
+        .{ .pc = 16, .opcode = .image_store },
+        .{ .pc = 20, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+    defer specialized.deinit(std.testing.allocator);
+    try std.testing.expectEqual(rdna2.Opcode.s_branch, specialized.items[3].opcode);
+    try std.testing.expectEqual(rdna2.Opcode.image_store, specialized.items[4].opcode);
+
+    // A loop-carried overwrite must invalidate the entry SRT pointer.
+    instructions[4] = .{ .pc = 16, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 0 } };
+    instructions[5] = .{ .pc = 20, .opcode = .s_branch, .branch_target = 4 };
+    var loop_graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer loop_graph.deinit(std.testing.allocator);
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &loop_graph)) == null);
+    // A later overwrite with no return path does not poison an earlier guard.
+    instructions[5] = .{ .pc = 20, .opcode = .s_endpgm };
+    var late_write = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+    defer late_write.deinit(std.testing.allocator);
+    instructions[4] = .{ .pc = 16, .opcode = .image_store };
+    // Neither unsupported scalar arithmetic nor 64-bit comparisons can reuse
+    // an old/partial SCC result as a proof.
+    for ([_]rdna2.Opcode{ .s_add_u32, .s_cmp_lg_u64 }) |opcode| {
+        instructions[2].opcode = opcode;
+        try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
+    }
+    instructions[0] = instructions[1];
+    instructions[0].pc = 0;
+    instructions[1] = .{ .pc = 4, .opcode = .s_cmp_lg_u32, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 };
+    instructions[2] = .{ .pc = 8, .opcode = .s_add_u32, .dst = .{ .kind = .sgpr, .reg = 9 }, .src0 = .{ .kind = .sgpr, .reg = 10 }, .src1 = .{ .kind = .sgpr, .reg = 11 }, .src_count = 2 };
+    var stale_graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer stale_graph.deinit(std.testing.allocator);
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &stale_graph)) == null);
+}
+
+test "scalar provenance follows an SRT pointer through ALU and SMEM" {
+    var storage = [_]u8{0} ** 0x500;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const program: u64 = 0x1000;
+    const srt: u64 = 0x1200;
+    // s4 = s0 + 16; s5 = s1 + carry; load s8:s9 from s4:s5 + 8.
+    memory.write(program + 0, 0x8004_9000);
+    memory.write(program + 4, 0x8205_8001);
+    memory.write(program + 8, 0xf404_0202);
+    memory.write(program + 12, (125 << 25) | 8);
+    memory.write(program + 16, 0xbf81_0000);
+    memory.write(srt + 24, 0x1122_3344);
+    memory.write(srt + 28, 0x5566_7788);
+
+    const bindings = testBindings(program, srt);
+    const result = evaluatePrefix(memory.reader(), &bindings);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), result.load_count);
+    try std.testing.expect(result.loads[0].from_srt);
+    try std.testing.expect(result.loads[0].base_sources.user_data);
+    try std.testing.expect(result.loads[0].base_sources.immediate);
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), result.loads[0].values[0]);
+    try std.testing.expectEqual(@as(u32, 0x5566_7788), result.loads[0].values[1]);
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), result.register(8).?.value);
+    try std.testing.expect(result.register(8).?.sources.memory);
+    try std.testing.expect(result.register(8).?.sources.user_data);
+}
+
+test "reused scalar evaluation refreshes guest loads and clears failed or abandoned state" {
+    var storage = [_]u8{0} ** 32;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    var bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{ 0xf404_0200, 125 << 25, 0xbf81_0000 };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var result: Evaluation = undefined;
+    memory.write(0x4000, 17);
+    memory.write(0x4004, 23);
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(@as(usize, 1), result.load_count);
+    try std.testing.expectEqual(@as(u32, 17), result.register(8).?.value);
+    var saved: Evaluation = undefined;
+    saved.copyFrom(&result);
+    saved.copyFrom(&saved);
+
+    memory.write(0x4000, 71);
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(@as(u32, 71), result.register(8).?.value);
+    try std.testing.expectEqual(@as(u32, 71), result.loadSlice()[0].values[0]);
+    try std.testing.expectEqual(@as(u32, 17), saved.register(8).?.value);
+    try std.testing.expectEqual(@as(u32, 17), saved.loadSlice()[0].values[0]);
+
+    memory.bytes = storage[0..0];
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expect(result.memory_read_failed);
+    try std.testing.expect(result.register(8) == null);
+    try std.testing.expectEqual(@as(usize, 0), result.load_count);
+    bindings.resource_instruction_budget = 0;
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expect(!result.memory_read_failed);
+    try std.testing.expectEqual(StopReason.instruction_limit, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.instruction_count);
+    try std.testing.expectEqual(@as(u32, 0), result.stop_pc);
+    try std.testing.expectEqual(@as(usize, 0), result.load_count);
+    try std.testing.expect(result.register(8) == null);
+}
+
+test "resource reuse pins scalar conditions, direct descriptors and SMEM bounds" {
+    var evaluation: Evaluation = undefined;
+    evaluation.reset();
+    for (0..32) |index| evaluation.registers[index] = .{
+        .known = true,
+        .value = @intCast(index),
+        .user_bits = @as(u64, 1) << @intCast(index),
+    };
+    recordResourceUserData(&evaluation, &.{ .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 2 });
+    try std.testing.expect(evaluation.address_user_data_mask & (@as(u64, 1) << 20) != 0);
+    recordResourceUserData(&evaluation, &.{ .family = .smem, .opcode = .s_buffer_load_dword, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src_count = 2 });
+    try std.testing.expect(evaluation.address_user_data_mask & 0x10f == 0x10f);
+    recordResourceUserData(&evaluation, &.{ .family = .mimg, .opcode = .image_sample, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src2 = .{ .kind = .sgpr, .reg = 24 } });
+    try std.testing.expect(evaluation.address_user_data_mask & 0x0f00_ff00 == 0x0f00_ff00);
+    const protected = evaluation.address_user_data_mask;
+    recordResourceUserData(&evaluation, &.{ .family = .vop2, .opcode = .v_mul_f32, .src0 = .{ .kind = .sgpr, .reg = 31 }, .src1 = .{ .kind = .vgpr, .reg = 0 }, .dst = .{ .kind = .vgpr, .reg = 1 }, .src_count = 2 });
+    try std.testing.expectEqual(protected, evaluation.address_user_data_mask);
+    recordResourceUserData(&evaluation, &.{ .family = .vop1, .opcode = .v_readfirstlane_b32 });
+    try std.testing.expectEqual(std.math.maxInt(u64), evaluation.address_user_data_mask);
+}
+
+test "NGG scalar user data starts at s8" {
+    var storage = [_]u8{0} ** 0x20;
+    var memory = TestMemory{ .base = 0x2000, .bytes = &storage };
+    memory.write(0x2000, 0xbf81_0000);
+    var bindings = testBindings(0x2000, 0x1234);
+    bindings.scalar_user_data_base = 8;
+    const result = evaluatePrefix(memory.reader(), &bindings);
+    try std.testing.expect(result.register(0) == null);
+    try std.testing.expectEqual(@as(u32, 0x1234), result.register(8).?.value);
+}
+
+test "bounded scalar prefix does not observe later shader writes" {
+    var storage = [_]u8{0} ** 0x40;
+    var memory = TestMemory{ .base = 0x3000, .bytes = &storage };
+    memory.write(0x3000, 0xbe82_0381); // s_mov_b32 s2, 1
+    memory.write(0x3004, 0xbe82_0382); // would overwrite s2 after the boundary
+    memory.write(0x3008, 0xbf81_0000);
+    const bindings = testBindings(0x3000, 0x1234);
+    const result = evaluatePrefixUntil(memory.reader(), &bindings, 4);
+    try std.testing.expectEqual(StopReason.prefix_complete, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), result.register(2).?.value);
+    try std.testing.expectEqual(@as(u32, 4), result.stop_pc);
+}
+
+test "one-pass resource checkpoints preserve instruction-local SGPR state" {
+    var storage = [_]u8{0} ** 0x20;
+    var memory = TestMemory{ .base = 0x3800, .bytes = &storage };
+    const instructions = [_]rdna2.Instruction{
+        .{
+            .pc = 0,
+            .opcode = .s_mov_b32,
+            .dst = .{ .kind = .sgpr, .reg = 2 },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{
+            .pc = 4,
+            .opcode = .s_mov_b32,
+            .dst = .{ .kind = .sgpr, .reg = 2 },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 2 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{ .pc = 8, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    const bindings = testBindings(0x3800, 0x1234);
+    const checkpoint_pcs = [_]u32{ 4, 8 };
+    var snapshots: [checkpoint_pcs.len]ScalarRegisters = undefined;
+    _ = try testResourceCheckpoints(
+        memory.reader(),
+        &bindings,
+        &instructions,
+        &checkpoint_pcs,
+        &snapshots,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(u32, 1), snapshots[0][2].value);
+    try std.testing.expectEqual(@as(u32, 2), snapshots[1][2].value);
+    const first = evaluateDecodedResourceStateUntil(memory.reader(), &bindings, &instructions, 4);
+    const second = evaluateDecodedResourceStateUntil(memory.reader(), &bindings, &instructions, 8);
+    try std.testing.expectEqual(first.registers[2], snapshots[0][2]);
+    try std.testing.expectEqual(second.registers[2], snapshots[1][2]);
+}
+
+test "invariant loop loads leave room for post-loop scalar specializations" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0x41000000);
+    memory.write(0x4004, 0x3ca3d70a);
+    const bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xb008_0000, // s8=0
+        0xf400_0100, 125 << 25, // s_load_dword s4,s0:s1,0
+        0x8008_8108, // s8 += 1
+        0xbf0a_ff08, 160, // s_cmp_lt_u32 s8,160
+        0xbf85_fffa, // repeat pc4, exceeding the load-record capacity
+        0xf400_0300, (125 << 25) | 4, // post-loop load into s12
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var result = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 160), result.register(8).?.value);
+    try std.testing.expectEqual(@as(usize, 2), result.load_count);
+    try std.testing.expectEqual(@as(u32, 28), result.loads[1].pc);
+    try std.testing.expectEqual(@as(u32, 0x3ca3d70a), result.loads[1].values[0]);
+
+    // Only identical observations coalesce; a changed value or address remains
+    // available to consumers which reason about loop-varying loads.
+    var late_load = program.instructions.items[program.instructions.items.len - 2];
+    memory.write(0x4004, 0x3f800000);
+    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, &late_load, true));
+    try std.testing.expectEqual(@as(usize, 3), result.load_count);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), result.loads[2].values[0]);
+    memory.write(0x4008, 0x3f800000);
+    late_load.memory_offset = 8;
+    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, &late_load, true));
+    try std.testing.expectEqual(@as(usize, 4), result.load_count);
+    try std.testing.expectEqual(@as(u64, 0x4008), result.loads[3].address);
+}
+
+test "long resource walks retain post-loop loads and checkpoint state within an explicit budget" {
+    var storage = [_]u8{0} ** 8;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0x41000000);
+    memory.write(0x4004, 0x3ca3d70a);
+    var bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xb008_0000,
+        0xf400_0100,
+        125 << 25,
+        0x8008_8108,
+        0xbf0a_ff08,
+        5000,
+        0xbf85_fffa,
+        0xf400_0300,
+        (125 << 25) | 4,
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const limited = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(StopReason.instruction_limit, limited.stop_reason);
+    try std.testing.expectEqual(@as(u32, 16 * 1024), limited.instruction_count);
+    try std.testing.expect(limited.register(12) == null);
+
+    bindings.resource_instruction_budget = 32 * 1024;
+    var snapshots: [1]ScalarRegisters = undefined;
+    const complete = try testResourceCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{36}, &snapshots, null);
+    try std.testing.expectEqual(StopReason.end_program, complete.stop_reason);
+    try std.testing.expectEqual(@as(u32, 5000), complete.register(8).?.value);
+    try std.testing.expectEqual(@as(usize, 2), complete.load_count);
+    try std.testing.expect(snapshots[0][12].known);
+    try std.testing.expectEqual(@as(u32, 0x3ca3d70a), snapshots[0][12].value);
+
+    memory.write(0x4004, 0x3f800000);
+    const refreshed = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), refreshed.register(12).?.value);
+    bindings.resource_instruction_budget = 8;
+    const bounded = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(StopReason.instruction_limit, bounded.stop_reason);
+    try std.testing.expectEqual(@as(u32, 8), bounded.instruction_count);
+}
+
+test "resource checkpoints leave skipped blocks unknown and capture backward visits" {
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xb008_0001, // s_movk s8, 1
+        0xbf82_0004, // jump forward to pc24
+        0xb008_002a, // pc8: s8=42, reached by the backward jump
+        0xbf80_0000, // pc12: checkpoint
+        0xbf82_0003, // jump to END at32
+        0xb008_0063, // pc20: unreachable, never capture stale s8=1 here
+        0xbf82_fffb, // pc24: branch back to8
+        0xbf80_0000,
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var snapshots: [4]ScalarRegisters = undefined;
+    _ = try testResourceCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 12, 20, 24, 32 }, &snapshots, null);
+    try std.testing.expectEqual(@as(u32, 42), snapshots[0][8].value);
+    try std.testing.expect(snapshots[0][8].known);
+    try std.testing.expect(!snapshots[1][8].known);
+    try std.testing.expectEqual(@as(u32, 1), snapshots[2][8].value);
+    try std.testing.expectEqual(@as(u32, 42), snapshots[3][8].value);
+}
+
+test "resource checkpoints invalidate values that vary between loop iterations" {
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xb008_0000, // s8=0
+        0x8008_8108, // s_add_u32 s8,s8,1
+        0xbf80_0000, // checkpoint in loop
+        0xbf0a_8208, // s_cmp_lt_u32 s8,2
+        0xbf85_fffc, // s_cbranch_scc1 pc4
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var snapshots: [2]ScalarRegisters = undefined;
+    _ = try testResourceCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 8, 20 }, &snapshots, null);
+    try std.testing.expect(!snapshots[0][8].known);
+    try std.testing.expect(snapshots[0][0].known);
+    try std.testing.expectEqual(@as(u32, 2), snapshots[1][8].value);
+}
+
+test "masked loop checkpoints and load constants forget the first iteration" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    for (0..5) |index| memory.write(0x4000 + index * 4, @intCast((index + 1) * 10));
+    const bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xbe88_0380, // s8 = 0
+        0xbf0a_8308, // s_cmp_lt_u32 s8, 3
+        0x8584_807e, // s4:s5 = SCC ? EXEC : 0
+        0xbeea_0404, // VCC = s4:s5
+        0xbf86_0006, // mask exit to pc44
+        0x8f0a_8208, // s10 = s8 * 4
+        0xf400_0300, 10 << 25, // s12 = table[s8]
+        0xbf80_0000, // pc32: first iteration's 10 is not a constant
+        0x8108_8108, // ++s8
+        0xbf82_fff6, // pc40 -> pc4
+        0xbf80_0000, // pc44: loop writes are unknown
+        0xf400_0300, (125 << 25) | 16, // independent later load = 50
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var snapshots: [3]ScalarRegisters = undefined;
+    const result = try testResourceCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 32, 44, 56 }, &snapshots, null);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expect(!snapshots[0][8].known);
+    try std.testing.expect(!snapshots[0][12].known);
+    try std.testing.expect(snapshots[0][0].known);
+    try std.testing.expect(!snapshots[1][12].known);
+    try std.testing.expectEqual(@as(u32, 50), snapshots[2][12].value);
+    try std.testing.expectEqual(@as(usize, 1), result.loadSlice().len);
+    try std.testing.expectEqual(@as(u32, 48), result.loadSlice()[0].pc);
+}
+
+test "resource checkpoints recover after an unavailable scalar load" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const code = [_]u32{
+        0xf40c_0200, 125 << 25, // load s8:s15 from the known SRT
+        0xf40c_020a, 125 << 25, // overwrite them through unknown s20:s21
+        0xbf80_0000, // checkpoint after the failed load
+        0xf40c_0200, (125 << 25) | 32, // independent later T# in s8:s15
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    for (0..16) |index| memory.write(0x4000 + index * 4, @intCast(index + 1));
+    const bindings = testBindings(0x3000, 0x4000);
+    const pcs = [_]u32{ 8, 16, 28 };
+    var snapshots: [pcs.len]ScalarRegisters = undefined;
+    const result = try testResourceCheckpoints(memory.reader(), &bindings, program.instructions.items, &pcs, &snapshots, null);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    for (0..8) |index| {
+        try std.testing.expectEqual(@as(u32, @intCast(index + 1)), snapshots[0][8 + index].value);
+        try std.testing.expect(!snapshots[1][8 + index].known);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 9)), snapshots[2][8 + index].value);
+    }
+    const strict = evaluate(memory.reader(), &bindings, null, false, program.instructions.items, null, null);
+    try std.testing.expectEqual(StopReason.invalid_address, strict.stop_reason);
+    try std.testing.expectEqual(@as(u32, 8), strict.stop_pc);
+}
+
+test "resource checkpoints reach late descriptors in large shaders" {
+    const count = 4200;
+    const instructions = try std.testing.allocator.alloc(rdna2.Instruction, count + 2);
+    defer std.testing.allocator.free(instructions);
+    for (instructions[0..count], 0..) |*inst, index| {
+        inst.* = .{ .pc = @intCast(index * 4), .opcode = .s_nop, .word_count = 1 };
+    }
+    instructions[count] = .{
+        .pc = count * 4,
+        .opcode = .s_mov_b32,
+        .dst = .{ .kind = .sgpr, .reg = 8 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 42 },
+        .word_count = 1,
+    };
+    instructions[count + 1] = .{ .pc = (count + 1) * 4, .opcode = .s_endpgm, .word_count = 1 };
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    var snapshots: [1]ScalarRegisters = undefined;
+    const result = try testResourceCheckpoints(memory.reader(), &bindings, instructions, &.{(count + 1) * 4}, &snapshots, null);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 42), snapshots[0][8].value);
+}
+
+test "decoded resource cursor preserves gaps and prefix boundaries" {
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .integer_inline_constant, .value = 11 }, .word_count = 1 },
+        // PC 4 was omitted by the decoder.
+        .{ .pc = 8, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 9 }, .src0 = .{ .kind = .integer_inline_constant, .value = 22 }, .word_count = 1 },
+        .{ .pc = 12, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    const prefix = evaluateDecodedResourceStateUntil(memory.reader(), &bindings, &instructions, 8);
+    try std.testing.expectEqual(StopReason.prefix_complete, prefix.stop_reason);
+    try std.testing.expectEqual(@as(u32, 11), prefix.registers[8].value);
+    try std.testing.expect(!prefix.registers[9].known);
+    var snapshots: [2]ScalarRegisters = undefined;
+    const complete = try testResourceCheckpoints(memory.reader(), &bindings, &instructions, &.{ 8, 12 }, &snapshots, null);
+    try std.testing.expectEqual(StopReason.end_program, complete.stop_reason);
+    try std.testing.expectEqual(@as(u32, 3), complete.instruction_count);
+    try std.testing.expectEqual(@as(u32, 11), snapshots[0][8].value);
+    try std.testing.expect(!snapshots[0][9].known);
+    try std.testing.expectEqual(@as(u32, 22), snapshots[1][9].value);
+}
+
+test "scalar descriptor loads follow a pointer moved into VCC" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const code = [_]u32{
+        0xbeea_0400, // s_mov_b64 vcc, s0:s1
+        0xf408_0235, 125 << 25, // s_load_dwordx4 s8, vcc, 0
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    for (0..4) |index| memory.write(0x4000 + index * 4, @intCast(index + 11));
+    const bindings = testBindings(0x3000, 0x4000);
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0x4000), result.register(106).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(107).?.value);
+    for (0..4) |index| try std.testing.expectEqual(@as(u32, @intCast(index + 11)), result.register(@intCast(8 + index)).?.value);
+}
+
+test "resource checkpoints recover descriptors after nested lane-dependent loops" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const code = [_]u32{
+        0xbf88_0006, // outer EXECZ exits at pc 28
+        0xbf88_0004, // inner EXECZ exits at pc 24
+        0xf408_0200, 125 << 25, // loop T# in s8:s11
+        0xbf80_0000, // checkpoint at pc 16
+        0xbf82_fffb, // inner back edge to pc 4
+        0xbf82_fff9, // outer back edge to pc 0
+        0xbf80_0000, // checkpoint at pc 28: loop-carried writes unknown
+        0xf408_0200, (125 << 25) | 16, // independent output T#
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    for (0..8) |index| memory.write(0x4000 + index * 4, @intCast(index + 11));
+    const bindings = testBindings(0x3000, 0x4000);
+    const pcs = [_]u32{ 16, 28, 40 };
+    var snapshots: [pcs.len]ScalarRegisters = undefined;
+    const result = try testResourceCheckpoints(memory.reader(), &bindings, program.instructions.items, &pcs, &snapshots, null);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    for (0..4) |index| {
+        try std.testing.expectEqual(@as(u32, @intCast(index + 11)), snapshots[0][8 + index].value);
+        try std.testing.expect(!snapshots[1][8 + index].known);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 15)), snapshots[2][8 + index].value);
+    }
+    const scalar_loop = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 2 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 }, .word_count = 1 },
+        .{ .pc = 4, .opcode = .s_add_u32, .dst = .{ .kind = .sgpr, .reg = 2 }, .src0 = .{ .kind = .sgpr, .reg = 2 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 }, .src_count = 2, .word_count = 1 },
+        .{ .pc = 8, .opcode = .s_cmp_lt_u32, .src0 = .{ .kind = .sgpr, .reg = 2 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 }, .src_count = 2, .word_count = 1 },
+        .{ .pc = 12, .opcode = .s_cbranch_scc1, .branch_target = 4, .word_count = 1 },
+        .{ .pc = 16, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    const finite = evaluateDecodedResourceState(memory.reader(), &bindings, &scalar_loop);
+    try std.testing.expectEqual(StopReason.end_program, finite.stop_reason);
+    try std.testing.expectEqual(@as(u32, 3), finite.register(2).?.value);
+}
+
+test "resource checkpoints escape an unresolved scalar loop and recover later textures" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const code = [_]u32{
+        0xbf07_0280, // s_cmp_lg_u32 0, s2 (a readlane result is unknown)
+        0xbf84_0004, // s_cbranch_scc0 exits at pc 24
+        0xf408_0200, 125 << 25, // first iteration's descriptor
+        0xbf80_0000, // resource checkpoint pc 16
+        0xbf82_fffa, // back edge to pc 0
+        0xbf80_0000, // checkpoint pc 24: loop writes are unknown
+        0xf408_0200, (125 << 25) | 16, // independent later texture
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    for (0..8) |index| memory.write(0x4000 + index * 4, @intCast(index + 11));
+    const bindings = testBindings(0x3000, 0x4000);
+    var snapshots: [3]ScalarRegisters = undefined;
+    const result = try testResourceCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 16, 24, 36 }, &snapshots, null);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    for (0..4) |index| {
+        try std.testing.expectEqual(@as(u32, @intCast(index + 11)), snapshots[0][8 + index].value);
+        try std.testing.expect(!snapshots[1][8 + index].known);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 15)), snapshots[2][8 + index].value);
+    }
+}
+
+test "resource evaluation follows the active-lane branch path" {
+    var storage = [_]u8{0} ** 0x40;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0xbf88_0001); // s_cbranch_execz skips the resource setup
+    memory.write(0x4004, 0xbe82_0381); // s_mov_b32 s2, 1
+    memory.write(0x4008, 0xbf81_0000);
+    const bindings = testBindings(0x4000, 0x1234);
+
+    const strict = evaluatePrefix(memory.reader(), &bindings);
+    try std.testing.expectEqual(StopReason.branch, strict.stop_reason);
+    try std.testing.expect(strict.register(2) == null);
+
+    const resources = evaluateResourceState(memory.reader(), &bindings);
+    try std.testing.expectEqual(StopReason.end_program, resources.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), resources.register(2).?.value);
+}
+
+test "resource evaluation follows an unknown conditional fallthrough" {
+    var storage = [_]u8{0} ** 0x40;
+    var memory = TestMemory{ .base = 0x5000, .bytes = &storage };
+    memory.write(0x5000, 0xbf09_8356); // s_cmp_ge_u32 s86, 0; s86 is unknown
+    memory.write(0x5004, 0xbf84_0001); // s_cbranch_scc0 skips the resource path
+    memory.write(0x5008, 0xbe82_0381); // s_mov_b32 s2, 1
+    memory.write(0x500c, 0xbf81_0000);
+    const bindings = testBindings(0x5000, 0x1234);
+
+    const strict = evaluatePrefix(memory.reader(), &bindings);
+    try std.testing.expectEqual(StopReason.branch, strict.stop_reason);
+    const resources = evaluateResourceState(memory.reader(), &bindings);
+    try std.testing.expectEqual(@as(u32, 1), resources.register(2).?.value);
+}
+
+test "scalar conditional select preserves descriptor words" {
+    var result = Evaluation{};
+    result.registers[1] = .{ .known = true, .value = 0x1111_1111 };
+    result.registers[2] = .{ .known = true, .value = 0x2222_2222 };
+
+    var scc: ?bool = true;
+    executeScalar(&result, 0, &.{
+        .pc = 0x40,
+        .opcode = .s_cselect_b32,
+        .dst = .{ .kind = .sgpr, .reg = 3 },
+        .src0 = .{ .kind = .sgpr, .reg = 1 },
+        .src1 = .{ .kind = .sgpr, .reg = 2 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x1111_1111), result.register(3).?.value);
+
+    scc = false;
+    executeScalar(&result, 0, &.{
+        .pc = 0x44,
+        .opcode = .s_cselect_b32,
+        .dst = .{ .kind = .sgpr, .reg = 3 },
+        .src0 = .{ .kind = .sgpr, .reg = 1 },
+        .src1 = .{ .kind = .sgpr, .reg = 2 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x2222_2222), result.register(3).?.value);
+}
+
+test "descriptor BFE comparison drives conditional select" {
+    var result = Evaluation{};
+    result.registers[7] = .{ .known = true, .value = 0x0004_022c };
+    result.registers[34] = .{ .known = true, .value = 2 };
+    result.registers[106] = .{ .known = true, .value = 0x0003_8fac };
+
+    var scc: ?bool = null;
+    executeScalar(&result, 0, &.{
+        .pc = 0x10c,
+        .opcode = .s_bfe_u32,
+        .dst = .{ .kind = .sgpr, .reg = 14 },
+        .src0 = .{ .kind = .sgpr, .reg = 34 },
+        .src1 = .{ .kind = .literal_constant, .value = 0x0007_0007 },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, &.{
+        .pc = 0x160,
+        .opcode = .s_cmp_eq_u32,
+        .src0 = .{ .kind = .sgpr, .reg = 14 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, &.{
+        .pc = 0x168,
+        .opcode = .s_cselect_b32,
+        .dst = .{ .kind = .sgpr, .reg = 7 },
+        .src0 = .{ .kind = .sgpr, .reg = 7 },
+        .src1 = .{ .kind = .vcc_lo },
+        .src_count = 2,
+    }, &scc);
+
+    try std.testing.expectEqual(true, scc.?);
+    try std.testing.expectEqual(@as(u32, 0x0004_022c), result.register(7).?.value);
+}
+
+test "scalar BITSET preserves descriptor bits, dependencies and SCC" {
+    for ([_]u32{ 18, 50, 31, 0xffff_ffff }) |bit| {
+        var result = Evaluation{};
+        result.registers[1] = .{ .known = true, .value = 0x20, .user_bits = 2 };
+        result.registers[8] = .{ .known = true, .value = bit, .user_bits = 256 };
+        var scc: ?bool = true;
+        var inst = rdna2.Instruction{
+            .pc = 0x10,
+            .opcode = .s_bitset1_b32,
+            .dst = .{ .kind = .sgpr, .reg = 1 },
+            .src0 = .{ .kind = .sgpr, .reg = 8 },
+            .src_count = 1,
+        };
+        executeScalar(&result, 0, &inst, &scc);
+        try std.testing.expectEqual(@as(u32, 0x20) | (@as(u32, 1) << @as(u5, @truncate(bit))), result.register(1).?.value);
+        try std.testing.expectEqual(@as(u64, 258), result.register(1).?.user_bits);
+        try std.testing.expectEqual(@as(?u32, 0x10), result.register(1).?.producer_pc);
+        try std.testing.expectEqual(@as(?bool, true), scc);
+        inst.opcode = .s_bitset0_b32;
+        executeScalar(&result, 0, &inst, &scc);
+        try std.testing.expectEqual(@as(u32, 0x20), result.register(1).?.value);
+        try std.testing.expectEqual(@as(?bool, true), scc);
+        result.registers[8] = .{};
+        executeScalar(&result, 0, &inst, &scc);
+        try std.testing.expect(result.register(1) == null);
+        result.registers[8] = .{ .known = true, .value = bit };
+        executeScalar(&result, 0, &inst, &scc);
+        try std.testing.expect(result.register(1) == null);
+    }
+}
+
+test "a sampler assembled from immediates resolves to its descriptor words" {
+    // The exact prolog a Jurassic Park fragment program uses to build its S#
+    // in registers instead of loading one: a bitfield mask giving the LOD
+    // clamp, then the filter word as a literal. Both name constants, and a
+    // 64-bit operation reading a constant is the shape that used to leave
+    // every one of these four words unknown.
+    var result = Evaluation{};
+    var scc: ?bool = null;
+    executeScalar(&result, 0, &.{
+        .pc = 0x8,
+        .opcode = .s_bfm_b64,
+        .dst = .{ .kind = .sgpr, .reg = 12 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0xc },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0x2c },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, &.{
+        .pc = 0xc,
+        .opcode = .s_mov_b64,
+        .dst = .{ .kind = .sgpr, .reg = 14 },
+        .src0 = .{ .kind = .literal_constant, .value = 0x0950_0000 },
+        .src_count = 1,
+    }, &scc);
+
+    // ((1 << 12) - 1) << 44, so the run of bits lands wholly in the high word.
+    try std.testing.expectEqual(@as(u32, 0), result.register(12).?.value);
+    try std.testing.expectEqual(@as(u32, 0x00ff_f000), result.register(13).?.value);
+    // A literal fills the low word only; the high word is zero, not a sign.
+    try std.testing.expectEqual(@as(u32, 0x0950_0000), result.register(14).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(15).?.value);
+}
+
+test "an integer inline constant carries its sign into a 64-bit result" {
+    var result = Evaluation{};
+    var scc: ?bool = null;
+    executeScalar(&result, 0, &.{
+        .pc = 0x0,
+        .opcode = .s_mov_b64,
+        .dst = .{ .kind = .sgpr, .reg = 2 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0xffff_ffff },
+        .src_count = 1,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), result.register(2).?.value);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), result.register(3).?.value);
+}
+
+test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
+    var result = Evaluation{};
+    var scc: ?bool = null;
+    result.registers[0] = .{ .known = true, .value = 0xaaaa_1111, .sources = .{ .immediate = true } };
+    result.registers[1] = .{ .known = true, .value = 0xbbbb_2222, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, &.{
+        .pc = 0x0,
+        .opcode = .s_pack_ll_b32_b16,
+        .dst = .{ .kind = .sgpr, .reg = 2 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 1 },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, &.{
+        .pc = 0x4,
+        .opcode = .s_pack_lh_b32_b16,
+        .dst = .{ .kind = .sgpr, .reg = 3 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 1 },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, &.{
+        .pc = 0x8,
+        .opcode = .s_pack_hh_b32_b16,
+        .dst = .{ .kind = .sgpr, .reg = 4 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 1 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x2222_1111), result.register(2).?.value);
+    try std.testing.expectEqual(@as(u32, 0xbbbb_1111), result.register(3).?.value);
+    try std.testing.expectEqual(@as(u32, 0xbbbb_aaaa), result.register(4).?.value);
+
+    executeScalar(&result, 0, &.{
+        .pc = 0xc,
+        .opcode = .s_bfm_b32,
+        .dst = .{ .kind = .sgpr, .reg = 5 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 8 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 4 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x0000_0ff0), result.register(5).?.value);
+
+    result.registers[6] = .{ .known = true, .value = 0x0000_000f, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, &.{
+        .pc = 0x10,
+        .opcode = .s_bfe_i32,
+        .dst = .{ .kind = .sgpr, .reg = 7 },
+        .src0 = .{ .kind = .sgpr, .reg = 6 },
+        .src1 = .{ .kind = .literal_constant, .value = 0x0004_0000 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), result.register(7).?.value);
+
+    result.registers[8] = .{ .known = true, .value = 0, .sources = .{ .immediate = true } };
+    result.registers[9] = .{ .known = true, .value = 1, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, &.{
+        .pc = 0x18,
+        .opcode = .s_ff1_i32_b64,
+        .dst = .{ .kind = .sgpr, .reg = 10 },
+        .src0 = .{ .kind = .sgpr, .reg = 8 },
+        .src_count = 1,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 32), result.register(10).?.value);
+
+    result.registers[12] = .{ .known = true, .value = 0x0000_0001, .sources = .{ .immediate = true } };
+    result.registers[13] = .{ .known = true, .value = 0, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, &.{
+        .pc = 0x1c,
+        .opcode = .s_quadmask_b64,
+        .dst = .{ .kind = .sgpr, .reg = 14 },
+        .src0 = .{ .kind = .sgpr, .reg = 12 },
+        .src_count = 1,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x0000_000f), result.register(14).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(15).?.value);
+
+    result.registers[16] = .{ .known = true, .value = 0x0000_0005, .sources = .{ .immediate = true } };
+    result.registers[17] = .{ .known = true, .value = 0, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, &.{
+        .pc = 0x20,
+        .opcode = .s_bitreplicate_b64_b32,
+        .dst = .{ .kind = .sgpr, .reg = 18 },
+        .src0 = .{ .kind = .sgpr, .reg = 16 },
+        .src_count = 1,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x0000_0033), result.register(18).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(19).?.value);
+}
+
+test "scalar provenance follows a GETPC SETPC continuation" {
+    var storage = [_]u8{0} ** 0x40;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const program: u64 = 0x1000;
+    const instructions = [_]rdna2.Instruction{
+        .{
+            .pc = 0,
+            .opcode = .s_getpc_b64,
+            .dst = .{ .kind = .sgpr, .reg = 0 },
+            .word_count = 1,
+        },
+        .{
+            .pc = 4,
+            .opcode = .s_add_u32,
+            .dst = .{ .kind = .sgpr, .reg = 0 },
+            .src0 = .{ .kind = .sgpr, .reg = 0 },
+            .src1 = .{ .kind = .integer_inline_constant, .value = 8 },
+            .src_count = 2,
+            .word_count = 1,
+        },
+        .{
+            .pc = 8,
+            .opcode = .s_setpc_b64,
+            .src0 = .{ .kind = .sgpr, .reg = 0 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{
+            .pc = 12,
+            .opcode = .s_mov_b32,
+            .dst = .{ .kind = .sgpr, .reg = 2 },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{ .pc = 16, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    const bindings = testBindings(program, 0x1200);
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), result.register(2).?.value);
+}
+
+test "scalar buffer loads honor overlapping SOFFSET and per-dword bounds" {
+    var storage = [_]u8{0} ** 0x20;
+    var memory = TestMemory{ .base = 0x2000, .bytes = &storage };
+    memory.write(0x2000, 0x3f80_0000);
+    memory.write(0x2004, 0x4000_0000);
+    memory.write(0x2008, 0x4040_0000);
+    memory.write(0x200c, 0x4080_0000);
+
+    var user_data = [_]u32{0} ** 64;
+    user_data[0] = 0x2000;
+    user_data[1] = 0;
+    user_data[2] = 16;
+    user_data[3] = 0;
+    var bindings = shaders.StageBindings{
+        .stage = .pixel,
+        .user_data_stage = .pixel,
+        .program_address = 0x1000,
+        .user_data_count = 4,
+        .scalar_user_data_base = 0,
+        .user_data = user_data,
+        .metadata = null,
+        .srt_address = null,
+        .direct_pointers = .{},
+    };
+    var instructions = [_]rdna2.Instruction{
+        .{
+            .pc = 0,
+            .family = .smem,
+            .opcode = .s_buffer_load_dwordx4,
+            .dst = .{ .kind = .sgpr, .reg = 4 },
+            .src0 = .{ .kind = .sgpr, .reg = 0 },
+            .src1 = .{ .kind = .sgpr, .reg = 0 },
+            .src_count = 2,
+            .data_words = 4,
+            .word_count = 2,
+        },
+        .{ .pc = 8, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    for (4..8) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
+
+    instructions[0].src1 = .{ .kind = .null };
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(@as(u32, 0x3f80_0000), result.register(4).?.value);
+    try std.testing.expectEqual(@as(u32, 0x4000_0000), result.register(5).?.value);
+    try std.testing.expectEqual(@as(u32, 0x4040_0000), result.register(6).?.value);
+    try std.testing.expectEqual(@as(u32, 0x4080_0000), result.register(7).?.value);
+
+    // Two eight-byte records, with one valid word left in the second one.
+    // Mapped bytes beyond the descriptor must never become shader constants.
+    bindings.user_data[1] = 8 << 16;
+    bindings.user_data[2] = 2;
+    instructions[0].memory_offset = 15;
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0x4080_0000), result.register(4).?.value);
+    for (5..8) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
+    bindings.user_data[2] = 0;
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    for (4..8) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
+}
+
+test "wide scalar reads preserve bounds, byte order and failure invalidation" {
+    var storage: [64]u8 = undefined;
+    for (&storage, 0..) |*byte, index| byte.* = @intCast(index);
+    var memory = TestMemory{ .base = 0x2000, .bytes = &storage };
+    var bindings = testBindings(0x1000, 0x2000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .smem, .opcode = .s_load_dwordx16, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .null }, .data_words = 16, .word_count = 2 },
+        .{ .pc = 8, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), memory.read_count);
+    try std.testing.expectEqual(@as(usize, 64), memory.last_read_size);
+    try std.testing.expectEqual(@as(u32, 0x03020100), result.register(8).?.value);
+    try std.testing.expectEqual(@as(u32, 0x3f3e3d3c), result.register(23).?.value);
+    try std.testing.expectEqual(@as(usize, 1), result.load_count);
+
+    // A descriptor ending mid-dword permits only its complete prefix. The
+    // reader cannot access the rest, and the shader receives zero there.
+    instructions[0].opcode = .s_buffer_load_dwordx16;
+    bindings.user_data_count = 4;
+    bindings.user_data[2] = 7;
+    memory.bytes = storage[0..4];
+    memory.read_count = 0;
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), memory.read_count);
+    try std.testing.expectEqual(@as(usize, 4), memory.last_read_size);
+    try std.testing.expectEqual(@as(u32, 0x03020100), result.register(8).?.value);
+    for (9..24) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
+
+    bindings.user_data[2] = 64;
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, &instructions);
+    try std.testing.expect(result.memory_read_failed);
+    try std.testing.expectEqual(@as(usize, 0), result.load_count);
+    for (8..24) |reg| try std.testing.expect(result.register(@intCast(reg)) == null);
+
+    // Entirely OOB loads must not ask the reader to touch even the first byte.
+    instructions[0].memory_offset = -4;
+    memory.read_count = 0;
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(@as(usize, 0), memory.read_count);
+    for (8..24) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
+}
+
+test "load history deduplicates out-of-order PCs after copying and resets between walks" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0x1234);
+    const bindings = testBindings(0x3000, 0x4000);
+    var program = try rdna2.decodeProgram(std.testing.allocator, &.{ 0xf400_0200, 125 << 25, 0xbf81_0000 });
+    defer program.deinit(std.testing.allocator);
+    var result = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    var inst = program.instructions.items[0];
+    inst.pc = 100;
+    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, &inst, true));
+    inst.pc = 4;
+    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, &inst, true));
+    try std.testing.expectEqual(@as(usize, 3), result.load_count);
+    var copied: Evaluation = undefined;
+    copied.copyFrom(&result);
+    // Comparing only the last record's PC would incorrectly append this
+    // earlier observation a second time after a backward visit.
+    inst.pc = 100;
+    try std.testing.expect(executeSmem(&copied, memory.reader(), &bindings, &inst, true));
+    try std.testing.expectEqual(@as(usize, 3), copied.load_count);
+    memory.write(0x4000, 0x5678);
+    try std.testing.expect(executeSmem(&copied, memory.reader(), &bindings, &inst, true));
+    try std.testing.expectEqual(@as(usize, 4), copied.load_count);
+    try std.testing.expectEqual(@as(u32, 0x5678), copied.loads[3].values[0]);
+    evaluateDecodedResourceStateInto(&copied, memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(@as(usize, 1), copied.load_count);
+    try std.testing.expectEqual(@as(u32, 0), copied.highest_load_pc);
+    try std.testing.expectEqual(@as(u32, 0x5678), copied.loads[0].values[0]);
+}

@@ -1,0 +1,818 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! GFX10 vector-buffer, typed-buffer, flat, LDS and image decoding.
+
+const std = @import("std");
+const isa = @import("isa.zig");
+const operand = @import("operand.zig");
+const instruction = @import("instruction.zig");
+
+const Instruction = instruction.Instruction;
+pub const Error = instruction.Error;
+
+const MemoryInfo = struct {
+    opcode: isa.Opcode,
+    words: u8 = 1,
+    bits: u8 = 32,
+    signed: bool = false,
+    typed: bool = false,
+    formatted: bool = false,
+};
+
+fn mubufInfo(id: u32) ?MemoryInfo {
+    return switch (id) {
+        0x00 => .{ .opcode = .buffer_load_format_x, .formatted = true },
+        0x01 => .{ .opcode = .buffer_load_format_xy, .words = 2, .formatted = true },
+        0x02 => .{ .opcode = .buffer_load_format_xyz, .words = 3, .formatted = true },
+        0x03 => .{ .opcode = .buffer_load_format_xyzw, .words = 4, .formatted = true },
+        0x04 => .{ .opcode = .buffer_store_format_x, .formatted = true },
+        0x05 => .{ .opcode = .buffer_store_format_xy, .words = 2, .formatted = true },
+        0x06 => .{ .opcode = .buffer_store_format_xyz, .words = 3, .formatted = true },
+        0x07 => .{ .opcode = .buffer_store_format_xyzw, .words = 4, .formatted = true },
+        0x08 => .{ .opcode = .buffer_load_ubyte, .bits = 8 },
+        0x09 => .{ .opcode = .buffer_load_sbyte, .bits = 8, .signed = true },
+        0x0a => .{ .opcode = .buffer_load_ushort, .bits = 16 },
+        0x0b => .{ .opcode = .buffer_load_sshort, .bits = 16, .signed = true },
+        0x0c => .{ .opcode = .buffer_load_dword },
+        0x0d => .{ .opcode = .buffer_load_dwordx2, .words = 2 },
+        0x0e => .{ .opcode = .buffer_load_dwordx4, .words = 4 },
+        0x0f => .{ .opcode = .buffer_load_dwordx3, .words = 3 },
+        0x18 => .{ .opcode = .buffer_store_byte, .bits = 8 },
+        0x19 => .{ .opcode = .buffer_store_byte_d16_hi, .bits = 8 },
+        0x1a => .{ .opcode = .buffer_store_short, .bits = 16 },
+        0x1b => .{ .opcode = .buffer_store_short_d16_hi, .bits = 16 },
+        0x1c => .{ .opcode = .buffer_store_dword },
+        0x1d => .{ .opcode = .buffer_store_dwordx2, .words = 2 },
+        0x1e => .{ .opcode = .buffer_store_dwordx4, .words = 4 },
+        0x1f => .{ .opcode = .buffer_store_dwordx3, .words = 3 },
+        0x20 => .{ .opcode = .buffer_load_ubyte_d16, .bits = 8 },
+        0x21 => .{ .opcode = .buffer_load_ubyte_d16_hi, .bits = 8 },
+        0x22 => .{ .opcode = .buffer_load_sbyte_d16, .bits = 8, .signed = true },
+        0x23 => .{ .opcode = .buffer_load_sbyte_d16_hi, .bits = 8, .signed = true },
+        0x24 => .{ .opcode = .buffer_load_short_d16, .bits = 16 },
+        0x25 => .{ .opcode = .buffer_load_short_d16_hi, .bits = 16 },
+        0x27 => .{ .opcode = .buffer_store_format_d16_hi_x, .bits = 16, .formatted = true },
+        0x30 => .{ .opcode = .buffer_atomic_swap },
+        0x32 => .{ .opcode = .buffer_atomic_add },
+        0x33 => .{ .opcode = .buffer_atomic_sub },
+        0x35 => .{ .opcode = .buffer_atomic_smin },
+        0x36 => .{ .opcode = .buffer_atomic_umin },
+        0x37 => .{ .opcode = .buffer_atomic_smax },
+        0x38 => .{ .opcode = .buffer_atomic_umax },
+        0x39 => .{ .opcode = .buffer_atomic_and },
+        0x3a => .{ .opcode = .buffer_atomic_or },
+        0x3b => .{ .opcode = .buffer_atomic_xor },
+        0x3f => .{ .opcode = .buffer_atomic_fmin },
+        0x40 => .{ .opcode = .buffer_atomic_fmax },
+        0x80 => .{ .opcode = .buffer_load_format_d16_x, .bits = 16, .formatted = true },
+        0x81 => .{ .opcode = .buffer_load_format_d16_xy, .bits = 16, .formatted = true },
+        0x82 => .{ .opcode = .buffer_load_format_d16_xyz, .words = 2, .bits = 16, .formatted = true },
+        0x83 => .{ .opcode = .buffer_load_format_d16_xyzw, .words = 2, .bits = 16, .formatted = true },
+        0x84 => .{ .opcode = .buffer_store_format_d16_x, .bits = 16, .formatted = true },
+        0x85 => .{ .opcode = .buffer_store_format_d16_xy, .bits = 16, .formatted = true },
+        0x86 => .{ .opcode = .buffer_store_format_d16_xyz, .words = 2, .bits = 16, .formatted = true },
+        0x87 => .{ .opcode = .buffer_store_format_d16_xyzw, .words = 2, .bits = 16, .formatted = true },
+        else => null,
+    };
+}
+
+fn applyInfo(inst: *Instruction, info: ?MemoryInfo, reason: []const u8) void {
+    if (info) |value| {
+        inst.opcode = value.opcode;
+        inst.data_words = value.words;
+        inst.data_bits = value.bits;
+        inst.data_signed = value.signed;
+        inst.typed = value.typed;
+        inst.formatted = value.formatted;
+    } else {
+        inst.opcode = .unsupported;
+        inst.unsupported_reason = reason;
+    }
+}
+
+pub fn decodeMubuf(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
+    if (word_index + 1 >= code.len) return Error.TruncatedInstruction;
+    const word0 = code[word_index];
+    const word1 = code[word_index + 1];
+    const id = ((word0 >> 18) & 0x7f) | (((word0 >> 25) & 1) << 7);
+    var inst = Instruction{ .pc = pc, .word = word0, .family = .mubuf, .opcode_id = id };
+    inst.setRawWords(code, word_index, 2);
+    inst.memory_offset = @intCast(word0 & 0xfff);
+    inst.offset_enable = (word0 >> 12) & 1 != 0;
+    inst.index_enable = (word0 >> 13) & 1 != 0;
+    inst.globally_coherent = (word0 >> 14) & 1 != 0;
+    inst.system_coherent = (word1 >> 22) & 1 != 0;
+    applyInfo(&inst, mubufInfo(id), "MUBUF opcode is not implemented");
+    inst.dst = try operand.decodeVectorGpr((word1 >> 8) & 0xff);
+    inst.src0 = try operand.decodeVectorGpr(word1 & 0xff);
+    inst.src1 = try operand.decodeScalarSource(((word1 >> 16) & 0x1f) * 4);
+    inst.src2 = try operand.decodeScalarSource((word1 >> 24) & 0xff);
+    inst.src_count = 3;
+    return inst;
+}
+
+fn mtbufInfo(id: u32) ?MemoryInfo {
+    return switch (id) {
+        0 => .{ .opcode = .tbuffer_load_format_x, .typed = true, .formatted = true },
+        1 => .{ .opcode = .tbuffer_load_format_xy, .words = 2, .typed = true, .formatted = true },
+        2 => .{ .opcode = .tbuffer_load_format_xyz, .words = 3, .typed = true, .formatted = true },
+        3 => .{ .opcode = .tbuffer_load_format_xyzw, .words = 4, .typed = true, .formatted = true },
+        4 => .{ .opcode = .tbuffer_store_format_x, .typed = true, .formatted = true },
+        5 => .{ .opcode = .tbuffer_store_format_xy, .words = 2, .typed = true, .formatted = true },
+        6 => .{ .opcode = .tbuffer_store_format_xyz, .words = 3, .typed = true, .formatted = true },
+        7 => .{ .opcode = .tbuffer_store_format_xyzw, .words = 4, .typed = true, .formatted = true },
+        else => null,
+    };
+}
+
+pub fn decodeMtbuf(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
+    if (word_index + 1 >= code.len) return Error.TruncatedInstruction;
+    const word0 = code[word_index];
+    const word1 = code[word_index + 1];
+    const id = ((word0 >> 16) & 7) | (((word1 >> 21) & 1) << 3);
+    var inst = Instruction{ .pc = pc, .word = word0, .family = .mtbuf, .opcode_id = id };
+    inst.setRawWords(code, word_index, 2);
+    inst.memory_offset = @intCast(word0 & 0xfff);
+    inst.offset_enable = (word0 >> 12) & 1 != 0;
+    inst.index_enable = (word0 >> 13) & 1 != 0;
+    inst.globally_coherent = (word0 >> 14) & 1 != 0;
+    inst.buffer_format = @intCast((word0 >> 19) & 0x7f);
+    inst.system_coherent = (word1 >> 22) & 1 != 0;
+    applyInfo(&inst, mtbufInfo(id), "MTBUF opcode is not implemented");
+    inst.dst = try operand.decodeVectorGpr((word1 >> 8) & 0xff);
+    inst.src0 = try operand.decodeVectorGpr(word1 & 0xff);
+    inst.src1 = try operand.decodeScalarSource(((word1 >> 16) & 0x1f) * 4);
+    inst.src2 = try operand.decodeScalarSource((word1 >> 24) & 0xff);
+    inst.src_count = 3;
+    return inst;
+}
+
+fn flatInfo(id: u32) ?MemoryInfo {
+    return switch (id) {
+        0x08 => .{ .opcode = .flat_load_ubyte, .bits = 8 },
+        0x09 => .{ .opcode = .flat_load_sbyte, .bits = 8, .signed = true },
+        0x0a => .{ .opcode = .flat_load_ushort, .bits = 16 },
+        0x0b => .{ .opcode = .flat_load_sshort, .bits = 16, .signed = true },
+        0x0c => .{ .opcode = .flat_load_dword },
+        0x0d => .{ .opcode = .flat_load_dwordx2, .words = 2 },
+        0x0e => .{ .opcode = .flat_load_dwordx4, .words = 4 },
+        0x0f => .{ .opcode = .flat_load_dwordx3, .words = 3 },
+        0x18 => .{ .opcode = .flat_store_byte, .bits = 8 },
+        0x1a => .{ .opcode = .flat_store_short, .bits = 16 },
+        0x1c => .{ .opcode = .flat_store_dword },
+        0x1d => .{ .opcode = .flat_store_dwordx2, .words = 2 },
+        0x1e => .{ .opcode = .flat_store_dwordx4, .words = 4 },
+        0x1f => .{ .opcode = .flat_store_dwordx3, .words = 3 },
+        else => null,
+    };
+}
+
+fn signExtend12(value: u32) i32 {
+    const raw: i32 = @intCast(value & 0xfff);
+    return if (raw & 0x800 != 0) raw - 0x1000 else raw;
+}
+
+pub fn decodeFlat(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
+    if (word_index + 1 >= code.len) return Error.TruncatedInstruction;
+    const word0 = code[word_index];
+    const word1 = code[word_index + 1];
+    const id = (word0 >> 18) & 0x7f;
+    const segment: u2 = @intCast((word0 >> 14) & 3);
+    var inst = Instruction{ .pc = pc, .word = word0, .family = .flat, .opcode_id = id, .memory_segment = segment };
+    inst.setRawWords(code, word_index, 2);
+    inst.memory_offset = if (segment == 0) @intCast(word0 & 0x7ff) else signExtend12(word0);
+    inst.globally_coherent = (word0 >> 16) & 1 != 0;
+    inst.system_coherent = (word0 >> 17) & 1 != 0;
+    applyInfo(&inst, flatInfo(id), "FLAT opcode is not implemented");
+    const data = (word1 >> 8) & 0xff;
+    const vdst = (word1 >> 24) & 0xff;
+    const store = id >= 0x18 and id <= 0x1f;
+    inst.dst = try operand.decodeVectorGpr(if (store) data else vdst);
+    const addr = word1 & 0xff;
+    inst.src0 = try operand.decodeVectorGpr(addr);
+    const saddr = (word1 >> 16) & 0x7f;
+    inst.src1 = if (segment == 0 or saddr == 0x7d or saddr == 0x7f)
+        try operand.decodeVectorGpr(addr + 1)
+    else
+        try operand.decodeScalarSource(saddr);
+    inst.src_count = 2;
+    return inst;
+}
+
+fn dsInfo(id: u32) ?MemoryInfo {
+    return switch (id) {
+        0x00 => .{ .opcode = .ds_add_u32 },
+        0x01 => .{ .opcode = .ds_sub_u32 },
+        0x03 => .{ .opcode = .ds_inc_u32 },
+        0x04 => .{ .opcode = .ds_dec_u32 },
+        0x05 => .{ .opcode = .ds_min_i32 },
+        0x06 => .{ .opcode = .ds_max_i32 },
+        0x07 => .{ .opcode = .ds_min_u32 },
+        0x08 => .{ .opcode = .ds_max_u32 },
+        0x09 => .{ .opcode = .ds_and_b32 },
+        0x0a => .{ .opcode = .ds_or_b32 },
+        0x0b => .{ .opcode = .ds_xor_b32 },
+        0x0c => .{ .opcode = .ds_mskor_b32 },
+        0x0d => .{ .opcode = .ds_write_b32 },
+        0x0e => .{ .opcode = .ds_write2_b32, .words = 2 },
+        0x0f => .{ .opcode = .ds_write2st64_b32, .words = 2 },
+        0x12 => .{ .opcode = .ds_min_f32 },
+        0x13 => .{ .opcode = .ds_max_f32 },
+        0x1e => .{ .opcode = .ds_write_b8, .bits = 8 },
+        0x1f => .{ .opcode = .ds_write_b16, .bits = 16 },
+        0x20 => .{ .opcode = .ds_add_rtn_u32 },
+        0x21 => .{ .opcode = .ds_sub_rtn_u32 },
+        0x23 => .{ .opcode = .ds_inc_rtn_u32 },
+        0x24 => .{ .opcode = .ds_dec_rtn_u32 },
+        0x25 => .{ .opcode = .ds_min_rtn_i32 },
+        0x26 => .{ .opcode = .ds_max_rtn_i32 },
+        0x27 => .{ .opcode = .ds_min_rtn_u32 },
+        0x28 => .{ .opcode = .ds_max_rtn_u32 },
+        0x29 => .{ .opcode = .ds_and_rtn_b32 },
+        0x2a => .{ .opcode = .ds_or_rtn_b32 },
+        0x2b => .{ .opcode = .ds_xor_rtn_b32 },
+        0x2d => .{ .opcode = .ds_wrxchg_rtn_b32 },
+        0x35 => .{ .opcode = .ds_swizzle_b32 },
+        0x36 => .{ .opcode = .ds_read_b32 },
+        0x37 => .{ .opcode = .ds_read2_b32, .words = 2 },
+        0x38 => .{ .opcode = .ds_read2st64_b32, .words = 2 },
+        0x39 => .{ .opcode = .ds_read_sbyte, .bits = 8, .signed = true },
+        0x3a => .{ .opcode = .ds_read_ubyte, .bits = 8 },
+        0x3b => .{ .opcode = .ds_read_sshort, .bits = 16, .signed = true },
+        0x3c => .{ .opcode = .ds_read_ushort, .bits = 16 },
+        0x3d => .{ .opcode = .ds_consume },
+        0x3e => .{ .opcode = .ds_append },
+        0x3f => .{ .opcode = .ds_ordered_count },
+        0x40 => .{ .opcode = .ds_add_u64, .words = 2 },
+        0x4a => .{ .opcode = .ds_or_b64, .words = 2 },
+        0x4d => .{ .opcode = .ds_write_b64, .words = 2 },
+        0x4e => .{ .opcode = .ds_write2_b64, .words = 4 },
+        0x4f => .{ .opcode = .ds_write2st64_b64, .words = 4 },
+        0x76 => .{ .opcode = .ds_read_b64, .words = 2 },
+        0x77 => .{ .opcode = .ds_read2_b64, .words = 4 },
+        0x78 => .{ .opcode = .ds_read2st64_b64, .words = 4 },
+        0xa0 => .{ .opcode = .ds_write_b8_d16_hi, .bits = 8 },
+        0xa1 => .{ .opcode = .ds_write_b16_d16_hi, .bits = 16 },
+        0xa6 => .{ .opcode = .ds_read_u16_d16, .bits = 16 },
+        0xa7 => .{ .opcode = .ds_read_u16_d16_hi, .bits = 16 },
+        0xb0 => .{ .opcode = .ds_write_addtid_b32 },
+        0xb1 => .{ .opcode = .ds_read_addtid_b32 },
+        0xb2 => .{ .opcode = .ds_permute_b32 },
+        0xb3 => .{ .opcode = .ds_bpermute_b32 },
+        0xde => .{ .opcode = .ds_write_b96, .words = 3 },
+        0xdf => .{ .opcode = .ds_write_b128, .words = 4 },
+        0xfe => .{ .opcode = .ds_read_b96, .words = 3 },
+        0xff => .{ .opcode = .ds_read_b128, .words = 4 },
+        else => null,
+    };
+}
+
+pub fn decodeDs(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
+    if (word_index + 1 >= code.len) return Error.TruncatedInstruction;
+    const word0 = code[word_index];
+    const word1 = code[word_index + 1];
+    const id = (word0 >> 18) & 0xff;
+    const offset0 = word0 & 0xff;
+    const offset1 = (word0 >> 8) & 0xff;
+    var inst = Instruction{ .pc = pc, .word = word0, .family = .ds, .opcode_id = id };
+    inst.setRawWords(code, word_index, 2);
+    // Most DS instructions carry one 16-bit byte offset. The paired forms use
+    // two independent 8-bit offsets whose unit depends on the opcode.
+    inst.memory_offset = @intCast(offset0 | (offset1 << 8));
+    inst.secondary_memory_offset = 0;
+    switch (id) {
+        0x0e, 0x37 => {
+            inst.memory_offset = @intCast(offset0 * 4);
+            inst.secondary_memory_offset = @intCast(offset1 * 4);
+        },
+        0x4e, 0x77 => {
+            inst.memory_offset = @intCast(offset0 * 8);
+            inst.secondary_memory_offset = @intCast(offset1 * 8);
+        },
+        0x0f, 0x38 => {
+            inst.memory_offset = @intCast(offset0 * 256);
+            inst.secondary_memory_offset = @intCast(offset1 * 256);
+        },
+        0x4f, 0x78 => {
+            inst.memory_offset = @intCast(offset0 * 512);
+            inst.secondary_memory_offset = @intCast(offset1 * 512);
+        },
+        else => {},
+    }
+    inst.gds = (word0 >> 17) & 1 != 0;
+    applyInfo(&inst, dsInfo(id), "DS opcode is not implemented");
+    inst.dst = try operand.decodeVectorGpr((word1 >> 24) & 0xff);
+    inst.src0 = try operand.decodeVectorGpr(word1 & 0xff);
+    inst.src1 = try operand.decodeVectorGpr((word1 >> 8) & 0xff);
+    inst.src2 = try operand.decodeVectorGpr((word1 >> 16) & 0xff);
+    inst.src_count = switch (id) {
+        0x0c, 0x0e, 0x0f, 0x4e, 0x4f => 3,
+        0x0d, 0x00, 0x01, 0x03, 0x04, 0x05...0x0b, 0x12, 0x13, 0x1e, 0x1f, 0x20, 0x21, 0x23, 0x24, 0x25...0x2b, 0x2d, 0x40, 0x4a, 0xa0, 0xa1, 0xb2, 0xb3 => 2,
+        0xb0 => 1,
+        0xb1, 0x3d, 0x3e => 0,
+        else => 1,
+    };
+    return inst;
+}
+
+fn mimgOpcode(id: u32) isa.Opcode {
+    return switch (id) {
+        0x00 => .image_load,
+        0x01 => .image_load_mip,
+        0x08 => .image_store,
+        0x09 => .image_store_mip,
+        0x0e => .image_get_resinfo,
+        0x11 => .image_atomic_add,
+        0x15 => .image_atomic_umin,
+        0x17 => .image_atomic_umax,
+        0x18 => .image_atomic_and,
+        0x19 => .image_atomic_or,
+        0x1a => .image_atomic_xor,
+        0x1f => .image_atomic_fmax,
+        0x20...0x3f, 0x68...0x6f, 0xa0...0xbe => .image_sample,
+        0x44, 0x47, 0x48, 0x4c, 0x4f, 0x54, 0x57, 0x58, 0x5c, 0x5f, 0x61 => .image_gather4,
+        0x60 => .image_get_lod,
+        0xe6 => .image_bvh_intersect_ray,
+        0xe7 => .image_bvh64_intersect_ray,
+        else => .unsupported,
+    };
+}
+
+fn bitCount4(mask: u4) u8 {
+    return @intCast(@popCount(mask));
+}
+
+test "comparison gather explicit LOD decodes all captured NSA operands" {
+    const inst = try decodeMimg(0x10cc, &.{ 0xf130_010a, 0x00a3_0013, 0x0016_1a19 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_gather4, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.lod);
+    try std.testing.expect(inst.image_sample_flags.compare);
+    try std.testing.expect(!inst.image_sample_flags.level_zero);
+    try std.testing.expectEqual(@as(u8, 4), inst.image_address_components);
+    try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 19), inst.src0.reg);
+    try std.testing.expectEqualSlices(u8, &.{ 25, 26, 22 }, inst.image_nsa_address[0..3]);
+    const offset = try decodeMimg(0, &.{ 0xf170_010a, 0x00a3_0001, 0x0504_0302 }, 0);
+    try std.testing.expect(offset.image_sample_flags.offset);
+    try std.testing.expect(offset.image_sample_flags.lod);
+    try std.testing.expectEqual(@as(u8, 5), offset.image_address_components);
+}
+
+test "MIMG D16 packs returned registers independently of address precision" {
+    for ([_]u4{ 1, 3, 5, 7, 15 }) |mask| {
+        const sample = try decodeMimg(0, &.{ 0xf09c_0010 | (@as(u32, mask) << 8), 0x8143_0916 }, 0);
+        try std.testing.expect(sample.image_sample_flags.d16);
+        try std.testing.expect(!sample.image_sample_flags.a16);
+        try std.testing.expectEqual((bitCount4(mask) + 1) / 2, sample.data_words);
+        const full = try decodeMimg(0, &.{ 0xf09c_0010 | (@as(u32, mask) << 8), 0x0143_0916 }, 0);
+        try std.testing.expectEqual(bitCount4(mask), full.data_words);
+    }
+    const gather = try decodeMimg(0, &.{ 0xf11c_0108, 0x8143_0916 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_gather4, gather.opcode);
+    try std.testing.expectEqual(@as(u8, 2), gather.data_words);
+}
+
+pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
+    if (word_index + 1 >= code.len) return Error.TruncatedInstruction;
+    const word0 = code[word_index];
+    const word1 = code[word_index + 1];
+    const id = ((word0 >> 18) & 0x7f) | ((word0 & 1) << 7);
+    const nsa: u2 = @intCast((word0 >> 1) & 3);
+    const word_count: u32 = 2 + @as(u32, nsa);
+    if (word_index + word_count > code.len) return Error.TruncatedInstruction;
+    const op = mimgOpcode(id);
+    var inst = Instruction{
+        .pc = pc,
+        .word = word0,
+        .family = .mimg,
+        .opcode_id = id,
+        .opcode = op,
+        .image_nsa_words = nsa,
+        .image_dimension = @enumFromInt((word0 >> 3) & 7),
+    };
+    inst.setRawWords(code, word_index, word_count);
+    inst.data_mask = @intCast((word0 >> 8) & 0xf);
+    inst.data_words = if (op == .image_gather4) 4 else @max(1, bitCount4(inst.data_mask));
+    inst.globally_coherent = (word0 >> 13) & 1 != 0;
+    inst.image_r128 = (word0 >> 15) & 1 != 0;
+    inst.system_coherent = (word0 >> 25) & 1 != 0;
+    inst.image_sample_flags.a16 = (word1 >> 30) & 1 != 0;
+    // GFX10 MIMG bit 63 packs two returned/stored 16-bit components per VGPR.
+    // It is independent of A16, which only packs address components.
+    inst.image_sample_flags.d16 = (word1 >> 31) & 1 != 0 and
+        (op == .image_sample or op == .image_gather4 or
+            (op == .image_load and id <= 1) or (op == .image_store and (id == 8 or id == 9)));
+    if (inst.image_sample_flags.d16) inst.data_words = (inst.data_words + 1) / 2;
+    if (op == .image_sample) {
+        if (id >= 0x20 and id <= 0x3f or (id >= 0xa0 and id <= 0xbe)) {
+            const encoded = if (id >= 0xa0) id - 0x80 else id;
+            const nibble: u32 = encoded & 7;
+            inst.image_sample_flags.lod_clamp = nibble == 1 or nibble == 3 or nibble == 6;
+            inst.image_sample_flags.derivative = nibble == 2 or nibble == 3;
+            inst.image_sample_flags.lod = nibble == 4;
+            inst.image_sample_flags.bias = nibble == 5 or nibble == 6;
+            inst.image_sample_flags.level_zero = nibble == 7;
+            inst.image_sample_flags.compare = encoded & 0x08 != 0;
+            inst.image_sample_flags.offset = encoded & 0x10 != 0;
+            inst.image_sample_flags.adjust = id >= 0xa0;
+        } else if (id >= 0x68 and id <= 0x6f) {
+            inst.image_sample_flags.derivative = true;
+            inst.image_sample_flags.coherent_derivative = true;
+            inst.image_sample_flags.lod_clamp = id & 1 != 0;
+            inst.image_sample_flags.compare = id & 2 != 0;
+            inst.image_sample_flags.offset = id & 4 != 0;
+        }
+    } else if (op == .image_gather4) {
+        switch (id) {
+            0x44 => inst.image_sample_flags.lod = true,
+            0x4c => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.lod = true;
+            },
+            0x54, 0x5c => {
+                inst.image_sample_flags.lod = true;
+                inst.image_sample_flags.offset = true;
+                inst.image_sample_flags.compare = id == 0x5c;
+            },
+            0x47 => inst.image_sample_flags.level_zero = true,
+            0x48 => inst.image_sample_flags.compare = true,
+            0x4f => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.level_zero = true;
+            },
+            0x57 => {
+                inst.image_sample_flags.level_zero = true;
+                inst.image_sample_flags.offset = true;
+            },
+            0x58 => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.offset = true;
+            },
+            0x5f => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.level_zero = true;
+                inst.image_sample_flags.offset = true;
+            },
+            0x61 => inst.image_sample_flags.gather_horizontal = true,
+            else => {},
+        }
+    }
+    const coordinate_components: u8 = switch (inst.image_dimension) {
+        .dim_1d => 1,
+        .dim_2d => 2,
+        .dim_3d, .dim_2d_array, .dim_2d_array_alt => 3,
+        .dim_1d_array => 2,
+        .dim_2d_msaa => 3,
+        .dim_2d_msaa_array => 4,
+    };
+    inst.image_address_components = coordinate_components;
+    // IMAGE_*_MIP appends an explicit integer mip level after DIM's texel
+    // coordinates. Without counting it the following VGPR is omitted from
+    // NSA/consecutive-address reconstruction and LOAD_MIP cannot be lowered.
+    if (op == .image_load_mip or op == .image_store_mip) {
+        inst.image_address_components += 1;
+    } else if (op == .image_sample) {
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.compare);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.lod);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.bias);
+        if (inst.image_sample_flags.derivative) {
+            inst.image_address_components += switch (inst.image_dimension) {
+                .dim_1d, .dim_1d_array => 2,
+                .dim_3d => 6,
+                else => 4,
+            };
+        }
+    } else if (op == .image_gather4) {
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.compare);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.lod);
+    }
+    for (0..@as(usize, nsa) * 4) |i| {
+        inst.image_nsa_address[i] = @truncate(code[word_index + 2 + i / 4] >> @intCast((i % 4) * 8));
+    }
+    inst.dst = try operand.decodeVectorGpr((word1 >> 8) & 0xff);
+    inst.src0 = try operand.decodeVectorGpr(word1 & 0xff);
+    inst.src1 = try operand.decodeScalarSource(((word1 >> 16) & 0x1f) * 4);
+    inst.src2 = try operand.decodeScalarSource(((word1 >> 21) & 0x1f) * 4);
+    inst.src_count = 3;
+    if (op == .image_bvh_intersect_ray or op == .image_bvh64_intersect_ray) {
+        // RDNA 2 ray operands are node pointer, extent, origin, direction and
+        // inverse direction. A16 packs only the final six floating components;
+        // DIM and DMASK do not describe this instruction's operand widths.
+        inst.data_words = 4;
+        inst.image_address_components = @as(u8, if (inst.image_sample_flags.a16) 8 else 11) +
+            @intFromBool(op == .image_bvh64_intersect_ray);
+        inst.src2 = .{};
+        inst.src_count = 2;
+    }
+    if (op == .unsupported) inst.unsupported_reason = "MIMG opcode is not implemented";
+    return inst;
+}
+
+test "MIMG ray intersection preserves captured nonconsecutive ray operands" {
+    const code = [_]u32{ 0xf198_9f07, 0x0006_022b, 0x3822_3937, 0x3e36_2425, 0x0000_193f };
+    const inst = try decodeMimg(0x15a4, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_bvh_intersect_ray, inst.opcode);
+    try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+    try std.testing.expectEqual(@as(u8, 11), inst.image_address_components);
+    try std.testing.expectEqual(@as(u32, 2), inst.dst.reg);
+    try std.testing.expectEqual(@as(u32, 43), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 24), inst.src1.reg);
+    try std.testing.expectEqual(@as(u8, 2), inst.src_count);
+    try std.testing.expect(inst.image_r128);
+    try std.testing.expectEqualSlices(u8, &.{ 55, 57, 34, 56, 37, 36, 54, 62, 63, 25 }, inst.image_nsa_address[0..10]);
+    try std.testing.expectError(Error.TruncatedInstruction, decodeMimg(0, code[0..4], 0));
+}
+
+test "MIMG ray intersection counts 32-bit and 64-bit node pointers with A16" {
+    for ([_]bool{ false, true }) |wide| {
+        for ([_]bool{ false, true }) |a16| {
+            const inst = try decodeMimg(0, &.{
+                0xf198_8001 | @as(u32, if (wide) 1 << 18 else 0),
+                0x0006_0210 | @as(u32, if (a16) 1 << 30 else 0),
+            }, 0);
+            try std.testing.expectEqual(if (wide) isa.Opcode.image_bvh64_intersect_ray else isa.Opcode.image_bvh_intersect_ray, inst.opcode);
+            try std.testing.expectEqual(@as(u8, if (a16) 8 else 11) + @intFromBool(wide), inst.image_address_components);
+            try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+        }
+    }
+}
+
+pub fn decodeExp(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
+    if (word_index + 1 >= code.len) return Error.TruncatedInstruction;
+    const word0 = code[word_index];
+    const word1 = code[word_index + 1];
+    const target: u6 = @intCast((word0 >> 4) & 0x3f);
+    const enable: u4 = @intCast(word0 & 0xf);
+    var inst = Instruction{
+        .pc = pc,
+        .word = word0,
+        .family = .exp,
+        .opcode_id = target,
+        .opcode = .exp,
+        .export_target = target,
+        .export_enable = enable,
+        .export_compressed = (word0 >> 10) & 1 != 0,
+        .export_done = (word0 >> 11) & 1 != 0,
+        .export_valid_mask = (word0 >> 12) & 1 != 0,
+    };
+    inst.setRawWords(code, word_index, 2);
+    inst.src0 = try operand.decodeVectorGpr(word1 & 0xff);
+    inst.src1 = try operand.decodeVectorGpr((word1 >> 8) & 0xff);
+    inst.src2 = try operand.decodeVectorGpr((word1 >> 16) & 0xff);
+    inst.src3 = try operand.decodeVectorGpr((word1 >> 24) & 0xff);
+    inst.src_count = if (enable == 0) 0 else if (inst.export_compressed) 2 else 4;
+    return inst;
+}
+
+test "MUBUF keeps resource and address operands" {
+    const code = [_]u32{ (@as(u32, 0x0c) << 18) | 0x24, (@as(u32, 7) << 24) | (@as(u32, 3) << 16) | (@as(u32, 9) << 8) | 4 };
+    const inst = try decodeMubuf(0, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.buffer_load_dword, inst.opcode);
+    try std.testing.expectEqual(@as(i32, 0x24), inst.memory_offset);
+    try std.testing.expectEqual(@as(u32, 12), inst.src1.reg);
+}
+
+test "MIMG NSA words are retained in the instruction length" {
+    const code = [_]u32{ (@as(u32, 0x20) << 18) | (2 << 1), 0, 0x0403_0201, 0x0807_0605 };
+    const inst = try decodeMimg(0, &code, 0);
+    try std.testing.expectEqual(@as(u32, 4), inst.word_count);
+    try std.testing.expectEqual(@as(u8, 1), inst.image_nsa_address[0]);
+    try std.testing.expectEqual(@as(u8, 8), inst.image_nsa_address[7]);
+}
+
+test "MIMG explicit-mip operations include the mip address VGPR" {
+    const code = [_]u32{ 0xf004_0108, 0x000a_0c00 };
+    const inst = try decodeMimg(0x64, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_load_mip, inst.opcode);
+    try std.testing.expectEqual(@as(u8, 3), inst.image_address_components);
+}
+
+test "MIMG gather retains result width and offset address layout" {
+    const code = [_]u32{
+        0xf15c_080a, // image_gather4_lz_o, dim:2d, dmask:w, one NSA word
+        0x0040_0400, // v[4:7], v0, T#s0, S#s8
+        0x0000_0f0e, // coordinates v14, v15
+    };
+    const inst = try decodeMimg(0, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_gather4, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.level_zero);
+    try std.testing.expect(inst.image_sample_flags.offset);
+    try std.testing.expectEqual(@as(u8, 3), inst.image_address_components);
+    try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+    try std.testing.expectEqual(@as(u8, 14), inst.image_nsa_address[0]);
+    try std.testing.expectEqual(@as(u8, 15), inst.image_nsa_address[1]);
+}
+
+test "MIMG sample level-zero offset keeps packed offset before NSA coordinates" {
+    const code = [_]u32{
+        0xf0dc_080a, // image_sample_lz_o, dim:2d, dmask:w, one NSA word
+        0x0040_1100, // v17, v0, T#s0, S#s8
+        0x0000_0f0e, // coordinates v14, v15
+    };
+    const inst = try decodeMimg(0, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.level_zero);
+    try std.testing.expect(inst.image_sample_flags.offset);
+    try std.testing.expectEqual(@as(u8, 3), inst.image_address_components);
+    try std.testing.expectEqual(@as(u8, 1), inst.data_words);
+    try std.testing.expectEqual(@as(u8, 14), inst.image_nsa_address[0]);
+    try std.testing.expectEqual(@as(u8, 15), inst.image_nsa_address[1]);
+}
+
+test "MIMG sample_c_lz counts the compare address" {
+    const inst = try decodeMimg(0, &.{ 0xf0bc_0f08, 0x0040_0200 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.compare);
+    try std.testing.expect(inst.image_sample_flags.level_zero);
+    try std.testing.expectEqual(@as(u8, 3), inst.image_address_components);
+}
+
+test "MIMG SAMPLE_D counts explicit derivative addresses" {
+    const inst = try decodeMimg(0, &.{ 0xf088_0f08, 0x0040_0200 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.derivative);
+    try std.testing.expectEqual(isa.ImageDimension.dim_2d, inst.image_dimension);
+    try std.testing.expectEqual(@as(u8, 6), inst.image_address_components);
+}
+
+test "MIMG 1D sample counts a single coordinate" {
+    const inst = try decodeMimg(0, &.{ 0xf080_0f00, 0x0040_0200 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expectEqual(isa.ImageDimension.dim_1d, inst.image_dimension);
+    try std.testing.expectEqual(@as(u8, 1), inst.image_address_components);
+}
+
+test "MIMG explicit LOD sample counts its LOD address after cube coordinates" {
+    const code = [_]u32{ 0xf090_071a, 0x01e2_0020, 0x0023_2221 };
+    const inst = try decodeMimg(0x41c, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 0x24), inst.opcode_id);
+    try std.testing.expect(inst.image_sample_flags.lod);
+    try std.testing.expectEqual(isa.ImageDimension.dim_2d_array, inst.image_dimension);
+    try std.testing.expectEqual(@as(u8, 4), inst.image_address_components);
+    try std.testing.expectEqual(@as(u32, 32), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 8), inst.src1.reg);
+    try std.testing.expectEqual(@as(u32, 60), inst.src2.reg);
+    try std.testing.expectEqual(@as(u8, 35), inst.image_nsa_address[2]);
+}
+
+test "DS offsets use byte units required by paired operations" {
+    const paired = [_]u32{
+        (@as(u32, 0x0e) << 18) | (@as(u32, 0x20) << 8) | 3,
+        (@as(u32, 2) << 16) | (@as(u32, 1) << 8) | 4,
+    };
+    const write2 = try decodeDs(0, &paired, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_write2_b32, write2.opcode);
+    try std.testing.expectEqual(@as(i32, 12), write2.memory_offset);
+    try std.testing.expectEqual(@as(i32, 128), write2.secondary_memory_offset);
+
+    const single = [_]u32{
+        (@as(u32, 0x0d) << 18) | (@as(u32, 0x12) << 8) | 0x34,
+        (@as(u32, 1) << 8) | 4,
+    };
+    const write = try decodeDs(0, &single, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_write_b32, write.opcode);
+    try std.testing.expectEqual(@as(i32, 0x1234), write.memory_offset);
+}
+
+test "DS addtid scratch and append opcodes decode explicitly" {
+    const write_code = [_]u32{ 0xdac0_0100, 0x0000_0700 };
+    const write = try decodeDs(0, &write_code, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_write_addtid_b32, write.opcode);
+    try std.testing.expectEqual(@as(i32, 0x100), write.memory_offset);
+    try std.testing.expectEqual(@as(u32, 7), write.src1.reg);
+
+    const read_code = [_]u32{ 0xdac4_0000, 0x0800_0000 };
+    const read = try decodeDs(8, &read_code, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_read_addtid_b32, read.opcode);
+    try std.testing.expectEqual(@as(u32, 8), read.dst.reg);
+
+    const append_code = [_]u32{ 0xd8fa_0004, 0x0300_0000 };
+    const append = try decodeDs(16, &append_code, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_append, append.opcode);
+    try std.testing.expect(append.gds);
+    try std.testing.expectEqual(@as(u32, 3), append.dst.reg);
+}
+
+test "DS swizzle consume and 64-bit pair encodings decode" {
+    const swizzle = try decodeDs(0, &.{ (@as(u32, 0x35) << 18), 0x0100_0004 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_swizzle_b32, swizzle.opcode);
+    const consume = try decodeDs(0, &.{ (@as(u32, 0x3d) << 18), 0x0800_0000 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_consume, consume.opcode);
+    // ds_ordered_count v3, v2 offset0:7 offset1:0x10 gds: the count comes from
+    // ADDR, and both offset bytes stay packed for the translator.
+    const ordered = try decodeDs(0, &.{ (@as(u32, 0x3f) << 18) | (1 << 17) | 0x1007, 0x0300_0902 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_ordered_count, ordered.opcode);
+    try std.testing.expect(ordered.gds);
+    try std.testing.expectEqual(@as(i32, 0x1007), ordered.memory_offset);
+    try std.testing.expectEqual(@as(u32, 2), ordered.src0.reg);
+    try std.testing.expectEqual(@as(u32, 1), ordered.src_count);
+    try std.testing.expectEqual(@as(u32, 3), ordered.dst.reg);
+    const inc = try decodeDs(0, &.{ (@as(u32, 0x03) << 18) | 0x20, 0x0100_0402 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_inc_u32, inc.opcode);
+    try std.testing.expectEqual(@as(u32, 2), inc.src_count);
+    try std.testing.expectEqual(@as(u32, 2), inc.src0.reg);
+    try std.testing.expectEqual(@as(u32, 4), inc.src1.reg);
+    const mskor = try decodeDs(0, &.{ (@as(u32, 0x0c) << 18), 0x0006_0503 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_mskor_b32, mskor.opcode);
+    try std.testing.expectEqual(@as(u32, 3), mskor.src_count);
+    try std.testing.expectEqual(@as(u32, 6), mskor.src2.reg);
+    const read_hi = try decodeDs(0, &.{ (@as(u32, 0xa7) << 18) | 8, 0x0900_0001 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_read_u16_d16_hi, read_hi.opcode);
+    try std.testing.expectEqual(@as(i32, 8), read_hi.memory_offset);
+    try std.testing.expectEqual(@as(u32, 1), read_hi.src_count);
+    const permute = try decodeDs(0, &.{ (@as(u32, 0xb2) << 18) | 4, 0x0200_0705 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_permute_b32, permute.opcode);
+    try std.testing.expectEqual(@as(u32, 2), permute.src_count);
+    try std.testing.expectEqual(@as(u32, 5), permute.src0.reg);
+    try std.testing.expectEqual(@as(u32, 7), permute.src1.reg);
+    try std.testing.expectEqual(@as(i32, 4), permute.memory_offset);
+    const write2st = try decodeDs(0, &.{ (@as(u32, 0x0f) << 18) | (@as(u32, 2) << 8) | 1, 0x0002_0104 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_write2st64_b32, write2st.opcode);
+    try std.testing.expectEqual(@as(i32, 256), write2st.memory_offset);
+    try std.testing.expectEqual(@as(i32, 512), write2st.secondary_memory_offset);
+}
+
+test "DS 64-bit paired offsets count eight-byte values including stride64" {
+    for ([_]u32{ 0x4e, 0x77, 0x4f, 0x78 }) |opcode| {
+        const inst = try decodeDs(0, &.{ (opcode << 18) | (7 << 8) | 3, 0x1008_0201 }, 0);
+        const scale: i32 = if (opcode == 0x4f or opcode == 0x78) 512 else 8;
+        try std.testing.expectEqual(3 * scale, inst.memory_offset);
+        try std.testing.expectEqual(7 * scale, inst.secondary_memory_offset);
+        try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+    }
+}
+
+test "DS 64-bit OR decodes its address and data pair" {
+    const inst = try decodeDs(0x6f0, &.{ 0xd928_0000, 0x0000_0307 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_or_b64, inst.opcode);
+    try std.testing.expectEqual(@as(u8, 2), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 7), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 3), inst.src1.reg);
+}
+
+test "DS 64-bit add decodes captured Yotei instruction" {
+    const inst = try decodeDs(0x2c8, &.{ 0xd900_0000, 0x0000_0307 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_add_u64, inst.opcode);
+    try std.testing.expectEqual(@as(u8, 2), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 7), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 3), inst.src1.reg);
+    try std.testing.expectEqual(@as(u8, 2), inst.src_count);
+}
+
+test "MIMG r128 flag is taken from the first encoding word" {
+    const code = [_]u32{ (@as(u32, 0x20) << 18) | (1 << 15), 0 };
+    const inst = try decodeMimg(0, &code, 0);
+    try std.testing.expect(inst.image_r128);
+    try std.testing.expectEqual(@as(u32, 4), inst.imageResourceWords());
+    const full = try decodeMimg(0xe74, &.{ 0xf088_0808, 0x0261_0e4c }, 0);
+    const compact = try decodeMimg(0xe48, &.{ 0xf088_8808, 0x02f4_0348 }, 0);
+    try std.testing.expectEqual(@as(u32, 8), full.imageResourceWords());
+    try std.testing.expectEqual(@as(u32, 4), compact.imageResourceWords());
+    try std.testing.expectEqual(@as(u32, 80), compact.src1.reg);
+}
+
+test "MIMG floating-point maximum atomic decodes" {
+    const inst = try decodeMimg(0x1f0, &.{ 0xf07c_0108, 0x0001_0508 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_atomic_fmax, inst.opcode);
+    try std.testing.expectEqual(@as(u4, 1), inst.data_mask);
+    try std.testing.expectEqual(@as(u32, 5), inst.dst.reg);
+    try std.testing.expectEqual(@as(u32, 8), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 4), inst.src1.reg);
+}
+
+test "MUBUF floating-point atomics decode" {
+    const fmin = try decodeMubuf(0, &.{ (@as(u32, 0x3f) << 18), 0 }, 0);
+    try std.testing.expectEqual(isa.Opcode.buffer_atomic_fmin, fmin.opcode);
+}
+
+test "MUBUF formatted high-half store decodes the Yotei output write" {
+    const inst = try decodeMubuf(0x14e4, &.{ 0xe09c_6000, 0x8001_0007 }, 0);
+    try std.testing.expectEqual(isa.Opcode.buffer_store_format_d16_hi_x, inst.opcode);
+    try std.testing.expect(inst.formatted and inst.index_enable and inst.globally_coherent);
+    try std.testing.expectEqual(@as(u8, 16), inst.data_bits);
+    try std.testing.expectEqual(@as(u8, 1), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 0), inst.dst.reg);
+    try std.testing.expectEqual(@as(u32, 7), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 4), inst.src1.reg);
+}
+
+test "MUBUF byte high-half store decodes the hull shader output write" {
+    const inst = try decodeMubuf(0x105c, &.{ 0xe064_6000, 0x8004_1707 }, 0);
+    try std.testing.expectEqual(isa.Opcode.buffer_store_byte_d16_hi, inst.opcode);
+    try std.testing.expect(inst.index_enable and inst.globally_coherent);
+    try std.testing.expect(!inst.formatted and !inst.offset_enable);
+    try std.testing.expectEqual(@as(u8, 8), inst.data_bits);
+    try std.testing.expectEqual(@as(u8, 1), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 23), inst.dst.reg);
+    try std.testing.expectEqual(@as(u32, 7), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 16), inst.src1.reg);
+}
+
+test "truncated EXP is rejected" {
+    const code = [_]u32{0xf800_0000};
+    try std.testing.expectError(Error.TruncatedInstruction, decodeExp(0, &code, 0));
+}

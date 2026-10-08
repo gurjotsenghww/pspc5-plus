@@ -1,0 +1,695 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+//
+//! Bindings for the services a shipped title asks for and this machine
+//! does not have. Generated from the identifiers such a title imports and
+//! the published names they hash to; what each answer means is in
+//! services.zig, where it can be read without a thousand lines in the way.
+
+const services = @import("services.zig");
+const json = @import("json.zig");
+const dialogs = @import("dialogs.zig");
+const av_player = @import("av_player.zig");
+const font = @import("font.zig");
+const platform_services = @import("platform_services.zig");
+const playgo = @import("playgo.zig");
+const psml = @import("psml.zig");
+const videodec2 = @import("videodec2.zig");
+const trace = @import("../trace.zig");
+const symbols = @import("../symbols.zig");
+
+pub const ipmi_exports = [_]symbols.Export{
+    .{ .name = "_ZN4IPMI6Client6ConfigC1Ev", .function = trace.wrap("IPMI::Client::Config::Config", &services.ipmiClientConfigInit), .expect_id = "O1lQ2+do5r4" },
+    .{ .name = "_ZN4IPMI6Client6createEPPS0_PKNS0_6ConfigEPvS6_", .function = trace.wrap("IPMI::Client::create", &services.ipmiClientCreate), .expect_id = "0zsTiDhM0nU" },
+};
+
+pub const agc_exports = [_]symbols.Export{
+    .{ .name = "libSceAgc:7Wa3aeJgeVU", .function = trace.wrap("libSceAgc:7Wa3aeJgeVU", &services.accept), .id_override = "7Wa3aeJgeVU" },
+    .{ .name = "libSceAgc:rP5xLdOf26k", .function = trace.wrap("libSceAgc:rP5xLdOf26k", &services.accept), .id_override = "rP5xLdOf26k" },
+    .{ .name = "libSceAgc:k0E7vkgqAuE", .function = trace.wrap("libSceAgc:k0E7vkgqAuE", &services.accept), .id_override = "k0E7vkgqAuE" },
+    .{ .name = "libSceAgc:gQkqkLttcpw", .function = trace.wrap("libSceAgc:gQkqkLttcpw", &services.accept), .id_override = "gQkqkLttcpw" },
+    .{ .name = "libSceAgc:zARR5aCmkoY", .function = trace.wrap("libSceAgc:zARR5aCmkoY", &services.accept), .id_override = "zARR5aCmkoY" },
+};
+
+pub const avplayer_exports = [_]symbols.Export{
+    .{ .name = "sceAvPlayerAddSource", .function = trace.wrap("sceAvPlayerAddSource", &av_player.addSource), .expect_id = "KMcEa+rHsIo" },
+    .{ .name = "sceAvPlayerCurrentTime", .function = trace.wrap("sceAvPlayerCurrentTime", &av_player.currentTime), .expect_id = "wwM99gjFf1Y" },
+    .{ .name = "sceAvPlayerSetTrickSpeed", .function = trace.wrap("sceAvPlayerSetTrickSpeed", &av_player.setTrickSpeed), .expect_id = "av8Z++94rs0" },
+    .{ .name = "sceAvPlayerGetStreamInfo", .function = trace.wrap("sceAvPlayerGetStreamInfo", &av_player.getStreamInfo), .expect_id = "d8FcbzfAdQw" },
+    .{ .name = "sceAvPlayerDisableStream", .function = trace.wrap("sceAvPlayerDisableStream", &av_player.disableStream), .expect_id = "BOVKAzRmuTQ" },
+    .{ .name = "sceAvPlayerInit", .function = trace.wrap("sceAvPlayerInit", &av_player.init), .expect_id = "aS66RI0gGgo" },
+};
+
+pub const coredump_exports = [_]symbols.Export{
+    .{ .name = "sceCoredumpRegisterCoredumpHandler", .function = trace.wrap("sceCoredumpRegisterCoredumpHandler", &services.accept), .expect_id = "8zLSfEfW5AU" },
+    .{ .name = "sceCoredumpSetUserDataType", .function = trace.wrap("sceCoredumpSetUserDataType", &services.accept), .expect_id = "Uxqkdta7wEg" },
+    .{ .name = "sceCoredumpWriteUserData", .function = trace.wrap("sceCoredumpWriteUserData", &services.accept), .expect_id = "Dbbkj6YHWdo" },
+    .{ .name = "sceCoredumpAttachUserFile", .function = trace.wrap("sceCoredumpAttachUserFile", &services.accept), .expect_id = "5nc2gdLNsok" },
+    .{ .name = "sceCoredumpWriteUserString", .function = trace.wrap("sceCoredumpWriteUserString", &services.accept), .expect_id = "32KQRUK13kI" },
+    .{ .name = "libSceCoredump:kK0DUW1Ukgc", .function = trace.wrap("libSceCoredump:kK0DUW1Ukgc", &services.accept), .id_override = "kK0DUW1Ukgc" },
+    .{ .name = "libSceCoredump:Jrs7UUkGOFo", .function = trace.wrap("libSceCoredump:Jrs7UUkGOFo", &services.accept), .id_override = "Jrs7UUkGOFo" },
+    .{ .name = "libSceCoredump:MEJ7tc7ThwM", .function = trace.wrap("libSceCoredump:MEJ7tc7ThwM", &services.accept), .id_override = "MEJ7tc7ThwM" },
+};
+
+pub const camera2_exports = [_]symbols.Export{
+    .{ .name = "sceCamera2IsAttached", .function = trace.wrap("sceCamera2IsAttached", &services.notAttached), .expect_id = "2v21-m4gljU" },
+    .{ .name = "sceCamera2Open", .function = trace.wrap("sceCamera2Open", &services.noDevice), .expect_id = "dmLUJh3bVTc" },
+    .{ .name = "sceCamera2Stop", .function = trace.wrap("sceCamera2Stop", &services.noDevice), .expect_id = "TZWR3p6XxXk" },
+    .{ .name = "sceCamera2Close", .function = trace.wrap("sceCamera2Close", &services.noDevice), .expect_id = "uBRW3tEoWWM" },
+    .{ .name = "sceCamera2SetConfig", .function = trace.wrap("sceCamera2SetConfig", &services.noDevice), .expect_id = "O5x-G9Rqwx4" },
+    .{ .name = "sceCamera2Start", .function = trace.wrap("sceCamera2Start", &services.noDevice), .expect_id = "eGkcUia48ts" },
+    .{ .name = "sceCamera2GetExposureGain", .function = trace.wrap("sceCamera2GetExposureGain", &services.noDevice), .expect_id = "c9XZGDF1OcM" },
+    .{ .name = "sceCamera2SetExposureGain", .function = trace.wrap("sceCamera2SetExposureGain", &services.noDevice), .expect_id = "8MEjogxPrv0" },
+    .{ .name = "sceCamera2GetWhiteBalance", .function = trace.wrap("sceCamera2GetWhiteBalance", &services.noDevice), .expect_id = "n+R7PGJa6MI" },
+    .{ .name = "sceCamera2SetWhiteBalance", .function = trace.wrap("sceCamera2SetWhiteBalance", &services.noDevice), .expect_id = "AfIDd+2ycTs" },
+    .{ .name = "sceCamera2GetGamma", .function = trace.wrap("sceCamera2GetGamma", &services.noDevice), .expect_id = "gJqqsinextg" },
+    .{ .name = "sceCamera2SetGamma", .function = trace.wrap("sceCamera2SetGamma", &services.noDevice), .expect_id = "pfiqU2f6PQY" },
+    .{ .name = "sceCamera2GetSaturation", .function = trace.wrap("sceCamera2GetSaturation", &services.noDevice), .expect_id = "DAycoVmY3Mw" },
+    .{ .name = "sceCamera2SetSaturation", .function = trace.wrap("sceCamera2SetSaturation", &services.noDevice), .expect_id = "TzkL-nUWfaQ" },
+    .{ .name = "sceCamera2GetContrast", .function = trace.wrap("sceCamera2GetContrast", &services.noDevice), .expect_id = "1-IJHxzRJGw" },
+    .{ .name = "sceCamera2SetContrast", .function = trace.wrap("sceCamera2SetContrast", &services.noDevice), .expect_id = "66IVWcdNHyI" },
+    .{ .name = "sceCamera2GetSharpness", .function = trace.wrap("sceCamera2GetSharpness", &services.noDevice), .expect_id = "vPi3gSzw79M" },
+    .{ .name = "sceCamera2SetSharpness", .function = trace.wrap("sceCamera2SetSharpness", &services.noDevice), .expect_id = "2zCd8XDOe-Y" },
+    .{ .name = "sceCamera2GetHue", .function = trace.wrap("sceCamera2GetHue", &services.noDevice), .expect_id = "T8jy0JWa210" },
+    .{ .name = "sceCamera2SetHue", .function = trace.wrap("sceCamera2SetHue", &services.noDevice), .expect_id = "gB+OkFvkSXE" },
+};
+
+pub const errordialog_exports = [_]symbols.Export{
+    .{ .name = "sceErrorDialogInitialize", .function = trace.wrap("sceErrorDialogInitialize", &dialogs.errorDialogInitialize), .expect_id = "I88KChlynSs" },
+    .{ .name = "sceErrorDialogOpen", .function = trace.wrap("sceErrorDialogOpen", &dialogs.errorDialogOpen), .expect_id = "M2ZF-ClLhgY" },
+    .{ .name = "sceErrorDialogUpdateStatus", .function = trace.wrap("sceErrorDialogUpdateStatus", &dialogs.errorDialogUpdateStatus), .expect_id = "WWiGuh9XfgQ" },
+    .{ .name = "sceErrorDialogTerminate", .function = trace.wrap("sceErrorDialogTerminate", &dialogs.errorDialogTerminate), .expect_id = "9XAxK2PMwk8" },
+    .{ .name = "sceErrorDialogClose", .function = trace.wrap("sceErrorDialogClose", &dialogs.errorDialogClose), .expect_id = "ekXHb1kDBl0" },
+    .{ .name = "sceErrorDialogGetStatus", .function = trace.wrap("sceErrorDialogGetStatus", &dialogs.errorDialogGetStatus), .expect_id = "t2FvHRXzgqk" },
+};
+
+pub const gamelivestreaming_exports = [_]symbols.Export{
+    .{ .name = "sceGameLiveStreamingInitialize", .function = trace.wrap("sceGameLiveStreamingInitialize", &services.offline), .expect_id = "kvYEw2lBndk" },
+    .{ .name = "sceGameLiveStreamingTerminate", .function = trace.wrap("sceGameLiveStreamingTerminate", &services.offline), .expect_id = "9yK6Fk8mKOQ" },
+    .{ .name = "sceGameLiveStreamingGetCurrentStatus2", .function = trace.wrap("sceGameLiveStreamingGetCurrentStatus2", &services.offline), .expect_id = "lK8dLBNp9OE" },
+    .{ .name = "sceGameLiveStreamingGetProgramInfo", .function = trace.wrap("sceGameLiveStreamingGetProgramInfo", &services.offline), .expect_id = "OIIm19xu+NM" },
+};
+
+pub const gameupdate_exports = [_]symbols.Export{
+    .{ .name = "sceGameUpdateInitialize", .function = trace.wrap("sceGameUpdateInitialize", &services.gameUpdateInitialize), .expect_id = "YJtKLttI9fM" },
+    .{ .name = "sceGameUpdateTerminate", .function = trace.wrap("sceGameUpdateTerminate", &services.gameUpdateTerminate), .expect_id = "NSH-C-OmoNI" },
+    .{ .name = "sceGameUpdateCreateRequest", .function = trace.wrap("sceGameUpdateCreateRequest", &services.gameUpdateCreateRequest), .expect_id = "UvcvKaFvupA" },
+    .{ .name = "sceGameUpdateCheck", .function = trace.wrap("sceGameUpdateCheck", &services.gameUpdateCheck), .expect_id = "LYVV9z8+owM" },
+    .{ .name = "sceGameUpdateAbortRequest", .function = trace.wrap("sceGameUpdateAbortRequest", &services.gameUpdateAbortRequest), .expect_id = "d1CNGEOaK28" },
+    .{ .name = "sceGameUpdateDeleteRequest", .function = trace.wrap("sceGameUpdateDeleteRequest", &services.gameUpdateDeleteRequest), .expect_id = "bcCyjHN5sn0" },
+    .{ .name = "sceGameUpdateGetAddcontLatestVersion", .function = trace.wrap("sceGameUpdateGetAddcontLatestVersion", &services.gameUpdateGetAddcontLatestVersion), .expect_id = "0g0+Oq9xcI0" },
+};
+
+pub const hmd2_exports = [_]symbols.Export{
+    .{ .name = "sceHmd2ReprojectionSetRenderConfig", .function = trace.wrap("sceHmd2ReprojectionSetRenderConfig", &services.noDevice), .expect_id = "hA9LshbSkzw" },
+    .{ .name = "sceHmd2GetDeviceInformation", .function = trace.wrap("sceHmd2GetDeviceInformation", &services.noDevice), .expect_id = "bIi4YUfSRys" },
+    .{ .name = "sceHmd2GetDeviceInformationByHandle", .function = trace.wrap("sceHmd2GetDeviceInformationByHandle", &services.noDevice), .expect_id = "4BlE4IPXP0Q" },
+    .{ .name = "sceHmd2Open", .function = trace.wrap("sceHmd2Open", &services.noDevice), .expect_id = "f3kPeoTZnIE" },
+    .{ .name = "sceHmd2GetFieldOfViewWithoutHandle", .function = trace.wrap("sceHmd2GetFieldOfViewWithoutHandle", &services.noDevice), .expect_id = "gF8+lvc7GuQ" },
+    .{ .name = "sceHmd2ReprojectionBeginFrame", .function = trace.wrap("sceHmd2ReprojectionBeginFrame", &services.noDevice), .expect_id = "Ocf081WpBpA" },
+    .{ .name = "sceHmd2ReprojectionEnableMirroring", .function = trace.wrap("sceHmd2ReprojectionEnableMirroring", &services.noDevice), .expect_id = "Qx7SkcgAzok" },
+    .{ .name = "sceHmd2ReprojectionSetMirroringOption", .function = trace.wrap("sceHmd2ReprojectionSetMirroringOption", &services.noDevice), .expect_id = "+seEJVlljr0" },
+    .{ .name = "sceHmd2ReprojectionDisableMirroring", .function = trace.wrap("sceHmd2ReprojectionDisableMirroring", &services.noDevice), .expect_id = "asilo8VNGvg" },
+    .{ .name = "sceHmd2ReprojectionGetPredictedDisplayTime", .function = trace.wrap("sceHmd2ReprojectionGetPredictedDisplayTime", &services.noDevice), .expect_id = "SVEG+1D7qHA" },
+    .{ .name = "sceHmd2ReprojectionSetParam", .function = trace.wrap("sceHmd2ReprojectionSetParam", &services.noDevice), .expect_id = "xMo9ENEu2E0" },
+    .{ .name = "sceHmd2SetVibration", .function = trace.wrap("sceHmd2SetVibration", &services.noDevice), .expect_id = "Al4qjNREVQQ" },
+    .{ .name = "sceHmd2Initialize", .function = trace.wrap("sceHmd2Initialize", &services.noDevice), .expect_id = "c812oYs7Vsc" },
+    .{ .name = "sceHmd2ReprojectionQueryBufferSizeAlign", .function = trace.wrap("sceHmd2ReprojectionQueryBufferSizeAlign", &services.noDevice), .expect_id = "U-CnbmeyYaA" },
+    .{ .name = "sceHmd2ReprojectionQueryDisplayBufferSizeAlign", .function = trace.wrap("sceHmd2ReprojectionQueryDisplayBufferSizeAlign", &services.noDevice), .expect_id = "-C2nkoEYOnU" },
+    .{ .name = "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign", .function = trace.wrap("sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign", &services.noDevice), .expect_id = "Pb1d+j-bBSc" },
+    .{ .name = "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign", .function = trace.wrap("sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign", &services.noDevice), .expect_id = "wEO+gMHs9NU" },
+    .{ .name = "sceHmd2ReprojectionInitialize", .function = trace.wrap("sceHmd2ReprojectionInitialize", &services.noDevice), .expect_id = "C0rPwER-yxg" },
+    .{ .name = "sceHmd2ReprojectionEnableVrMode", .function = trace.wrap("sceHmd2ReprojectionEnableVrMode", &services.noDevice), .expect_id = "VVvFh51o20s" },
+    .{ .name = "sceHmd2ReprojectionSetTiming", .function = trace.wrap("sceHmd2ReprojectionSetTiming", &services.noDevice), .expect_id = "FkQX7rjFomk" },
+    .{ .name = "sceHmd2ReprojectionDisableVrMode", .function = trace.wrap("sceHmd2ReprojectionDisableVrMode", &services.noDevice), .expect_id = "wj1kOyNF4vM" },
+    .{ .name = "sceHmd2ReprojectionGetStatus", .function = trace.wrap("sceHmd2ReprojectionGetStatus", &services.noDevice), .expect_id = "8GkaY2B7opM" },
+    .{ .name = "sceHmd2ReprojectionTerminate", .function = trace.wrap("sceHmd2ReprojectionTerminate", &services.noDevice), .expect_id = "4Q11W4M2h5Q" },
+    .{ .name = "sceHmd2Close", .function = trace.wrap("sceHmd2Close", &services.noDevice), .expect_id = "oPhtjySuHa8" },
+    .{ .name = "sceHmd2Terminate", .function = trace.wrap("sceHmd2Terminate", &services.noDevice), .expect_id = "QU2M1pPNbaY" },
+    .{ .name = "sceHmd2GazeGetResult", .function = trace.wrap("sceHmd2GazeGetResult", &services.noDevice), .expect_id = "lAoFUedcfqA" },
+    .{ .name = "sceHmd2GazeGetResultForFoveatedRendering", .function = trace.wrap("sceHmd2GazeGetResultForFoveatedRendering", &services.noDevice), .expect_id = "retc+-uRMhk" },
+    .{ .name = "libSceHmd2:uv0Ae+jCeWY", .function = trace.wrap("libSceHmd2:uv0Ae+jCeWY", &services.noDevice), .id_override = "uv0Ae+jCeWY" },
+    .{ .name = "libSceHmd2:JWBl3Uq6q8k", .function = trace.wrap("libSceHmd2:JWBl3Uq6q8k", &services.noDevice), .id_override = "JWBl3Uq6q8k" },
+};
+
+pub const http_exports = [_]symbols.Export{
+    .{ .name = "sceHttpUriBuild", .function = trace.wrap("sceHttpUriBuild", &services.offline), .expect_id = "5LZA+KPISVA" },
+    .{ .name = "sceHttpAbortRequest", .function = trace.wrap("sceHttpAbortRequest", &services.offline), .expect_id = "hvG6GfBMXg8" },
+    .{ .name = "sceHttpSendRequest", .function = trace.wrap("sceHttpSendRequest", &services.offline), .expect_id = "1e2BNwI-XzE" },
+    .{ .name = "sceHttpGetLastErrno", .function = trace.wrap("sceHttpGetLastErrno", &services.offline), .expect_id = "0onIrKx9NIE" },
+    .{ .name = "sceHttpGetStatusCode", .function = trace.wrap("sceHttpGetStatusCode", &services.offline), .expect_id = "0a2TBNfE3BU" },
+    .{ .name = "sceHttpGetResponseContentLength", .function = trace.wrap("sceHttpGetResponseContentLength", &services.offline), .expect_id = "yuO2H2Uvnos" },
+    .{ .name = "sceHttpReadData", .function = trace.wrap("sceHttpReadData", &services.offline), .expect_id = "P5pdoykPYTk" },
+    .{ .name = "sceHttpWaitRequest", .function = trace.wrap("sceHttpWaitRequest", &services.offline), .expect_id = "qISjDHrxONc" },
+    .{ .name = "sceHttpDeleteRequest", .function = trace.wrap("sceHttpDeleteRequest", &services.offline), .expect_id = "qe7oZ+v4PWA" },
+    .{ .name = "sceHttpDestroyEpoll", .function = trace.wrap("sceHttpDestroyEpoll", &services.offline), .expect_id = "wYhXVfS2Et4" },
+    .{ .name = "sceHttpDeleteConnection", .function = trace.wrap("sceHttpDeleteConnection", &services.offline), .expect_id = "P6A3ytpsiYc" },
+    .{ .name = "sceHttpCreateRequestWithURL", .function = trace.wrap("sceHttpCreateRequestWithURL", &services.offline), .expect_id = "Aeu5wVKkF9w" },
+    .{ .name = "sceHttpCreateRequestWithURL2", .function = trace.wrap("sceHttpCreateRequestWithURL2", &services.offline), .expect_id = "Cnp77podkCU" },
+    .{ .name = "sceHttpSetNonblock", .function = trace.wrap("sceHttpSetNonblock", &services.offline), .expect_id = "s2-NPIvz+iA" },
+    .{ .name = "sceHttpCreateEpoll", .function = trace.wrap("sceHttpCreateEpoll", &services.offline), .expect_id = "6381dWF+xsQ" },
+    .{ .name = "sceHttpSetEpoll", .function = trace.wrap("sceHttpSetEpoll", &services.offline), .expect_id = "-xm7kZQNpHI" },
+    .{ .name = "sceHttpCreateConnectionWithURL", .function = trace.wrap("sceHttpCreateConnectionWithURL", &services.offline), .expect_id = "qgxDBjorUxs" },
+    .{ .name = "sceHttpAddRequestHeader", .function = trace.wrap("sceHttpAddRequestHeader", &services.offline), .expect_id = "EY28T2bkN7k" },
+    .{ .name = "sceHttpGetAllResponseHeaders", .function = trace.wrap("sceHttpGetAllResponseHeaders", &services.offline), .expect_id = "aCYPMSUIaP8" },
+    .{ .name = "sceHttpCreateTemplate", .function = trace.wrap("sceHttpCreateTemplate", &services.offline), .expect_id = "0gYjPTR-6cY" },
+    .{ .name = "sceHttpDeleteTemplate", .function = trace.wrap("sceHttpDeleteTemplate", &services.offline), .expect_id = "4I8vEpuEhZ8" },
+    .{ .name = "libSceHttp:Qq8SfuJJJqE", .function = trace.wrap("libSceHttp:Qq8SfuJJJqE", &services.accept), .id_override = "Qq8SfuJJJqE" },
+    .{ .name = "sceHttpSetConnectTimeOut", .function = trace.wrap("sceHttpSetConnectTimeOut", &services.accept), .expect_id = "0S9tTH0uqTU" },
+    .{ .name = "sceHttpSetRecvTimeOut", .function = trace.wrap("sceHttpSetRecvTimeOut", &services.accept), .expect_id = "yigr4V0-HTM" },
+    .{ .name = "sceHttpSetSendTimeOut", .function = trace.wrap("sceHttpSetSendTimeOut", &services.accept), .expect_id = "xegFfZKBVlw" },
+    .{ .name = "libSceHttp:DK+GoXCNT04", .function = trace.wrap("libSceHttp:DK+GoXCNT04", &services.accept), .id_override = "DK+GoXCNT04" },
+};
+
+pub const imedialog_exports = [_]symbols.Export{
+    .{ .name = "sceImeDialogGetPanelSizeExtended", .function = trace.wrap("sceImeDialogGetPanelSizeExtended", &dialogs.imeDialogGetPanelSizeExtended), .expect_id = "CRD+jSErEJQ" },
+};
+
+pub const json2_exports = [_]symbols.Export{
+    .{ .name = "_ZN3sce4Json6ObjectC1Ev", .function = trace.wrap("_ZN3sce4Json6ObjectC1Ev", &json.objectConstruct), .expect_id = "OJPTonqdg0I" },
+    .{ .name = "_ZN3sce4Json6StringC1EPKc", .function = trace.wrap("_ZN3sce4Json6StringC1EPKc", &json.stringConstructFromText), .expect_id = "9KUZFjI1IxA" },
+    .{ .name = "_ZN3sce4Json5ValueC1ERKNS0_6StringE", .function = trace.wrap("_ZN3sce4Json5ValueC1ERKNS0_6StringE", &services.absent), .expect_id = "sZIoMRGO+jk" },
+    .{ .name = "_ZN3sce4Json6ObjectixERKNS0_6StringE", .function = trace.wrap("_ZN3sce4Json6ObjectixERKNS0_6StringE", &json.objectSubscript), .expect_id = "ERuf9y0DY84" },
+    .{ .name = "_ZN3sce4Json5ValueaSERKS1_", .function = trace.wrap("_ZN3sce4Json5ValueaSERKS1_", &json.valueCopyAssign), .expect_id = "4zrm6VrgIAw" },
+    .{ .name = "_ZN3sce4Json6StringD1Ev", .function = trace.wrap("_ZN3sce4Json6StringD1Ev", &json.stringDestruct), .expect_id = "cG1VE2HMl6c" },
+    .{ .name = "_ZN3sce4Json5ValueD1Ev", .function = trace.wrap("_ZN3sce4Json5ValueD1Ev", &json.valueDestruct), .expect_id = "WTtYf+cNnXI" },
+    .{ .name = "_ZN3sce4Json6ObjectC1ERKS1_", .function = trace.wrap("_ZN3sce4Json6ObjectC1ERKS1_", &json.objectCopyConstruct), .expect_id = "a+W7HHlwpBs" },
+    .{ .name = "_ZN3sce4Json6ObjectD1Ev", .function = trace.wrap("_ZN3sce4Json6ObjectD1Ev", &json.objectDestruct), .expect_id = "5JmzZt8twAo" },
+    .{ .name = "_ZN3sce4Json5ValueC1Ev", .function = trace.wrap("_ZN3sce4Json5ValueC1Ev", &json.valueConstruct), .expect_id = "qBMjqyBn3OM" },
+    .{ .name = "_ZN3sce4Json6Parser5parseERNS0_5ValueEPKcm", .function = trace.wrap("_ZN3sce4Json6Parser5parseERNS0_5ValueEPKcm", &json.parserParse), .expect_id = "S5JxQnoGF3E" },
+    .{ .name = "_ZNK3sce4Json5ValueixEPKc", .function = trace.wrap("_ZNK3sce4Json5ValueixEPKc", &json.valueSubscriptName), .expect_id = "HwDt5lD9Bfo" },
+    .{ .name = "_ZNK3sce4Json5Value9getStringEv", .function = trace.wrap("_ZNK3sce4Json5Value9getStringEv", &json.valueGetString), .expect_id = "epJ6x2LV0kU" },
+    .{ .name = "_ZNK3sce4Json6String5c_strEv", .function = trace.wrap("_ZNK3sce4Json6String5c_strEv", &json.stringCStr), .expect_id = "L1KAkYWml-M" },
+    // JSON's process-wide bootstrap owns no guest-visible result handles. The
+    // offline CppWebApi module still initializes it before deciding that no
+    // network service is available, so returning ENOSYS here aborts the whole
+    // Unity plug-in bootstrap instead of selecting that offline path.
+    .{ .name = "_ZN3sce4Json12MemAllocatorC2Ev", .function = trace.wrap("_ZN3sce4Json12MemAllocatorC2Ev", &services.accept), .expect_id = "-hJRce8wn1U" },
+    .{ .name = "_ZN3sce4Json14InitParameter2C1Ev", .function = trace.wrap("_ZN3sce4Json14InitParameter2C1Ev", &services.accept), .expect_id = "WSOuge5IsCg" },
+    .{ .name = "_ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv", .function = trace.wrap("_ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv", &services.accept), .expect_id = "I2QC8PYhJWY" },
+    .{ .name = "_ZN3sce4Json14InitParameter217setFileBufferSizeEm", .function = trace.wrap("_ZN3sce4Json14InitParameter217setFileBufferSizeEm", &services.accept), .expect_id = "Eu95jmqn5Rw" },
+    .{ .name = "_ZN3sce4Json11InitializerC1Ev", .function = trace.wrap("_ZN3sce4Json11InitializerC1Ev", &services.accept), .expect_id = "cK6bYHf-Q5E" },
+    .{ .name = "_ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E", .function = trace.wrap("_ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E", &services.accept), .expect_id = "IXW-z8pggfg" },
+    .{ .name = "_ZN3sce4Json11Initializer9terminateEv", .function = trace.wrap("_ZN3sce4Json11Initializer9terminateEv", &services.accept), .expect_id = "PR5k1penBLM" },
+    .{ .name = "_ZN3sce4Json11InitializerD1Ev", .function = trace.wrap("_ZN3sce4Json11InitializerD1Ev", &services.accept), .expect_id = "RujUxbr3haM" },
+    .{ .name = "_ZN3sce4Json12MemAllocatorD2Ev", .function = trace.wrap("_ZN3sce4Json12MemAllocatorD2Ev", &services.accept), .expect_id = "OcAgPxcq5Vk" },
+};
+
+pub const net_exports = [_]symbols.Export{
+    .{ .name = "sceNetInetNtop", .function = trace.wrap("sceNetInetNtop", &services.offline), .expect_id = "9vA2aW+CHuA" },
+    .{ .name = "sceNetGetMacAddress", .function = trace.wrap("sceNetGetMacAddress", &services.offline), .expect_id = "6Oc0bLsIYe0" },
+    .{ .name = "sceNetGetSockInfo", .function = trace.wrap("sceNetGetSockInfo", &services.offline), .expect_id = "hLuXdjHnhiI" },
+    .{ .name = "sceNetResolverStartNtoaMultipleRecords", .function = trace.wrap("sceNetResolverStartNtoaMultipleRecords", &services.offline), .expect_id = "RCCY01Xd+58" },
+    .{ .name = "sceNetResolverStartAton", .function = trace.wrap("sceNetResolverStartAton", &services.offline), .expect_id = "Apb4YDxKsRI" },
+};
+
+pub const npauth_exports = [_]symbols.Export{
+    .{ .name = "sceNpAuthPollAsync", .function = trace.wrap("sceNpAuthPollAsync", &services.offline), .expect_id = "gjSyfzSsDcE" },
+    .{ .name = "sceNpAuthDeleteRequest", .function = trace.wrap("sceNpAuthDeleteRequest", &services.offline), .expect_id = "H8wG9Bk-nPc" },
+    .{ .name = "sceNpAuthCreateAsyncRequest", .function = trace.wrap("sceNpAuthCreateAsyncRequest", &services.offline), .expect_id = "N+mr7GjTvr8" },
+    .{ .name = "sceNpAuthGetAuthorizationCodeV3", .function = trace.wrap("sceNpAuthGetAuthorizationCodeV3", &services.offline), .expect_id = "KI4dHLlTNl0" },
+    .{ .name = "sceNpAuthGetIdTokenV3", .function = trace.wrap("sceNpAuthGetIdTokenV3", &services.offline), .expect_id = "RdsFVsgSpZY" },
+};
+
+pub const npcommerce_exports = [_]symbols.Export{
+    .{ .name = "sceNpCommerceDialogUpdateStatus", .function = trace.wrap("sceNpCommerceDialogUpdateStatus", &services.offline), .expect_id = "LR5cwFMMCVE" },
+    .{ .name = "sceNpCommerceDialogGetResult", .function = trace.wrap("sceNpCommerceDialogGetResult", &services.offline), .expect_id = "r42bWcQbtZY" },
+    .{ .name = "sceNpCommerceDialogTerminate", .function = trace.wrap("sceNpCommerceDialogTerminate", &services.offline), .expect_id = "m-I92Ab50W8" },
+    .{ .name = "sceNpCommerceDialogInitialize", .function = trace.wrap("sceNpCommerceDialogInitialize", &services.offline), .expect_id = "0aR2aWmQal4" },
+    .{ .name = "sceNpCommerceDialogOpen", .function = trace.wrap("sceNpCommerceDialogOpen", &services.offline), .expect_id = "DfSCDRA3EjY" },
+    .{ .name = "sceNpCommerceShowPsStoreIcon", .function = trace.wrap("sceNpCommerceShowPsStoreIcon", &services.offline), .expect_id = "DHmwsa6S8Tc" },
+    .{ .name = "sceNpCommerceHidePsStoreIcon", .function = trace.wrap("sceNpCommerceHidePsStoreIcon", &services.offline), .expect_id = "dsqCVsNM0Zg" },
+};
+
+pub const npentitlementaccess_exports = [_]symbols.Export{
+    .{ .name = "sceNpEntitlementAccessPollUnifiedEntitlementInfoList", .function = trace.wrap("sceNpEntitlementAccessPollUnifiedEntitlementInfoList", &services.offline), .expect_id = "nAEqawEZG5s" },
+    .{ .name = "sceNpEntitlementAccessDeleteRequest", .function = trace.wrap("sceNpEntitlementAccessDeleteRequest", &services.offline), .expect_id = "Z0eQj8m7XA8" },
+    .{ .name = "sceNpEntitlementAccessPollServiceEntitlementInfoList", .function = trace.wrap("sceNpEntitlementAccessPollServiceEntitlementInfoList", &services.offline), .expect_id = "aFv8qms6XTM" },
+    .{ .name = "sceNpEntitlementAccessRequestUnifiedEntitlementInfoList", .function = trace.wrap("sceNpEntitlementAccessRequestUnifiedEntitlementInfoList", &services.offline), .expect_id = "uCZf2L27th8" },
+    .{ .name = "sceNpEntitlementAccessRequestServiceEntitlementInfoList", .function = trace.wrap("sceNpEntitlementAccessRequestServiceEntitlementInfoList", &services.offline), .expect_id = "brbRxzr7qyI" },
+    .{ .name = "sceNpEntitlementAccessInitialize", .function = trace.wrap("sceNpEntitlementAccessInitialize", &services.npEntitlementAccessInitialize), .expect_id = "jO8DM8oyego" },
+};
+
+pub const npgameintent_exports = [_]symbols.Export{
+    .{ .name = "sceNpGameIntentTerminate", .function = trace.wrap("sceNpGameIntentTerminate", &services.npGameIntentTerminate), .expect_id = "0HBYxYAjmf0" },
+    .{ .name = "sceNpGameIntentInitialize", .function = trace.wrap("sceNpGameIntentInitialize", &services.npGameIntentInitialize), .expect_id = "m87BHxt-H60" },
+    .{ .name = "sceNpGameIntentReceiveIntent", .function = trace.wrap("sceNpGameIntentReceiveIntent", &services.npGameIntentReceiveIntent), .expect_id = "jEIXUAr9XE8" },
+    .{ .name = "sceNpGameIntentGetPropertyValueString", .function = trace.wrap("sceNpGameIntentGetPropertyValueString", &services.npGameIntentGetPropertyValueString), .expect_id = "rPl0INNc-M8" },
+};
+
+pub const npmanager_exports = [_]symbols.Export{
+    .{ .name = "sceNpNotifyPremiumFeature", .function = trace.wrap("sceNpNotifyPremiumFeature", &services.offline), .expect_id = "P6piso307SE" },
+    // Polling an empty callback queue is a successful no-op. Returning ENOSYS
+    // makes Unity's frontend treat normal offline polling as a service fault.
+    .{ .name = "sceNpCheckCallback", .function = trace.wrap("sceNpCheckCallback", &services.accept), .expect_id = "3Zl8BePTh9Y" },
+    .{ .name = "sceNpCreateRequest", .function = trace.wrap("sceNpCreateRequest", &services.npCreateRequest), .expect_id = "GpLQDNKICac" },
+    .{ .name = "sceNpCheckPremium", .function = trace.wrap("sceNpCheckPremium", &services.offline), .expect_id = "O80NrhUOPGY" },
+    .{ .name = "sceNpDeleteRequest", .function = trace.wrap("sceNpDeleteRequest", &services.npDeleteRequest), .expect_id = "S7QTn72PrDw" },
+    .{ .name = "sceNpGetUserIdByAccountId", .function = trace.wrap("sceNpGetUserIdByAccountId", &services.offline), .expect_id = "VgYczPGB5ss" },
+    .{ .name = "sceNpGetOnlineId", .function = trace.wrap("sceNpGetOnlineId", &services.npGetOnlineId), .expect_id = "XDncXQIJUSk" },
+    // Registration itself is local and succeeds on an offline console.  No
+    // callback is delivered until the NP state changes, which cannot happen in
+    // the emulator's stable offline profile.
+    .{ .name = "sceNpRegisterStateCallbackA", .function = trace.wrap("sceNpRegisterStateCallbackA", &services.accept), .expect_id = "qQJfO8HAiaY" },
+    .{ .name = "sceNpRegisterNpReachabilityStateCallback", .function = trace.wrap("sceNpRegisterNpReachabilityStateCallback", &services.accept), .expect_id = "hw5KNqAAels" },
+    .{ .name = "sceNpCheckNpReachability", .function = trace.wrap("sceNpCheckNpReachability", &services.offline), .expect_id = "KfGZg2y73oM" },
+    .{ .name = "sceNpHasSignedUp", .function = trace.wrap("sceNpHasSignedUp", &services.offline), .expect_id = "Oad3rvY-NJQ" },
+};
+
+pub const npsessionsignaling_exports = [_]symbols.Export{
+    .{ .name = "sceNpSessionSignalingTerminate", .function = trace.wrap("sceNpSessionSignalingTerminate", &services.accept), .expect_id = "CqJuNXo5yiM" },
+    .{ .name = "sceNpSessionSignalingInitialize", .function = trace.wrap("sceNpSessionSignalingInitialize", &services.npSessionSignalingInitialize), .expect_id = "ysmw6J-P8Ak" },
+    .{ .name = "sceNpSessionSignalingCreateContext2", .function = trace.wrap("sceNpSessionSignalingCreateContext2", &services.offline), .expect_id = "aBuX0PX-T7I" },
+    .{ .name = "sceNpSessionSignalingDestroyContext", .function = trace.wrap("sceNpSessionSignalingDestroyContext", &services.offline), .expect_id = "Z9Q9LzQDXf0" },
+    .{ .name = "sceNpSessionSignalingDeactivate", .function = trace.wrap("sceNpSessionSignalingDeactivate", &services.offline), .expect_id = "cQkBH-pXhF0" },
+    .{ .name = "sceNpSessionSignalingGetConnectionInfo", .function = trace.wrap("sceNpSessionSignalingGetConnectionInfo", &services.offline), .expect_id = "yJw2m6UWDYU" },
+    .{ .name = "sceNpSessionSignalingGetConnectionStatus", .function = trace.wrap("sceNpSessionSignalingGetConnectionStatus", &services.offline), .expect_id = "n1fn2KFeLDA" },
+    .{ .name = "sceNpSessionSignalingActivateSession", .function = trace.wrap("sceNpSessionSignalingActivateSession", &services.offline), .expect_id = "r4XacqHvkn4" },
+};
+
+pub const nptrophy2_exports = [_]symbols.Export{
+    .{ .name = "sceNpTrophy2CreateContext", .function = trace.wrap("sceNpTrophy2CreateContext", &services.npTrophy2CreateContext), .expect_id = "Bagshr7OQ6Q" },
+    .{ .name = "sceNpTrophy2CreateHandle", .function = trace.wrap("sceNpTrophy2CreateHandle", &services.npTrophy2CreateHandle), .expect_id = "Gz1rmUZpROM" },
+    .{ .name = "sceNpTrophy2RegisterContext", .function = trace.wrap("sceNpTrophy2RegisterContext", &services.accept), .expect_id = "bIDov3wBu5Q" },
+    .{ .name = "sceNpTrophy2DestroyContext", .function = trace.wrap("sceNpTrophy2DestroyContext", &services.accept), .expect_id = "sysY2FHYff4" },
+    .{ .name = "sceNpTrophy2DestroyHandle", .function = trace.wrap("sceNpTrophy2DestroyHandle", &services.accept), .expect_id = "d8P11CI40KE" },
+    .{ .name = "sceNpTrophy2GetGameInfo", .function = trace.wrap("sceNpTrophy2GetGameInfo", &services.npTrophy2GetGameInfo), .expect_id = "4IzqhhUQ3nk" },
+    .{ .name = "sceNpTrophy2GetTrophyInfoArray", .function = trace.wrap("sceNpTrophy2GetTrophyInfoArray", &services.offline), .expect_id = "y3zHpdZO6ME" },
+    .{ .name = "sceNpTrophy2RegisterUnlockCallback", .function = trace.wrap("sceNpTrophy2RegisterUnlockCallback", &services.accept), .expect_id = "sUXGfNMalIo" },
+    .{ .name = "sceNpTrophy2UnregisterUnlockCallback", .function = trace.wrap("sceNpTrophy2UnregisterUnlockCallback", &services.accept), .expect_id = "wVqxM58sIKs" },
+};
+
+pub const npuniversaldatasystem_exports = [_]symbols.Export{
+    .{ .name = "sceNpUniversalDataSystemRegisterContext", .function = trace.wrap("sceNpUniversalDataSystemRegisterContext", &services.accept), .expect_id = "tpFJ8LIKvPw" },
+    .{ .name = "sceNpUniversalDataSystemDestroyHandle", .function = trace.wrap("sceNpUniversalDataSystemDestroyHandle", &services.accept), .expect_id = "AUIHb7jUX3I" },
+    .{ .name = "sceNpUniversalDataSystemDestroyContext", .function = trace.wrap("sceNpUniversalDataSystemDestroyContext", &services.accept), .expect_id = "wB7IWzGp2v0" },
+    .{ .name = "sceNpUniversalDataSystemPostEvent", .function = trace.wrap("sceNpUniversalDataSystemPostEvent", &services.accept), .expect_id = "CzkKf7ahIyU" },
+    .{ .name = "sceNpUniversalDataSystemDestroyEvent", .function = trace.wrap("sceNpUniversalDataSystemDestroyEvent", &services.accept), .expect_id = "wG+84pnNIuo" },
+    .{ .name = "sceNpUniversalDataSystemCreateEvent", .function = trace.wrap("sceNpUniversalDataSystemCreateEvent", &services.udsCreateEvent), .expect_id = "p+GcLqwpL9M" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetInt32", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetInt32", &services.accept), .expect_id = "YE4dbtbz6OE" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetUInt32", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetUInt32", &services.accept), .expect_id = "AzD4irAcKE4" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetInt64", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetInt64", &services.accept), .expect_id = "56QLTqx911s" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetUInt64", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetUInt64", &services.accept), .expect_id = "xvsP5Yz6FmY" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetFloat64", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetFloat64", &services.accept), .expect_id = "4Fu8tHW+u-k" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetString", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetString", &services.accept), .expect_id = "MfDb+4Nln64" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetFloat32", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetFloat32", &services.accept), .expect_id = "lbPlT4+QVcE" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetBool", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetBool", &services.accept), .expect_id = "Fidd8vWgyVE" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetArray", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetArray", &services.accept), .expect_id = "Wxbg5x3pTXA" },
+    .{ .name = "sceNpUniversalDataSystemDestroyEventPropertyArray", .function = trace.wrap("sceNpUniversalDataSystemDestroyEventPropertyArray", &services.accept), .expect_id = "W-0xwY0ZMjw" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyObjectSetObject", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyObjectSetObject", &services.accept), .expect_id = "74ASEqxSnkM" },
+    .{ .name = "sceNpUniversalDataSystemDestroyEventPropertyObject", .function = trace.wrap("sceNpUniversalDataSystemDestroyEventPropertyObject", &services.accept), .expect_id = "kKUH0Viib3c" },
+    .{ .name = "sceNpUniversalDataSystemCreateEventPropertyArray", .function = trace.wrap("sceNpUniversalDataSystemCreateEventPropertyArray", &services.accept), .expect_id = "Hm7qubT3b70" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyArraySetBool", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyArraySetBool", &services.accept), .expect_id = "0+l4QSWCM4E" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyArraySetString", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyArraySetString", &services.accept), .expect_id = "4llLk7YJRTE" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyArraySetFloat32", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyArraySetFloat32", &services.accept), .expect_id = "JmgwKm96Lq4" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyArraySetArray", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyArraySetArray", &services.accept), .expect_id = "rdi9BAfDLq8" },
+    .{ .name = "sceNpUniversalDataSystemEventPropertyArraySetObject", .function = trace.wrap("sceNpUniversalDataSystemEventPropertyArraySetObject", &services.accept), .expect_id = "XY14n3jNIpE" },
+    .{ .name = "sceNpUniversalDataSystemCreateEventPropertyObject", .function = trace.wrap("sceNpUniversalDataSystemCreateEventPropertyObject", &services.accept), .expect_id = "s6W4Zl4Slgk" },
+    .{ .name = "sceNpUniversalDataSystemInitialize", .function = trace.wrap("sceNpUniversalDataSystemInitialize", &services.udsInitialize), .expect_id = "sjaobBgqeB4" },
+    .{ .name = "sceNpUniversalDataSystemTerminate", .function = trace.wrap("sceNpUniversalDataSystemTerminate", &services.accept), .expect_id = "47UAEuQl+iI" },
+    .{ .name = "sceNpUniversalDataSystemCreateContext", .function = trace.wrap("sceNpUniversalDataSystemCreateContext", &services.udsCreateContext), .expect_id = "5zBnau1uIEo" },
+    .{ .name = "sceNpUniversalDataSystemCreateHandle", .function = trace.wrap("sceNpUniversalDataSystemCreateHandle", &services.udsCreateHandle), .expect_id = "hT0IAEvN+M0" },
+};
+
+pub const npwebapi2_exports = [_]symbols.Export{
+    .{ .name = "sceNpWebApi2SetRequestTimeout", .function = trace.wrap("sceNpWebApi2SetRequestTimeout", &services.accept), .expect_id = "TjAutbrkr60" },
+    .{ .name = "sceNpWebApi2PushEventCreateFilter", .function = trace.wrap("sceNpWebApi2PushEventCreateFilter", &services.npWebApi2PushEventCreateHandle), .expect_id = "MsaFhR+lPE4" },
+    .{ .name = "sceNpWebApi2PushEventDeleteFilter", .function = trace.wrap("sceNpWebApi2PushEventDeleteFilter", &services.accept), .expect_id = "KJdPcOGmK58" },
+    .{ .name = "sceNpWebApi2PushEventUnregisterCallback", .function = trace.wrap("sceNpWebApi2PushEventUnregisterCallback", &services.accept), .expect_id = "hOnIlcGrO6g" },
+    .{ .name = "sceNpWebApi2PushEventRegisterCallback", .function = trace.wrap("sceNpWebApi2PushEventRegisterCallback", &services.accept), .expect_id = "fY3QqeNkF8k" },
+    .{ .name = "sceNpWebApi2PushEventDeletePushContext", .function = trace.wrap("sceNpWebApi2PushEventDeletePushContext", &services.accept), .expect_id = "QafxeZM3WK4" },
+    .{ .name = "sceNpWebApi2PushEventUnregisterPushContextCallback", .function = trace.wrap("sceNpWebApi2PushEventUnregisterPushContextCallback", &services.accept), .expect_id = "PmyrbbJSFz0" },
+    .{ .name = "sceNpWebApi2PushEventRegisterPushContextCallback", .function = trace.wrap("sceNpWebApi2PushEventRegisterPushContextCallback", &services.accept), .expect_id = "lxtHJMwBsaU" },
+    .{ .name = "sceNpWebApi2PushEventCreatePushContext", .function = trace.wrap("sceNpWebApi2PushEventCreatePushContext", &services.npWebApi2PushEventCreateHandle), .expect_id = "NNVf18SlbT8" },
+    .{ .name = "sceNpWebApi2PushEventStartPushContextCallback", .function = trace.wrap("sceNpWebApi2PushEventStartPushContextCallback", &services.accept), .expect_id = "AAj9X+4aGYA" },
+    .{ .name = "sceNpWebApi2PushEventCreateHandle", .function = trace.wrap("sceNpWebApi2PushEventCreateHandle", &services.npWebApi2PushEventCreateHandle), .expect_id = "WV1GwM32NgY" },
+};
+
+pub const pad_exports = [_]symbols.Export{
+    .{ .name = "scePadVrControllerReadState", .function = trace.wrap("scePadVrControllerReadState", &services.noDevice), .expect_id = "iA-DdobUen8" },
+    .{ .name = "scePadVrControllerGetDeviceInformation", .function = trace.wrap("scePadVrControllerGetDeviceInformation", &services.noDevice), .expect_id = "mbJHDdjhVeY" },
+    .{ .name = "scePadVrControllerGetTriggerEffectState", .function = trace.wrap("scePadVrControllerGetTriggerEffectState", &services.noDevice), .expect_id = "OL2CJ2idmhk" },
+    .{ .name = "scePadVrControllerSetTriggerEffects", .function = trace.wrap("scePadVrControllerSetTriggerEffects", &services.noDevice), .expect_id = "v8P+9PRqg10" },
+    .{ .name = "scePadVrControllerSetTriggerEffect", .function = trace.wrap("scePadVrControllerSetTriggerEffect", &services.noDevice), .expect_id = "6Cdc9bbjrRY" },
+    .{ .name = "scePadVrControllerSetVibrationMode", .function = trace.wrap("scePadVrControllerSetVibrationMode", &services.noDevice), .expect_id = "Wf6-PNCyY20" },
+    .{ .name = "scePadVrControllerSetVibration", .function = trace.wrap("scePadVrControllerSetVibration", &services.noDevice), .expect_id = "DGCwN1Lmmys" },
+    .{ .name = "libScePad:306mCg0ibh8", .function = trace.wrap("libScePad:306mCg0ibh8", &services.accept), .id_override = "306mCg0ibh8" },
+};
+
+pub const jpegdec_exports = [_]symbols.Export{
+    .{ .name = "sceJpegDecParseHeader", .function = trace.wrap("sceJpegDecParseHeader", &services.accept), .expect_id = "LSinoSQH790" },
+    .{ .name = "sceJpegDecQueryMemorySize", .function = trace.wrap("sceJpegDecQueryMemorySize", &services.accept), .expect_id = "uNAUmANZMEw" },
+    .{ .name = "sceJpegDecCreate", .function = trace.wrap("sceJpegDecCreate", &services.accept), .expect_id = "JPh3Zgg0Zwc" },
+    .{ .name = "sceJpegDecDecode", .function = trace.wrap("sceJpegDecDecode", &services.absent), .expect_id = "1kzQRoWEgSA" },
+    .{ .name = "sceJpegDecDelete", .function = trace.wrap("sceJpegDecDelete", &services.accept), .expect_id = "Hwh11+m5KoI" },
+};
+
+pub const convert_keycode_exports = [_]symbols.Export{
+    .{ .name = "libSceConvertKeycode:mUuUOWI-C+0", .function = trace.wrap("libSceConvertKeycode:mUuUOWI-C+0", &services.accept), .id_override = "mUuUOWI-C+0" },
+    .{ .name = "sceConvertKeycodeGetVirtualKeycode", .function = trace.wrap("sceConvertKeycodeGetVirtualKeycode", &services.accept), .expect_id = "vIsoJsLvvlM" },
+};
+
+pub const razorcpu_exports = [_]symbols.Export{
+    .{ .name = "sceRazorCpuPushMarker", .function = trace.wrap("sceRazorCpuPushMarker", &services.accept), .expect_id = "zw+celG7zSI" },
+    .{ .name = "sceRazorCpuPopMarker", .function = trace.wrap("sceRazorCpuPopMarker", &services.accept), .expect_id = "YpkGsMXP3ew" },
+    .{ .name = "sceRazorCpuPushMarkerStatic", .function = trace.wrap("sceRazorCpuPushMarkerStatic", &services.accept), .expect_id = "uZrOwuNJX-M" },
+};
+
+pub const playgo_exports = [_]symbols.Export{
+    .{ .name = "scePlayGoInitialize", .function = trace.wrap("scePlayGoInitialize", &playgo.initialize), .expect_id = "ts6GlZOKRrE" },
+    .{ .name = "scePlayGoOpen", .function = trace.wrap("scePlayGoOpen", &playgo.open), .expect_id = "M1Gma1ocrGE" },
+    .{ .name = "scePlayGoTerminate", .function = trace.wrap("scePlayGoTerminate", &playgo.terminate), .expect_id = "MPe0EeBGM-E" },
+    .{ .name = "scePlayGoClose", .function = trace.wrap("scePlayGoClose", &playgo.close), .expect_id = "Uco1I0dlDi8" },
+    .{ .name = "scePlayGoGetLocus", .function = trace.wrap("scePlayGoGetLocus", &playgo.getLocus), .expect_id = "uWIYLFkkwqk" },
+    .{ .name = "scePlayGoGetEta", .function = trace.wrap("scePlayGoGetEta", &playgo.getEta), .expect_id = "v6EZ-YWRdMs" },
+    .{ .name = "scePlayGoGetProgress", .function = trace.wrap("scePlayGoGetProgress", &playgo.getProgress), .expect_id = "-RJWNMK3fC8" },
+    .{ .name = "scePlayGoSetInstallSpeed", .function = trace.wrap("scePlayGoSetInstallSpeed", &playgo.setInstallSpeed), .expect_id = "4AAcTU9R3XM" },
+    .{ .name = "scePlayGoPrefetch", .function = trace.wrap("scePlayGoPrefetch", &playgo.prefetch), .expect_id = "-Q1-u1a7p0g" },
+    .{ .name = "scePlayGoGetInstallSpeed", .function = trace.wrap("scePlayGoGetInstallSpeed", &playgo.getInstallSpeed), .expect_id = "rvBSfTimejE" },
+    .{ .name = "scePlayGoGetLanguageMask", .function = trace.wrap("scePlayGoGetLanguageMask", &playgo.getLanguageMask), .expect_id = "3OMbYZBaa50" },
+    .{ .name = "scePlayGoGetToDoList", .function = trace.wrap("scePlayGoGetToDoList", &playgo.getToDoList), .expect_id = "Nn7zKwnA5q0" },
+    .{ .name = "scePlayGoSetToDoList", .function = trace.wrap("scePlayGoSetToDoList", &playgo.setToDoList), .expect_id = "gUPGiOQ1tmQ" },
+    .{ .name = "scePlayGoGetChunkId", .function = trace.wrap("scePlayGoGetChunkId", &playgo.getChunkId), .expect_id = "73fF1MFU8hA" },
+    .{ .name = "scePlayGoGetInstallChunkId", .function = trace.wrap("scePlayGoGetInstallChunkId", &playgo.getInstallChunkId), .expect_id = "8-e7E989rCU" },
+    .{ .name = "scePlayGoGetOptionalChunk", .function = trace.wrap("scePlayGoGetOptionalChunk", &playgo.getOptionalChunk), .expect_id = "g4AZyxpSAlA" },
+    .{ .name = "scePlayGoGetSupportedOptionalChunk", .function = trace.wrap("scePlayGoGetSupportedOptionalChunk", &playgo.getSupportedOptionalChunk), .expect_id = "IfiN+-oeVWI" },
+    .{ .name = "scePlayGoPrefetchOptionalChunk", .function = trace.wrap("scePlayGoPrefetchOptionalChunk", &playgo.prefetchOptionalChunk), .expect_id = "HVAa744ecdw" },
+};
+
+pub const playerinvitationdialog_exports = [_]symbols.Export{
+    .{ .name = "scePlayerInvitationDialogUpdateStatus", .function = trace.wrap("scePlayerInvitationDialogUpdateStatus", &services.offline), .expect_id = "kFhuwHrIUqs" },
+    .{ .name = "scePlayerInvitationDialogTerminate", .function = trace.wrap("scePlayerInvitationDialogTerminate", &services.offline), .expect_id = "gDm5a6GSE94" },
+    .{ .name = "scePlayerInvitationDialogInitialize", .function = trace.wrap("scePlayerInvitationDialogInitialize", &services.offline), .expect_id = "JDwx3Bl4bB4" },
+    .{ .name = "scePlayerInvitationDialogOpen", .function = trace.wrap("scePlayerInvitationDialogOpen", &services.offline), .expect_id = "rKPTlHwGa4k" },
+};
+
+pub const rtc_exports = [_]symbols.Export{
+    .{ .name = "sceRtcGetCurrentClockLocalTime", .function = trace.wrap("sceRtcGetCurrentClockLocalTime", &platform_services.rtcGetCurrentClockLocalTime), .expect_id = "ZPD1YOKI+Kw" },
+    .{ .name = "sceRtcSetTick", .function = trace.wrap("sceRtcSetTick", &platform_services.rtcSetTick), .expect_id = "ueega6v3GUw" },
+    .{ .name = "sceRtcGetTickResolution", .function = trace.wrap("sceRtcGetTickResolution", &platform_services.rtcGetTickResolution), .expect_id = "jMNwqYr4R-k" },
+    .{ .name = "sceRtcIsLeapYear", .function = trace.wrap("sceRtcIsLeapYear", &platform_services.rtcIsLeapYear), .expect_id = "Ug8pCwQvh0c" },
+    .{ .name = "sceRtcGetDayOfWeek", .function = trace.wrap("sceRtcGetDayOfWeek", &platform_services.rtcGetDayOfWeek), .expect_id = "CyIK-i4XdgQ" },
+    .{ .name = "sceRtcGetTick", .function = trace.wrap("sceRtcGetTick", &platform_services.rtcGetTick), .expect_id = "8w-H19ip48I" },
+    .{ .name = "sceRtcGetTime_t", .function = trace.wrap("sceRtcGetTime_t", &platform_services.rtcGetTimeT), .expect_id = "BtqmpTRXHgk" },
+    .{ .name = "sceRtcTickAddDays", .function = trace.wrap("sceRtcTickAddDays", &platform_services.rtcTickAddDays), .expect_id = "NR1J0N7L2xY" },
+    .{ .name = "sceRtcConvertUtcToLocalTime", .function = trace.wrap("sceRtcConvertUtcToLocalTime", &platform_services.rtcConvertUtcToLocalTime), .expect_id = "M1TvFst-jrM" },
+    .{ .name = "sceRtcSetTime_t", .function = trace.wrap("sceRtcSetTime_t", &platform_services.rtcSetTimeT), .expect_id = "bDEVVP4bTjQ" },
+    .{ .name = "sceRtcConvertLocalTimeToUtc", .function = trace.wrap("sceRtcConvertLocalTimeToUtc", &platform_services.rtcConvertLocalTimeToUtc), .expect_id = "8Yr143yEnRo" },
+};
+
+pub const savedatadialog_native_exports = [_]symbols.Export{
+    .{ .name = "sceSaveDataDialogTerminate", .function = trace.wrap("sceSaveDataDialogTerminate", &services.absent), .expect_id = "YuH2FA7azqQ" },
+    .{ .name = "sceSaveDataDialogOpen", .function = trace.wrap("sceSaveDataDialogOpen", &services.absent), .expect_id = "4tPhsP6FpDI" },
+    .{ .name = "sceSaveDataDialogUpdateStatus", .function = trace.wrap("sceSaveDataDialogUpdateStatus", &services.absent), .expect_id = "KK3Bdg1RWK0" },
+    .{ .name = "sceSaveDataDialogGetResult", .function = trace.wrap("sceSaveDataDialogGetResult", &services.absent), .expect_id = "yEiJ-qqr6Cg" },
+    .{ .name = "sceSaveDataDialogInitialize", .function = trace.wrap("sceSaveDataDialogInitialize", &services.absent), .expect_id = "s9e3+YpRnzw" },
+    .{ .name = "sceSaveDataDialogGetStatus", .function = trace.wrap("sceSaveDataDialogGetStatus", &services.saveDataDialogFinished), .expect_id = "ERKzksauAJA" },
+    .{ .name = "sceSaveDataDialogIsReadyToDisplay", .function = trace.wrap("sceSaveDataDialogIsReadyToDisplay", &services.saveDataDialogReady), .expect_id = "en7gNVnh878" },
+    .{ .name = "sceSaveDataDialogClose", .function = trace.wrap("sceSaveDataDialogClose", &services.accept), .expect_id = "fH46Lag88XY" },
+    .{ .name = "sceSaveDataDialogProgressBarInc", .function = trace.wrap("sceSaveDataDialogProgressBarInc", &services.accept), .expect_id = "V-uEeFKARJU" },
+    .{ .name = "sceSaveDataDialogProgressBarSetValue", .function = trace.wrap("sceSaveDataDialogProgressBarSetValue", &services.accept), .expect_id = "hay1CfTmLyA" },
+};
+
+pub const savedata_native_exports = [_]symbols.Export{
+    .{ .name = "sceSaveDataDelete", .function = trace.wrap("sceSaveDataDelete", &services.absent), .expect_id = "S1GkePI17zQ" },
+    .{ .name = "sceSaveDataGetMountInfo", .function = trace.wrap("sceSaveDataGetMountInfo", &services.absent), .expect_id = "65VH0Qaaz6s" },
+    .{ .name = "sceSaveDataSaveIcon", .function = trace.wrap("sceSaveDataSaveIcon", &services.absent), .expect_id = "c88Yy54Mx0w" },
+    .{ .name = "sceSaveDataSetParam", .function = trace.wrap("sceSaveDataSetParam", &services.absent), .expect_id = "85zul--eGXs" },
+    .{ .name = "sceSaveDataTerminate", .function = trace.wrap("sceSaveDataTerminate", &services.absent), .expect_id = "yKDy8S5yLA0" },
+    .{ .name = "sceSaveDataCreateTransactionResource", .function = trace.wrap("sceSaveDataCreateTransactionResource", &services.absent), .expect_id = "gjRZNnw0JPE" },
+    .{ .name = "sceSaveDataMount3", .function = trace.wrap("sceSaveDataMount3", &services.absent), .expect_id = "ZP4e7rlzOUk" },
+    .{ .name = "sceSaveDataPrepare", .function = trace.wrap("sceSaveDataPrepare", &services.absent), .expect_id = "sDCBrmc61XU" },
+    .{ .name = "sceSaveDataCommit", .function = trace.wrap("sceSaveDataCommit", &services.absent), .expect_id = "ie7qhZ4X0Cc" },
+    .{ .name = "sceSaveDataUmount2", .function = trace.wrap("sceSaveDataUmount2", &services.absent), .expect_id = "uW4vfTwMQVo" },
+    .{ .name = "sceSaveDataDirNameSearchPs4", .function = trace.wrap("sceSaveDataDirNameSearchPs4", &services.absent), .expect_id = "X4MYzukPc3g" },
+    .{ .name = "sceSaveDataTransferringMountPs4", .function = trace.wrap("sceSaveDataTransferringMountPs4", &services.absent), .expect_id = "RjMlsR8EXrw" },
+    .{ .name = "sceSaveDataTransferringMount", .function = trace.wrap("sceSaveDataTransferringMount", &services.absent), .expect_id = "WAzWTZm1H+I" },
+    .{ .name = "sceSaveDataSaveIconByPath", .function = trace.wrap("sceSaveDataSaveIconByPath", &services.absent), .expect_id = "Z7z6HXWORJY" },
+    .{ .name = "sceSaveDataBackup", .function = trace.wrap("sceSaveDataBackup", &services.absent), .expect_id = "z1JA8-iJt3k" },
+    .{ .name = "sceSaveDataLoadIcon", .function = trace.wrap("sceSaveDataLoadIcon", &services.absent), .expect_id = "cGjO3wM3V28" },
+    .{ .name = "sceSaveDataGetEventResult", .function = trace.wrap("sceSaveDataGetEventResult", &services.saveDataNoEvent), .expect_id = "j8xKtiFj0SY" },
+    .{ .name = "sceSaveDataDeleteTransactionResource", .function = trace.wrap("sceSaveDataDeleteTransactionResource", &services.accept), .expect_id = "lJUQuaKqoKY" },
+};
+
+pub const share_exports = [_]symbols.Export{
+    .{ .name = "sceShareFeatureProhibit", .function = trace.wrap("sceShareFeatureProhibit", &services.absent), .expect_id = "5wjxESwX68I" },
+    .{ .name = "sceShareInitialize", .function = trace.wrap("sceShareInitialize", &services.absent), .expect_id = "nBDD66kiFW8" },
+    .{ .name = "sceShareTerminate", .function = trace.wrap("sceShareTerminate", &services.absent), .expect_id = "0IL1keINExQ" },
+    .{ .name = "sceShareFeaturePermit", .function = trace.wrap("sceShareFeaturePermit", &services.absent), .expect_id = "YBiIdcDPrxs" },
+};
+
+pub const videoout_exports = [_]symbols.Export{
+    // Flip/vblank live in bootstrap_services; only keep the remaining stubs here.
+    .{ .name = "sceVideoOutInitializeOutputOptions", .function = trace.wrap("sceVideoOutInitializeOutputOptions", &services.absent), .expect_id = "+I4K03i3EL0" },
+    .{ .name = "libSceVideoOut:T0ynQY3mH-0", .function = trace.wrap("libSceVideoOut:T0ynQY3mH-0", &services.accept), .id_override = "T0ynQY3mH-0" },
+    .{ .name = "libSceVideoOut:WkYtyOg30do", .function = trace.wrap("libSceVideoOut:WkYtyOg30do", &services.accept), .id_override = "WkYtyOg30do" },
+    .{ .name = "sceVideoOutColorSettingsSetGamma", .function = trace.wrap("sceVideoOutColorSettingsSetGamma", &platform_services.videoOutColorSettingsSetGamma), .id_override = "DYhhWbJSeRg" },
+    .{ .name = "sceVideoOutAdjustColor", .function = trace.wrap("sceVideoOutAdjustColor", &platform_services.videoOutAdjustColor), .id_override = "pv9CI5VC+R0" },
+};
+
+pub const voiceqos_exports = [_]symbols.Export{
+    .{ .name = "sceVoiceQoSCreateRemoteEndpoint", .function = trace.wrap("sceVoiceQoSCreateRemoteEndpoint", &services.offline), .expect_id = "iqQQW2cBmWU" },
+    .{ .name = "sceVoiceQoSDeleteRemoteEndpoint", .function = trace.wrap("sceVoiceQoSDeleteRemoteEndpoint", &services.offline), .expect_id = "H4zqFaDhHW4" },
+    .{ .name = "sceVoiceQoSCreateLocalEndpoint", .function = trace.wrap("sceVoiceQoSCreateLocalEndpoint", &services.offline), .expect_id = "lvNClhNHzxI" },
+    .{ .name = "sceVoiceQoSConnect", .function = trace.wrap("sceVoiceQoSConnect", &services.offline), .expect_id = "kLU6hhXsa2A" },
+    .{ .name = "sceVoiceQoSDeleteLocalEndpoint", .function = trace.wrap("sceVoiceQoSDeleteLocalEndpoint", &services.offline), .expect_id = "kE0kdvcHTiY" },
+    .{ .name = "sceVoiceQoSWritePacket", .function = trace.wrap("sceVoiceQoSWritePacket", &services.offline), .expect_id = "SpxLratrO1Q" },
+    .{ .name = "sceVoiceQoSGetLocalEndpointAttribute", .function = trace.wrap("sceVoiceQoSGetLocalEndpointAttribute", &services.offline), .expect_id = "eZu2RP0Ma3w" },
+    .{ .name = "sceVoiceQoSReadPacket", .function = trace.wrap("sceVoiceQoSReadPacket", &services.offline), .expect_id = "PWokFqab5q4" },
+    .{ .name = "sceVoiceQoSSetLocalEndpointAttribute", .function = trace.wrap("sceVoiceQoSSetLocalEndpointAttribute", &services.offline), .expect_id = "F7wS7FbfumQ" },
+    .{ .name = "sceVoiceQoSDisconnect", .function = trace.wrap("sceVoiceQoSDisconnect", &services.offline), .expect_id = "j9Xt85krooc" },
+    .{ .name = "sceVoiceQoSInit", .function = trace.wrap("sceVoiceQoSInit", &services.offline), .expect_id = "U8IfNl6-Css" },
+    .{ .name = "sceVoiceQoSEnd", .function = trace.wrap("sceVoiceQoSEnd", &services.offline), .expect_id = "ATRGkmbolVM" },
+    .{ .name = "libSceVoiceQoS:cpC-zyHoMik", .function = trace.wrap("libSceVoiceQoS:cpC-zyHoMik", &services.offline), .id_override = "cpC-zyHoMik" },
+};
+
+/// Touchpad gesture recognition.
+///
+/// The recognizers are host-side state the firmware updates from touch
+/// reports; with no touches arriving there is nothing to recognize. Creating
+/// and updating a recognizer succeeds so a title's per-frame update loop runs
+/// as written, and the event count it then reads is zero. Fetching an event by
+/// index reports an invalid argument, which is what an index past the count
+/// deserves.
+pub const systemgesture_exports = [_]symbols.Export{
+    .{ .name = "sceSystemGestureOpen", .function = trace.wrap("sceSystemGestureOpen", &services.accept), .expect_id = "qpo-mEOwje0" },
+    .{ .name = "sceSystemGestureCreateTouchRecognizer", .function = trace.wrap("sceSystemGestureCreateTouchRecognizer", &services.accept), .expect_id = "FWF8zkhr854" },
+    .{ .name = "sceSystemGestureAppendTouchRecognizer", .function = trace.wrap("sceSystemGestureAppendTouchRecognizer", &services.accept), .expect_id = "1MMK0W-kMgA" },
+    .{ .name = "sceSystemGestureRemoveTouchRecognizer", .function = trace.wrap("sceSystemGestureRemoveTouchRecognizer", &services.accept), .expect_id = "ELvBVG-LKT0" },
+    .{ .name = "sceSystemGestureUpdatePrimitiveTouchRecognizer", .function = trace.wrap("sceSystemGestureUpdatePrimitiveTouchRecognizer", &services.accept), .expect_id = "GgFMb22sbbI" },
+    .{ .name = "sceSystemGestureUpdateAllTouchRecognizer", .function = trace.wrap("sceSystemGestureUpdateAllTouchRecognizer", &services.accept), .expect_id = "wPJGwI2RM2I" },
+    .{ .name = "sceSystemGestureGetTouchEventsCount", .function = trace.wrap("sceSystemGestureGetTouchEventsCount", &services.noEvents), .expect_id = "h8uongcBNVs" },
+    .{ .name = "sceSystemGestureGetTouchEventByIndex", .function = trace.wrap("sceSystemGestureGetTouchEventByIndex", &services.absent), .expect_id = "TSKvgSz5ChU" },
+    .{ .name = "sceSystemGestureClose", .function = trace.wrap("sceSystemGestureClose", &services.accept), .expect_id = "j4yXIA2jJ68" },
+    .{ .name = "sceSystemGestureInitializePrimitiveTouchRecognizer", .function = trace.wrap("sceSystemGestureInitializePrimitiveTouchRecognizer", &services.accept), .expect_id = "3pcAvmwKCvM" },
+    .{ .name = "sceSystemGestureFinalizePrimitiveTouchRecognizer", .function = trace.wrap("sceSystemGestureFinalizePrimitiveTouchRecognizer", &services.accept), .expect_id = "3QYCmMlOlCY" },
+    .{ .name = "sceSystemGestureResetPrimitiveTouchRecognizer", .function = trace.wrap("sceSystemGestureResetPrimitiveTouchRecognizer", &services.accept), .expect_id = "o11J529VaAE" },
+    .{ .name = "sceSystemGestureResetTouchRecognizer", .function = trace.wrap("sceSystemGestureResetTouchRecognizer", &services.accept), .expect_id = "oBuH3zFWYIg" },
+    .{ .name = "sceSystemGestureUpdateTouchRecognizer", .function = trace.wrap("sceSystemGestureUpdateTouchRecognizer", &services.accept), .expect_id = "j4h82CQWENo" },
+    .{ .name = "sceSystemGestureUpdateTouchRecognizerRectangle", .function = trace.wrap("sceSystemGestureUpdateTouchRecognizerRectangle", &services.accept), .expect_id = "4WOA1eTx3V8" },
+    .{ .name = "sceSystemGestureGetPrimitiveTouchEventsCount", .function = trace.wrap("sceSystemGestureGetPrimitiveTouchEventsCount", &services.noEvents), .expect_id = "JhwByySf9FY" },
+    .{ .name = "sceSystemGestureGetPrimitiveTouchEvents", .function = trace.wrap("sceSystemGestureGetPrimitiveTouchEvents", &services.noEvents), .expect_id = "L8YmemOeSNY" },
+    .{ .name = "sceSystemGestureGetTouchEvents", .function = trace.wrap("sceSystemGestureGetTouchEvents", &services.noEvents), .expect_id = "fLTseA7XiWY" },
+    .{ .name = "sceSystemGestureGetPrimitiveTouchEventByIndex", .function = trace.wrap("sceSystemGestureGetPrimitiveTouchEventByIndex", &services.absent), .expect_id = "KAeP0+cQPVU" },
+    .{ .name = "sceSystemGestureGetPrimitiveTouchEventByPrimitiveID", .function = trace.wrap("sceSystemGestureGetPrimitiveTouchEventByPrimitiveID", &services.absent), .expect_id = "yBaQ0h9m1NM" },
+    .{ .name = "sceSystemGestureGetTouchEventByEventID", .function = trace.wrap("sceSystemGestureGetTouchEventByEventID", &services.absent), .expect_id = "lpsXm7tzeoc" },
+    .{ .name = "sceSystemGestureGetTouchRecognizerInformation", .function = trace.wrap("sceSystemGestureGetTouchRecognizerInformation", &services.absent), .expect_id = "0KrW5eMnrwY" },
+};
+
+/// Voice chat. Quake II's party module links against it whether or not a
+/// party exists, so the graph needs these to resolve; there is no headset
+/// routed through a party here, so they answer as an unavailable service
+/// rather than handing back ports a title would then write audio into.
+pub const voice_exports = [_]symbols.Export{
+    .{ .name = "sceVoiceInit", .function = trace.wrap("sceVoiceInit", &services.offline), .expect_id = "9TrhuGzberQ" },
+    .{ .name = "sceVoiceEnd", .function = trace.wrap("sceVoiceEnd", &services.offline), .expect_id = "Oo0S5PH7FIQ" },
+    .{ .name = "sceVoiceStart", .function = trace.wrap("sceVoiceStart", &services.offline), .expect_id = "54phPH2LZls" },
+    .{ .name = "sceVoiceStop", .function = trace.wrap("sceVoiceStop", &services.offline), .expect_id = "Ao2YNSA7-Qo" },
+    .{ .name = "sceVoiceCreatePort", .function = trace.wrap("sceVoiceCreatePort", &services.offline), .expect_id = "nXpje5yNpaE" },
+    .{ .name = "sceVoiceDeletePort", .function = trace.wrap("sceVoiceDeletePort", &services.offline), .expect_id = "b7kJI+nx2hg" },
+    .{ .name = "sceVoiceConnectIPortToOPort", .function = trace.wrap("sceVoiceConnectIPortToOPort", &services.offline), .expect_id = "oV9GAdJ23Gw" },
+    .{ .name = "sceVoiceDisconnectIPortFromOPort", .function = trace.wrap("sceVoiceDisconnectIPortFromOPort", &services.offline), .expect_id = "ajVj3QG2um4" },
+    .{ .name = "sceVoiceGetPortInfo", .function = trace.wrap("sceVoiceGetPortInfo", &services.offline), .expect_id = "CrLqDwWLoXM" },
+    .{ .name = "sceVoiceReadFromOPort", .function = trace.wrap("sceVoiceReadFromOPort", &services.offline), .expect_id = "cQ6DGsQEjV4" },
+    .{ .name = "sceVoiceWriteToIPort", .function = trace.wrap("sceVoiceWriteToIPort", &services.offline), .expect_id = "YeJl6yDlhW0" },
+};
+
+pub const videodec2_exports = [_]symbols.Export{
+    .{ .name = "sceVideodec2ReleaseComputeQueue", .function = trace.wrap("sceVideodec2ReleaseComputeQueue", &videodec2.releaseComputeQueue), .expect_id = "UvtA3FAiF4Y" },
+    .{ .name = "sceVideodec2Reset", .function = trace.wrap("sceVideodec2Reset", &videodec2.reset), .expect_id = "wJXikG6QFN8" },
+    .{ .name = "sceVideodec2DeleteDecoder", .function = trace.wrap("sceVideodec2DeleteDecoder", &videodec2.deleteDecoder), .expect_id = "jwImxXRGSKA" },
+    .{ .name = "sceVideodec2QueryComputeMemoryInfo", .function = trace.wrap("sceVideodec2QueryComputeMemoryInfo", &videodec2.queryComputeMemoryInfo), .expect_id = "RnDibcGCPKw" },
+    .{ .name = "sceVideodec2AllocateComputeQueue", .function = trace.wrap("sceVideodec2AllocateComputeQueue", &videodec2.allocateComputeQueue), .expect_id = "eD+X2SmxUt4" },
+    .{ .name = "sceVideodec2Decode", .function = trace.wrap("sceVideodec2Decode", &videodec2.decode), .expect_id = "852F5+q6+iM" },
+    .{ .name = "sceVideodec2QueryDecoderMemoryInfo", .function = trace.wrap("sceVideodec2QueryDecoderMemoryInfo", &videodec2.queryDecoderMemoryInfo), .expect_id = "qqMCwlULR+E" },
+    .{ .name = "sceVideodec2GetPictureInfo", .function = trace.wrap("sceVideodec2GetPictureInfo", &videodec2.getPictureInfo), .expect_id = "NtXRa3dRzU0" },
+    .{ .name = "sceVideodec2CreateDecoder", .function = trace.wrap("sceVideodec2CreateDecoder", &videodec2.createDecoder), .expect_id = "CNNRoRYd8XI" },
+    .{ .name = "sceVideodec2Flush", .function = trace.wrap("sceVideodec2Flush", &videodec2.flush), .expect_id = "l1hXwscLuCY" },
+};
+
+pub const vrtracker2_exports = [_]symbols.Export{
+    .{ .name = "sceVrTracker2SetCoordinateSystem", .function = trace.wrap("sceVrTracker2SetCoordinateSystem", &services.noDevice), .expect_id = "UVCMLmS-Eas" },
+    .{ .name = "sceVrTracker2GetCoordinateSystem", .function = trace.wrap("sceVrTracker2GetCoordinateSystem", &services.noDevice), .expect_id = "Y-3JCiU9bbU" },
+    .{ .name = "sceVrTracker2ResetLocalCoordinate", .function = trace.wrap("sceVrTracker2ResetLocalCoordinate", &services.noDevice), .expect_id = "IdI2f+xHIeA" },
+    .{ .name = "sceVrTracker2GetPlayAreaBoundaryGeometry", .function = trace.wrap("sceVrTracker2GetPlayAreaBoundaryGeometry", &services.noDevice), .expect_id = "SCph4ZbkqzU" },
+    .{ .name = "sceVrTracker2GetPlayAreaOrientedBoundingBox", .function = trace.wrap("sceVrTracker2GetPlayAreaOrientedBoundingBox", &services.noDevice), .expect_id = "snYs7Nf-RKk" },
+    .{ .name = "sceVrTracker2RegisterDevice", .function = trace.wrap("sceVrTracker2RegisterDevice", &services.noDevice), .expect_id = "Dog+g25QYjw" },
+    .{ .name = "sceVrTracker2UnregisterDevice", .function = trace.wrap("sceVrTracker2UnregisterDevice", &services.noDevice), .expect_id = "kFt4MB3SUEk" },
+    .{ .name = "sceVrTracker2GetResult", .function = trace.wrap("sceVrTracker2GetResult", &services.noDevice), .expect_id = "J4Vh3VVX0iU" },
+    .{ .name = "sceVrTracker2LocateCoordinateSystem", .function = trace.wrap("sceVrTracker2LocateCoordinateSystem", &services.noDevice), .expect_id = "f7G97dWnEis" },
+    .{ .name = "sceVrTracker2QueryMemory", .function = trace.wrap("sceVrTracker2QueryMemory", &services.noDevice), .expect_id = "TwqZnaIjWv4" },
+    .{ .name = "sceVrTracker2Initialize", .function = trace.wrap("sceVrTracker2Initialize", &services.noDevice), .expect_id = "6Jy73SRfG-o" },
+    .{ .name = "sceVrTracker2Finalize", .function = trace.wrap("sceVrTracker2Finalize", &services.noDevice), .expect_id = "IQ3UD6SZbXo" },
+};
+
+pub const webbrowserdialog_exports = [_]symbols.Export{
+    .{ .name = "sceWebBrowserDialogResetCookie", .function = trace.wrap("sceWebBrowserDialogResetCookie", &services.offline), .expect_id = "Cya+jvTtPqg" },
+    .{ .name = "sceWebBrowserDialogOpenForPredeterminedContent", .function = trace.wrap("sceWebBrowserDialogOpenForPredeterminedContent", &services.offline), .expect_id = "O7dIZQrwVFY" },
+    .{ .name = "sceWebBrowserDialogClose", .function = trace.wrap("sceWebBrowserDialogClose", &services.offline), .expect_id = "PSK+Eik919Q" },
+    .{ .name = "sceWebBrowserDialogGetResult", .function = trace.wrap("sceWebBrowserDialogGetResult", &services.offline), .expect_id = "vCaW0fgVQmc" },
+    .{ .name = "sceWebBrowserDialogGetStatus", .function = trace.wrap("sceWebBrowserDialogGetStatus", &services.saveDataDialogFinished), .expect_id = "CFTG6a8TjOU" },
+};
+
+/// A library, the module that publishes it, and its entry points.
+///
+/// The two names are kept apart because they routinely differ: a library whose
+/// name ends in a version digit usually lives in a module without one, and
+/// binding under the wrong module leaves an import that matches on identifier
+/// alone -- which the loader rightly refuses, since a bare identifier is no
+/// evidence that this is the implementation the caller meant.
+
+// Entry points reached only through the shipped online module, which
+// itself is only entered along paths that are refused above. Registered
+// so that module links; a title never arrives at them with the network
+// answering as it does here.
+pub const http_extra_exports = [_]symbols.Export{
+    .{ .name = "sceHttpUriEscape", .function = trace.wrap("sceHttpUriEscape", &services.offline), .expect_id = "YuOW3dDAKYc" },
+};
+
+pub const json2_extra_exports = [_]symbols.Export{
+    .{ .name = "_ZN3sce4Json5Value11referObjectEv", .function = trace.wrap("_ZN3sce4Json5Value11referObjectEv", &services.absent), .expect_id = "-NxEk7XLkDY" },
+    .{ .name = "_ZN3sce4Json5Value3setERKNS0_6ObjectE", .function = trace.wrap("_ZN3sce4Json5Value3setERKNS0_6ObjectE", &services.absent), .expect_id = "dFCphqnd+a4" },
+    .{ .name = "_ZN3sce4Json5ValueC1El", .function = trace.wrap("_ZN3sce4Json5ValueC1El", &services.absent), .expect_id = "0lLK8+kDqmE" },
+    .{ .name = "_ZN3sce4Json5ValueC1ERKNS0_5ArrayE", .function = trace.wrap("_ZN3sce4Json5ValueC1ERKNS0_5ArrayE", &services.absent), .expect_id = "iZeYfOxtMRg" },
+    .{ .name = "_ZNK3sce4Json5Value7getRealEv", .function = trace.wrap("_ZNK3sce4Json5Value7getRealEv", &json.valueGetReal), .expect_id = "3qrge7L-AU4" },
+    .{ .name = "_ZN3sce4Json5ValueC1ERKNS0_6ObjectE", .function = trace.wrap("_ZN3sce4Json5ValueC1ERKNS0_6ObjectE", &services.absent), .expect_id = "3xUXnmUkXfo" },
+    .{ .name = "_ZN3sce4Json5ValueC1EPKc", .function = trace.wrap("_ZN3sce4Json5ValueC1EPKc", &services.absent), .expect_id = "b9V6fmppLXY" },
+    .{ .name = "_ZNK3sce4Json5Array4backEv", .function = trace.wrap("_ZNK3sce4Json5Array4backEv", &services.absent), .expect_id = "bAM9Qwofus0" },
+    .{ .name = "_ZN3sce4Json5ArrayC1Ev", .function = trace.wrap("_ZN3sce4Json5ArrayC1Ev", &services.absent), .expect_id = "JP-PtKMiI1E" },
+    .{ .name = "_ZN3sce4Json5ArrayD1Ev", .function = trace.wrap("_ZN3sce4Json5ArrayD1Ev", &services.absent), .expect_id = "HJ8GpRT1aiw" },
+    .{ .name = "_ZN3sce4Json6StringaSERKS1_", .function = trace.wrap("_ZN3sce4Json6StringaSERKS1_", &services.absent), .expect_id = "cn9svYGWKDQ" },
+    .{ .name = "_ZNK3sce4Json5Value10getIntegerEv", .function = trace.wrap("_ZNK3sce4Json5Value10getIntegerEv", &json.valueGetInteger), .expect_id = "DIxvoy7Ngvk" },
+    .{ .name = "_ZNK3sce4Json6String6lengthEv", .function = trace.wrap("_ZNK3sce4Json6String6lengthEv", &json.stringLength), .expect_id = "EUH+EmT-v9E" },
+    .{ .name = "_ZN3sce4Json5Value3setENS0_9ValueTypeE", .function = trace.wrap("_ZN3sce4Json5Value3setENS0_9ValueTypeE", &services.absent), .expect_id = "IKQimvG9Wqs" },
+    .{ .name = "_ZNK3sce4Json5Value9getObjectEv", .function = trace.wrap("_ZNK3sce4Json5Value9getObjectEv", &services.absent), .expect_id = "IlsmvBtMkak" },
+    .{ .name = "_ZN3sce4Json5Value10referArrayEv", .function = trace.wrap("_ZN3sce4Json5Value10referArrayEv", &services.absent), .expect_id = "nM5XqdeXFPw" },
+    .{ .name = "_ZN3sce4Json6Object5clearEv", .function = trace.wrap("_ZN3sce4Json6Object5clearEv", &services.absent), .expect_id = "oH8aBmLU+fc" },
+    .{ .name = "_ZNK3sce4Json5Value8getArrayEv", .function = trace.wrap("_ZNK3sce4Json5Value8getArrayEv", &services.absent), .expect_id = "ONT8As5R1ug" },
+    .{ .name = "_ZN3sce4Json6StringC1Ev", .function = trace.wrap("_ZN3sce4Json6StringC1Ev", &json.stringConstructEmpty), .expect_id = "qSmqLXXCPas" },
+    .{ .name = "_ZN3sce4Json5Value9serializeERNS0_6StringE", .function = trace.wrap("_ZN3sce4Json5Value9serializeERNS0_6StringE", &services.absent), .expect_id = "R7FDWtcN6f8" },
+    .{ .name = "_ZNK3sce4Json5Array4sizeEv", .function = trace.wrap("_ZNK3sce4Json5Array4sizeEv", &json.arraySize), .expect_id = "rQGJeNjOuUk" },
+    .{ .name = "_ZNK3sce4Json5Value7getTypeEv", .function = trace.wrap("_ZNK3sce4Json5Value7getTypeEv", &json.valueGetType), .expect_id = "SHtAad20YYM" },
+    .{ .name = "_ZN3sce4Json5ValueC1Ed", .function = trace.wrap("_ZN3sce4Json5ValueC1Ed", &services.absent), .expect_id = "sOmU4vnx3s0" },
+    .{ .name = "_ZN3sce4Json5ValueC1Eb", .function = trace.wrap("_ZN3sce4Json5ValueC1Eb", &services.absent), .expect_id = "UeuWT+yNdCQ" },
+    .{ .name = "_ZN3sce4Json6ObjectaSERKS1_", .function = trace.wrap("_ZN3sce4Json6ObjectaSERKS1_", &services.absent), .expect_id = "urOpESTBZmo" },
+    .{ .name = "_ZNK3sce4Json5ValueixEm", .function = trace.wrap("_ZNK3sce4Json5ValueixEm", &json.valueSubscriptIndex), .expect_id = "XlWbvieLj2M" },
+    .{ .name = "_ZN3sce4Json5Array9push_backERKNS0_5ValueE", .function = trace.wrap("_ZN3sce4Json5Array9push_backERKNS0_5ValueE", &services.absent), .expect_id = "zQtLRTqceMY" },
+    .{ .name = "_ZNK3sce4Json5Value10getBooleanEv", .function = trace.wrap("_ZNK3sce4Json5Value10getBooleanEv", &json.valueGetBoolean), .expect_id = "zTwZdI8AZ5Y" },
+};
+
+pub const npwebapi2_extra_exports = [_]symbols.Export{
+    .{ .name = "sceNpWebApi2AbortRequest", .function = trace.wrap("sceNpWebApi2AbortRequest", &services.offline), .expect_id = "zpiPsH7dbFQ" },
+};
+
+pub const rtc_extra_exports = [_]symbols.Export{
+    .{ .name = "sceRtcParseRFC3339", .function = trace.wrap("sceRtcParseRFC3339", &platform_services.rtcParseRFC3339), .expect_id = "99bMGglFW3I" },
+    .{ .name = "sceRtcFormatRFC3339", .function = trace.wrap("sceRtcFormatRFC3339", &platform_services.rtcFormatRFC3339), .expect_id = "WJ3rqFwymew" },
+};
+
+/// Content capture and broadcast.
+///
+/// There is no capture hardware behind this, and the calls a title makes here
+/// state a policy or set up a subsystem rather than ask for a result: it says
+/// whether capturing its screen is allowed, hands over a title for the clip,
+/// and registers to hear about clips that will never be produced. Accepting
+/// those is truthful — the policy is recorded and honoured by there being no
+/// capture at all — while a refusal would read as the subsystem being broken.
+const share_extra_exports = [_]symbols.Export{
+    .{ .name = "sceSharePlayInitialize", .function = trace.wrap("sceSharePlayInitialize", &services.accept), .expect_id = "isruqthpYcw" },
+    .{ .name = "sceShareRegisterContentEventCallback", .function = trace.wrap("sceShareRegisterContentEventCallback", &services.accept), .expect_id = "Sygnk9dr5WQ" },
+    .{ .name = "sceShareUnregisterContentEventCallback", .function = trace.wrap("sceShareUnregisterContentEventCallback", &services.accept), .expect_id = "KnsfHKmZqFA" },
+    .{ .name = "sceShareSetContentParam", .function = trace.wrap("sceShareSetContentParam", &services.accept), .expect_id = "7QZtURYnXG4" },
+};
+
+/// Where a title's own data physically sits.
+///
+/// Everything is installed locally, so a range is never waiting behind a disc.
+const disc_map_exports = [_]symbols.Export{
+    .{ .name = "sceDiscMapIsRequestOnHDD", .function = trace.wrap("sceDiscMapIsRequestOnHDD", &services.discMapIsRequestOnHDD), .expect_id = "lbQKqsERhtE" },
+    // Two entry points whose published names are unknown. The identifier is
+    // what a title binds against, so it is given directly rather than derived
+    // from a placeholder that would hash to something else entirely.
+    .{ .name = "sceDiscMapUncataloguedRequest", .function = trace.wrap("sceDiscMapUncataloguedRequest", &services.accept), .id_override = "fJgP+wqifno" },
+    .{ .name = "sceDiscMapUncataloguedQuery", .function = trace.wrap("sceDiscMapUncataloguedQuery", &services.accept), .id_override = "IoKMOKcLDlc" },
+};
+
+/// Exporting captured content off the console, which nothing here can do.
+/// Initialisation still succeeds so that a title can carry on and discover
+/// that at the point it actually tries to export something.
+const content_export_exports = [_]symbols.Export{
+    .{ .name = "sceContentExportInit2", .function = trace.wrap("sceContentExportInit2", &services.accept), .expect_id = "0GnN4QCgIfs" },
+};
+pub const Table = struct { library: []const u8, module: []const u8, exports: []const symbols.Export };
+
+pub const all = [_]Table{
+    .{ .library = "libSceAgc", .module = "libSceAgc", .exports = &agc_exports },
+    .{ .library = "libSceAvPlayer", .module = "libSceAvPlayer", .exports = &avplayer_exports },
+    .{ .library = "libSceCamera2", .module = "libSceCamera", .exports = &camera2_exports },
+    .{ .library = "libSceCoredump", .module = "libkernel", .exports = &coredump_exports },
+    .{ .library = "libSceErrorDialog", .module = "libSceErrorDialog", .exports = &errordialog_exports },
+    .{ .library = "libSceGameLiveStreaming", .module = "libSceGameLiveStreaming", .exports = &gamelivestreaming_exports },
+    .{ .library = "libSceGameUpdate", .module = "libSceGameUpdate", .exports = &gameupdate_exports },
+    .{ .library = "libSceFont", .module = "libSceFont", .exports = &font.exports },
+    .{ .library = "libSceFontFt", .module = "libSceFontFt", .exports = &font.ft_exports },
+    .{ .library = "libSceHmd2", .module = "libSceHmd2", .exports = &hmd2_exports },
+    .{ .library = "libSceHttp", .module = "libSceHttp", .exports = &http_exports },
+    .{ .library = "libSceImeDialog", .module = "libSceImeDialog", .exports = &imedialog_exports },
+    .{ .library = "libSceIpmi", .module = "libSceIpmi", .exports = &ipmi_exports },
+    .{ .library = "libSceJson2", .module = "libSceJson", .exports = &json2_exports },
+    .{ .library = "libSceJpegDec", .module = "libSceJpegDec", .exports = &jpegdec_exports },
+    .{ .library = "libSceNet", .module = "libSceNet", .exports = &net_exports },
+    .{ .library = "libSceNpAuth", .module = "libSceNpAuth", .exports = &npauth_exports },
+    .{ .library = "libSceNpCommerce", .module = "libSceNpCommerce", .exports = &npcommerce_exports },
+    .{ .library = "libSceNpEntitlementAccess", .module = "libSceNpEntitlementAccess", .exports = &npentitlementaccess_exports },
+    .{ .library = "libSceNpGameIntent", .module = "libSceNpGameIntent", .exports = &npgameintent_exports },
+    .{ .library = "libSceNpManager", .module = "libSceNpManager", .exports = &npmanager_exports },
+    .{ .library = "libSceNpSessionSignaling", .module = "libSceNpSessionSignaling", .exports = &npsessionsignaling_exports },
+    .{ .library = "libSceNpTrophy2", .module = "libSceNpTrophy2", .exports = &nptrophy2_exports },
+    .{ .library = "libSceNpUniversalDataSystem", .module = "libSceNpUniversalDataSystem", .exports = &npuniversaldatasystem_exports },
+    .{ .library = "libSceNpWebApi2", .module = "libSceNpWebApi2", .exports = &npwebapi2_exports },
+    .{ .library = "libScePad", .module = "libScePad", .exports = &pad_exports },
+    .{ .library = "libScePlayGo", .module = "libScePlayGo", .exports = &playgo_exports },
+    .{ .library = "libScePlayerInvitationDialog", .module = "libScePlayerInvitationDialog", .exports = &playerinvitationdialog_exports },
+    .{ .library = "libSceRazorCpu", .module = "libSceRazorCpu", .exports = &razorcpu_exports },
+    .{ .library = "libSceRtc", .module = "libSceRtc", .exports = &rtc_exports },
+    .{ .library = "libSceSaveDataDialog.native", .module = "libSceSaveDataDialog", .exports = &savedatadialog_native_exports },
+    .{ .library = "libSceSaveData_native", .module = "libSceSaveData_native", .exports = &savedata_native_exports },
+    .{ .library = "libSceShare", .module = "libSceShare", .exports = &share_exports },
+    .{ .library = "libSceVideoOut", .module = "libSceVideoOut", .exports = &videoout_exports },
+    .{ .library = "libSceVideodec2", .module = "libSceVideodec2", .exports = &videodec2_exports },
+    .{ .library = "libSceSystemGesture", .module = "libSceSystemGesture", .exports = &systemgesture_exports },
+    .{ .library = "libSceVoice", .module = "libSceVoice", .exports = &voice_exports },
+    .{ .library = "libSceVoiceQoS", .module = "libSceVoiceQoS", .exports = &voiceqos_exports },
+    .{ .library = "libSceConvertKeycode", .module = "libSceConvertKeycode", .exports = &convert_keycode_exports },
+    .{ .library = "libSceVrTracker2", .module = "libSceVrTracker2", .exports = &vrtracker2_exports },
+    .{ .library = "libSceWebBrowserDialog", .module = "libSceWebBrowserDialog", .exports = &webbrowserdialog_exports },
+
+    .{ .library = "libSceHttp", .module = "libSceHttp", .exports = &http_extra_exports },
+    .{ .library = "libSceJson2", .module = "libSceJson", .exports = &json2_extra_exports },
+    .{ .library = "libSceNpWebApi2", .module = "libSceNpWebApi2", .exports = &npwebapi2_extra_exports },
+    .{ .library = "libSceRtc", .module = "libSceRtc", .exports = &rtc_extra_exports },
+    .{ .library = "libSceShare", .module = "libSceShare", .exports = &share_extra_exports },
+    .{ .library = "libSceDiscMap", .module = "libSceDiscMap", .exports = &disc_map_exports },
+    .{ .library = "libSceContentExport", .module = "libSceContentExport", .exports = &content_export_exports },
+    .{ .library = "libScePsml", .module = "libScePsml", .exports = &psml.exports },
+};

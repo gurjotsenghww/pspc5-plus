@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! The export tables for the graphics library, kept apart from the handlers.
+//!
+//! Generated from the identifiers a shipped title imports and the published
+//! names they hash to. Held in its own file because it is a long list of
+//! bindings and nothing else: what each binding does is next door, where it can
+//! be read without scrolling past a hundred and fifty entries.
+//!
+//! Every entry states the identifier it must hash to, so a name that is wrong
+//! fails at registration rather than becoming an import nothing resolves.
+
+const agc = @import("agc.zig");
+const agc_submit = @import("agc_submit.zig");
+const trace = @import("../trace.zig");
+const symbols = @import("../symbols.zig");
+
+pub const exports = [_]symbols.Export{
+    .{ .name = "sceAgcGetDefaultCxStateFlat", .function = trace.wrap("sceAgcGetDefaultCxStateFlat", &agc.zeroQuery), .expect_id = "AAeX-U5-P3M" },
+    .{ .name = "sceAgcSetAmmSemaphoreMemory", .function = trace.wrap("sceAgcSetAmmSemaphoreMemory", &agc.accept), .expect_id = "OQTgEXyihvA" },
+    .{ .name = "sceAgcBranchPatchSetCompareAddress", .function = trace.wrap("sceAgcBranchPatchSetCompareAddress", &agc.patchCommand), .expect_id = "GXBlM-ekzrI" },
+    // sceAgcSetShRegIndirectPatchSetNumRegisters (nCUgItdN2ms),
+    // sceAgcSetCxRegIndirectPatchSetNumRegisters (whb1RL7K4Ss) and
+    // sceAgcSetUcRegIndirectPatchSetNumRegisters (fRG-JOH5+sI) are registered
+    // by bootstrap_services, next to the writer whose word they edit. A
+    // generic entry here would shadow them: this table registers first and a
+    // lookup takes the first match, so the accepting placeholder would win and
+    // the register count would never be patched.
+    .{ .name = "sceAgcCondExecPatchSetEnd", .function = trace.wrap("sceAgcCondExecPatchSetEnd", &agc.patchCondExecEnd), .expect_id = "ORWsxIbk4TE" },
+    .{ .name = "sceAgcCondExecPatchSetCommandAddress", .function = trace.wrap("sceAgcCondExecPatchSetCommandAddress", &agc.patchCondExecCommandAddress), .expect_id = "YWTKOju587o" },
+    .{ .name = "sceAgcAsyncCondExecPatchSetEnd", .function = trace.wrap("sceAgcAsyncCondExecPatchSetEnd", &agc.patchCondExecEnd), .expect_id = "k-JpyR2dYAM" },
+    .{ .name = "sceAgcAsyncCondExecPatchSetCommandAddress", .function = trace.wrap("sceAgcAsyncCondExecPatchSetCommandAddress", &agc.patchCondExecCommandAddress), .expect_id = "3ZWa3AoyWZQ" },
+    .{ .name = "sceAgcRewindPatchSetRewindState", .function = trace.wrap("sceAgcRewindPatchSetRewindState", &agc.patchCommand), .expect_id = "ziVA3whp3p4" },
+    .{ .name = "sceAgcAsyncRewindPatchSetRewindState", .function = trace.wrap("sceAgcAsyncRewindPatchSetRewindState", &agc.patchCommand), .expect_id = "eWaWyFegzgQ" },
+    .{ .name = "sceAgcGetPacketSize", .function = trace.wrap("sceAgcGetPacketSize", &agc.packetSize), .expect_id = "Lkf86B98qPc" },
+    .{ .name = "sceAgcGetDataPacketPayloadRange", .function = trace.wrap("sceAgcGetDataPacketPayloadRange", &agc.dataPacketPayloadRange), .expect_id = "s+VGAMDQ0AQ" },
+    // The two DMA_DATA address patches (IxYiarKlXxM, cdDRpqcFGbU) likewise
+    // belong with the DMA_DATA writer in bootstrap_services: the words they
+    // overwrite are fixed by the layout that writer emits, so the patch and
+    // the packet have to change together.
+    .{ .name = "sceAgcWriteDataPatchSetCachePolicy", .function = trace.wrap("sceAgcWriteDataPatchSetCachePolicy", &agc.patchCommand), .expect_id = "eAy8eGNsCuU" },
+    .{ .name = "sceAgcWriteDataPatchSetDst", .function = trace.wrap("sceAgcWriteDataPatchSetDst", &agc.patchCommand), .expect_id = "tmy-+rBpspY" },
+    .{ .name = "sceAgcWaitRegMemPatchCompareFunction", .function = trace.wrap("sceAgcWaitRegMemPatchCompareFunction", &agc.patchWaitRegMemCompareFunction), .expect_id = "n485EBnIWmk" },
+    .{ .name = "sceAgcWaitRegMemPatchAddress", .function = trace.wrap("sceAgcWaitRegMemPatchAddress", &agc.patchWaitRegMemAddress), .expect_id = "3KDcnM3lrcU" },
+    .{ .name = "sceAgcWaitRegMemPatchReference", .function = trace.wrap("sceAgcWaitRegMemPatchReference", &agc.patchWaitRegMemReference), .expect_id = "7nOoijNPvEU" },
+    .{ .name = "sceAgcQueueEndOfPipeActionPatchAddress", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchAddress", &agc.patchQueueEndOfPipeAddress), .expect_id = "0fWWK5uG9rQ" },
+    .{ .name = "sceAgcQueueEndOfPipeActionPatchGcrCntl", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchGcrCntl", &agc.patchQueueEndOfPipeGcr), .expect_id = "J8YCgfKAMQs" },
+    .{ .name = "sceAgcQueueEndOfPipeActionPatchData", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchData", &agc.patchQueueEndOfPipeData), .expect_id = "MlEw1feXcjg" },
+    .{ .name = "sceAgcQueueEndOfPipeActionPatchType", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchType", &agc.patchQueueEndOfPipeType), .expect_id = "T9fjQIINoeE" },
+    .{ .name = "sceAgcAcquireMemSetEngine", .function = trace.wrap("sceAgcAcquireMemSetEngine", &agc.accept), .expect_id = "W0WEyog0f74" },
+    .{ .name = "sceAgcCbBranch", .function = trace.wrap("sceAgcCbBranch", &agc.branch), .expect_id = "w1KFAHVqpaU" },
+    .{ .name = "sceAgcCbCondWrite", .function = trace.wrap("sceAgcCbCondWrite", &agc.writeCommand), .expect_id = "7toV+elXqNM" },
+    .{ .name = "sceAgcCbSetUcRegisterRangeDirect", .function = trace.wrap("sceAgcCbSetUcRegisterRangeDirect", &agc.writeCommand), .expect_id = "MDLD5Ly94Xk" },
+    .{ .name = "sceAgcCbBranchGetSize", .function = trace.wrap("sceAgcCbBranchGetSize", &agc.branchGetSize), .expect_id = "uZW-mqsxkrM" },
+    .{ .name = "sceAgcCbCondWriteGetSize", .function = trace.wrap("sceAgcCbCondWriteGetSize", &agc.commandSize), .expect_id = "FuVbkyKlf+s" },
+    .{ .name = "sceAgcCbQueueEndOfPipeActionGetSize", .function = trace.wrap("sceAgcCbQueueEndOfPipeActionGetSize", &agc.commandSize), .expect_id = "hL7C0IRpWZI" },
+    .{ .name = "sceAgcCbSetUcRegisterRangeDirectGetSize", .function = trace.wrap("sceAgcCbSetUcRegisterRangeDirectGetSize", &agc.commandSize), .expect_id = "JOWmDrl+j20" },
+    .{ .name = "sceAgcAcbAtomicMem", .function = trace.wrap("sceAgcAcbAtomicMem", &agc.writeCommand), .expect_id = "XKKuA6VkSRc" },
+    .{ .name = "sceAgcAcbCondExec", .function = trace.wrap("sceAgcAcbCondExec", &agc.condExec), .expect_id = "qyM2bxYFPAk" },
+    .{ .name = "sceAgcAcbRewind", .function = trace.wrap("sceAgcAcbRewind", &agc.writeCommand), .expect_id = "DwICrVxerkY" },
+    .{ .name = "sceAgcAcbPrimeUtcl2", .function = trace.wrap("sceAgcAcbPrimeUtcl2", &agc.writeCommand), .expect_id = "szG7hz2yEhA" },
+    .{ .name = "sceAgcAcbSetMarker", .function = trace.wrap("sceAgcAcbSetMarker", &agc.writeCommand), .expect_id = "xAeBOa0A3kk" },
+    .{ .name = "sceAgcAcbSetMarkerSpan", .function = trace.wrap("sceAgcAcbSetMarkerSpan", &agc.writeCommand), .expect_id = "pxx-GoOSdw4" },
+    .{ .name = "sceAgcAcbPushMarkerSpan", .function = trace.wrap("sceAgcAcbPushMarkerSpan", &agc.writeCommand), .expect_id = "8Kly1JrJUlw" },
+    .{ .name = "sceAgcAcbSetFlip", .function = trace.wrap("sceAgcAcbSetFlip", &agc.writeCommand), .expect_id = "ebixW91gpPw" },
+    .{ .name = "sceAgcGetSemaphoreLabel", .function = trace.wrap("sceAgcGetSemaphoreLabel", &agc.zeroQuery), .expect_id = "hFQ9pUxoLQ4" },
+    .{ .name = "sceAgcAcbMemSemaphore", .function = trace.wrap("sceAgcAcbMemSemaphore", &agc.writeCommand), .expect_id = "q4VuU-QsLOE" },
+    .{ .name = "sceAgcAcbSetWorkloadsActive", .function = trace.wrap("sceAgcAcbSetWorkloadsActive", &agc.writeCommand), .expect_id = "rVOmPz2RBlg" },
+    .{ .name = "sceAgcAcbSetWorkloadComplete", .function = trace.wrap("sceAgcAcbSetWorkloadComplete", &agc.writeCommand), .expect_id = "opR1JeJZCBU" },
+    .{ .name = "sceAgcAcbSetWorkloadStreamInactive", .function = trace.wrap("sceAgcAcbSetWorkloadStreamInactive", &agc.writeCommand), .expect_id = "FcgdDM3MB+k" },
+    .{ .name = "sceAgcAcbAcquireMemGetSize", .function = trace.wrap("sceAgcAcbAcquireMemGetSize", &agc.acquireMemGetSize), .expect_id = "ewobAQeMo5k" },
+    .{ .name = "sceAgcAcbAtomicGdsGetSize", .function = trace.wrap("sceAgcAcbAtomicGdsGetSize", &agc.commandSize), .expect_id = "hcIxS8pmXF4" },
+    .{ .name = "sceAgcAcbAtomicMemGetSize", .function = trace.wrap("sceAgcAcbAtomicMemGetSize", &agc.commandSize), .expect_id = "da1Sm8-QDoU" },
+    .{ .name = "sceAgcAcbCondExecGetSize", .function = trace.wrap("sceAgcAcbCondExecGetSize", &agc.condExecGetSize), .expect_id = "ozKzBP4aki4" },
+    .{ .name = "sceAgcAcbDmaDataGetSize", .function = trace.wrap("sceAgcAcbDmaDataGetSize", &agc.dmaDataGetSize), .expect_id = "M0ttm8h7SKA" },
+    .{ .name = "sceAgcAcbDispatchIndirectGetSize", .function = trace.wrap("sceAgcAcbDispatchIndirectGetSize", &agc.dispatchIndirectAbsoluteGetSize), .expect_id = "PxKWV2fVAps" },
+    .{ .name = "sceAgcAcbPrimeUtcl2GetSize", .function = trace.wrap("sceAgcAcbPrimeUtcl2GetSize", &agc.commandSize), .expect_id = "eCjKaqeeQ5s" },
+    .{ .name = "sceAgcAcbRewindGetSize", .function = trace.wrap("sceAgcAcbRewindGetSize", &agc.commandSize), .expect_id = "0ZOG0jc9nRg" },
+    .{ .name = "sceAgcAcbQueueEndOfShaderActionGetSize", .function = trace.wrap("sceAgcAcbQueueEndOfShaderActionGetSize", &agc.commandSize), .expect_id = "F8NLhWvFemI" },
+    .{ .name = "sceAgcDcbAtomicMem", .function = trace.wrap("sceAgcDcbAtomicMem", &agc.writeCommand), .expect_id = "1-gUn1PI4Sw" },
+    .{ .name = "sceAgcDcbCondExec", .function = trace.wrap("sceAgcDcbCondExec", &agc.condExec), .expect_id = "BIPexNBSGog" },
+    .{ .name = "sceAgcDcbSetUcRegisterDirect", .function = trace.wrap("sceAgcDcbSetUcRegisterDirect", &agc.setUcRegisterDirect), .expect_id = "w4-d0n60hdo" },
+    .{ .name = "sceAgcDcbSetCxRegisterDirect", .function = trace.wrap("sceAgcDcbSetCxRegisterDirect", &agc.setCxRegisterDirect), .expect_id = "LHFXRrlTPD8" },
+    .{ .name = "sceAgcDcbSetShRegisterDirect", .function = trace.wrap("sceAgcDcbSetShRegisterDirect", &agc.setShRegisterDirect), .expect_id = "pFLArOT53+w" },
+    .{ .name = "sceAgcDcbDrawIndirectMulti", .function = trace.wrap("sceAgcDcbDrawIndirectMulti", &agc.drawIndirectMulti), .expect_id = "kUlvghKs-mA" },
+    .{ .name = "sceAgcDcbDrawIndexIndirectMulti", .function = trace.wrap("sceAgcDcbDrawIndexIndirectMulti", &agc.drawIndexIndirectMulti), .expect_id = "ypVBz4uPKcQ" },
+    .{ .name = "sceAgcDcbDrawIndexMultiInstanced", .function = trace.wrap("sceAgcDcbDrawIndexMultiInstanced", &agc.drawIndexMultiInstanced), .expect_id = "Rlx+bykm0r0" },
+    .{ .name = "sceAgcDcbPrimeUtcl2", .function = trace.wrap("sceAgcDcbPrimeUtcl2", &agc.writeCommand), .expect_id = "jt3pl7EN17o" },
+    .{ .name = "sceAgcDcbSetIndexIndirectArgs", .function = trace.wrap("sceAgcDcbSetIndexIndirectArgs", &agc.writeCommand), .expect_id = "0o3VDdtA6nM" },
+    .{ .name = "sceAgcDcbSetMarker", .function = trace.wrap("sceAgcDcbSetMarker", &agc.writeCommand), .expect_id = "QhCbS4X9Rl8" },
+    .{ .name = "sceAgcDcbSetMarkerSpan", .function = trace.wrap("sceAgcDcbSetMarkerSpan", &agc.writeCommand), .expect_id = "BYcSvEsINWU" },
+    .{ .name = "sceAgcDcbPushMarkerSpan", .function = trace.wrap("sceAgcDcbPushMarkerSpan", &agc.writeCommand), .expect_id = "N7M3+N-sBCw" },
+    .{ .name = "sceAgcDcbMemSemaphore", .function = trace.wrap("sceAgcDcbMemSemaphore", &agc.writeCommand), .expect_id = "G0jrLdvEqDw" },
+    .{ .name = "sceAgcDcbSetWorkloadStreamInactive", .function = trace.wrap("sceAgcDcbSetWorkloadStreamInactive", &agc.writeCommand), .expect_id = "FneFypEDRgY" },
+    .{ .name = "sceAgcDcbSetShRegisterDirectGetSize", .function = trace.wrap("sceAgcDcbSetShRegisterDirectGetSize", &agc.registerDirectGetSize), .expect_id = "QhPDD513V0w" },
+    .{ .name = "sceAgcDcbSetCxRegisterDirectGetSize", .function = trace.wrap("sceAgcDcbSetCxRegisterDirectGetSize", &agc.registerDirectGetSize), .expect_id = "1DeUNpRIDDA" },
+    .{ .name = "sceAgcDcbSetUcRegisterDirectGetSize", .function = trace.wrap("sceAgcDcbSetUcRegisterDirectGetSize", &agc.registerDirectGetSize), .expect_id = "aP1Ki9G3++4" },
+    .{ .name = "sceAgcDcbAcquireMemGetSize", .function = trace.wrap("sceAgcDcbAcquireMemGetSize", &agc.acquireMemGetSize), .expect_id = "-vnlTPPXPrw" },
+    .{ .name = "sceAgcDcbAtomicGdsGetSize", .function = trace.wrap("sceAgcDcbAtomicGdsGetSize", &agc.commandSize), .expect_id = "1tB0xkLNjcw" },
+    .{ .name = "sceAgcDcbAtomicMemGetSize", .function = trace.wrap("sceAgcDcbAtomicMemGetSize", &agc.commandSize), .expect_id = "oz6zQq1JwCE" },
+    .{ .name = "sceAgcDcbCondExecGetSize", .function = trace.wrap("sceAgcDcbCondExecGetSize", &agc.condExecGetSize), .expect_id = "ou16V5hh5sg" },
+    .{ .name = "sceAgcDcbDmaDataGetSize", .function = trace.wrap("sceAgcDcbDmaDataGetSize", &agc.dmaDataGetSize), .expect_id = "2ccJz9LQI+w" },
+    .{ .name = "sceAgcDcbWriteDataGetSize", .function = trace.wrap("sceAgcDcbWriteDataGetSize", &agc.writeDataGetSize), .expect_id = "p9tI+yTvx68" },
+    .{ .name = "sceAgcDcbQueueEndOfShaderActionGetSize", .function = trace.wrap("sceAgcDcbQueueEndOfShaderActionGetSize", &agc.commandSize), .expect_id = "zg6u-N6Otxs" },
+    .{ .name = "sceAgcDcbDispatchIndirectGetSize", .function = trace.wrap("sceAgcDcbDispatchIndirectGetSize", &agc.dispatchIndirectGetSize), .expect_id = "w8HVkEeXPv8" },
+    // sceAgcDcbDrawIndexAutoGetSize (WrdP9Zxx3lQ) is registered by
+    // bootstrap_services, which answers the three words its DRAW_INDEX_AUTO
+    // actually occupies rather than the generic four.
+    .{ .name = "sceAgcDcbDrawIndirectGetSize", .function = trace.wrap("sceAgcDcbDrawIndirectGetSize", &agc.drawIndirectGetSize), .expect_id = "cxPZ4Wgvdj8" },
+    .{ .name = "sceAgcDcbDrawIndirectMultiGetSize", .function = trace.wrap("sceAgcDcbDrawIndirectMultiGetSize", &agc.drawIndirectMultiGetSize), .expect_id = "pYoKs3lPy88" },
+    .{ .name = "sceAgcDcbDrawIndexIndirectMultiGetSize", .function = trace.wrap("sceAgcDcbDrawIndexIndirectMultiGetSize", &agc.drawIndexIndirectMultiGetSize), .expect_id = "r98I08t+LOg" },
+    // The size queries for commands this table does not construct are
+    // registered beside their writers in bootstrap_services, so that a width
+    // and the packet it describes are changed in one place. A placeholder
+    // left here would shadow them: this table registers first and a lookup
+    // takes the first match.
+    .{ .name = "sceAgcDcbDrawIndexIndirectGetSize", .function = trace.wrap("sceAgcDcbDrawIndexIndirectGetSize", &agc.drawIndexIndirectGetSize), .expect_id = "mStuvI0zOtc" },
+    .{ .name = "sceAgcDcbDrawIndexMultiInstancedGetSize", .function = trace.wrap("sceAgcDcbDrawIndexMultiInstancedGetSize", &agc.drawIndexMultiInstancedGetSize), .expect_id = "mR9j7+SfM34" },
+    .{ .name = "sceAgcDcbSetBaseDispatchIndirectArgsGetSize", .function = trace.wrap("sceAgcDcbSetBaseDispatchIndirectArgsGetSize", &agc.setBaseDrawIndirectArgsGetSize), .expect_id = "9S4noWrUI0s" },
+    .{ .name = "sceAgcDcbSetBaseDrawIndirectArgsGetSize", .function = trace.wrap("sceAgcDcbSetBaseDrawIndirectArgsGetSize", &agc.setBaseDrawIndirectArgsGetSize), .expect_id = "MMlmJAL7N5w" },
+    .{ .name = "sceAgcDcbBeginOcclusionQueryGetSize", .function = trace.wrap("sceAgcDcbBeginOcclusionQueryGetSize", &agc.commandSize), .expect_id = "ms1xVoZ-Vwc" },
+    .{ .name = "sceAgcDcbEndOcclusionQueryGetSize", .function = trace.wrap("sceAgcDcbEndOcclusionQueryGetSize", &agc.commandSize), .expect_id = "P1CugZ99Uzc" },
+    .{ .name = "sceAgcDcbSetZPassPredicationEnableGetSize", .function = trace.wrap("sceAgcDcbSetZPassPredicationEnableGetSize", &agc.commandSize), .expect_id = "XN+Iuu7XsM8" },
+    .{ .name = "sceAgcDcbSetBoolPredicationEnableGetSize", .function = trace.wrap("sceAgcDcbSetBoolPredicationEnableGetSize", &agc.commandSize), .expect_id = "yheJGN-ay+A" },
+    .{ .name = "sceAgcDcbSetPredicationDisableGetSize", .function = trace.wrap("sceAgcDcbSetPredicationDisableGetSize", &agc.commandSize), .expect_id = "vLrBL8DQiz8" },
+    .{ .name = "sceAgcDcbPrimeUtcl2GetSize", .function = trace.wrap("sceAgcDcbPrimeUtcl2GetSize", &agc.commandSize), .expect_id = "KjPeVduz6jU" },
+    .{ .name = "sceAgcDcbSetIndexIndirectArgsGetSize", .function = trace.wrap("sceAgcDcbSetIndexIndirectArgsGetSize", &agc.commandSize), .expect_id = "AFIh8SQkYlQ" },
+    // These identifiers occur in the AGC 1.1 surface used by Rita's Rewind,
+    // but their public SDK spellings are not present in the available symbol
+    // lists.  Keep them explicit and traced until their command ABI is
+    // identified from a live call; returning success is safe for patch/config
+    // helpers and avoids fabricating a packet of an unknown width.
+    .{ .name = "sceAgcUnknownY5K5tPktiL8", .function = trace.wrap("sceAgcUnknownY5K5tPktiL8", &agc.accept), .id_override = "y5K5tPktiL8" },
+    .{ .name = "sceAgcUnknown6nths4DHNrs", .function = trace.wrap("sceAgcUnknown6nths4DHNrs", &agc.accept), .id_override = "6nths4DHNrs" },
+    .{ .name = "sceAgcUnknownICkECTBxrMw", .function = trace.wrap("sceAgcUnknownICkECTBxrMw", &agc.accept), .id_override = "ICkECTBxrMw" },
+    .{ .name = "sceAgcUnknownEJBA4dbmvfg", .function = trace.wrap("sceAgcUnknownEJBA4dbmvfg", &agc.accept), .id_override = "EJBA4dbmvfg" },
+    .{ .name = "sceAgcUnknownRTpjTIlvZc", .function = trace.wrap("sceAgcUnknownRTpjTIlvZc", &agc.accept), .id_override = "RTpj-tIlvZc" },
+    .{ .name = "sceAgcUnknownSwI6QxqwAC0", .function = trace.wrap("sceAgcUnknownSwI6QxqwAC0", &agc.accept), .id_override = "SwI6QxqwAC0" },
+    .{ .name = "sceAgcUnknownD4NZIlguzv0", .function = trace.wrap("sceAgcUnknownD4NZIlguzv0", &agc.accept), .id_override = "d4NZIlguzv0" },
+};
+
+pub const driver_exports = [_]symbols.Export{
+    .{ .name = "sceAgcDriverSubmitMultiAcbs", .function = trace.wrap("sceAgcDriverSubmitMultiAcbs", &agc_submit.submitMultiAcbs), .expect_id = "HF3YllT3mXU" },
+    .{ .name = "sceAgcDriverDeleteEqEvent", .function = trace.wrap("sceAgcDriverDeleteEqEvent", &agc.driverDeleteEqEvent), .expect_id = "DL2RXaXOy88" },
+    .{ .name = "sceAgcDriverGetEqEventType", .function = trace.wrap("sceAgcDriverGetEqEventType", &agc.driverGetEqEventType), .expect_id = "5CdQTZIQPxM" },
+    .{ .name = "sceAgcDriverTriggerCapture", .function = trace.wrap("sceAgcDriverTriggerCapture", &agc.accept), .expect_id = "Xq5WmbwPTnQ" },
+    .{ .name = "sceAgcDriverRequestCaptureStart", .function = trace.wrap("sceAgcDriverRequestCaptureStart", &agc.accept), .expect_id = "SAfhzJPcjuk" },
+    .{ .name = "sceAgcDriverRequestCaptureStop", .function = trace.wrap("sceAgcDriverRequestCaptureStop", &agc.accept), .expect_id = "FOwvmNlFLjM" },
+    .{ .name = "sceAgcDriverIsCaptureInProgress", .function = trace.wrap("sceAgcDriverIsCaptureInProgress", &agc.switchedOff), .expect_id = "Ddwk4gLT5j0" },
+    .{ .name = "sceAgcDriverIsSubmitValidationEnabled", .function = trace.wrap("sceAgcDriverIsSubmitValidationEnabled", &agc.switchedOff), .expect_id = "qspAL8bgcBY" },
+    .{ .name = "sceAgcDriverSetValidationErrorOutputFrequency", .function = trace.wrap("sceAgcDriverSetValidationErrorOutputFrequency", &agc.accept), .expect_id = "8F5j7U-Bq6s" },
+    .{ .name = "sceAgcDriverIsTraceInProgress", .function = trace.wrap("sceAgcDriverIsTraceInProgress", &agc.switchedOff), .expect_id = "+TN0oRTBxJQ" },
+    .{ .name = "sceAgcDriverGetShaderDebuggingStatus", .function = trace.wrap("sceAgcDriverGetShaderDebuggingStatus", &agc.switchedOff), .expect_id = "rJUyMrDdxJg" },
+    .{ .name = "sceAgcDriverQueryResourceRegistrationUserMemoryRequirements", .function = trace.wrap("sceAgcDriverQueryResourceRegistrationUserMemoryRequirements", &agc.driverQueryResourceRegistrationUserMemoryRequirements), .expect_id = "AOLcoIkQDgM" },
+    .{ .name = "sceAgcDriverInitResourceRegistration", .function = trace.wrap("sceAgcDriverInitResourceRegistration", &agc.driverInitResourceRegistration), .expect_id = "F0Y42t-3e18" },
+    .{ .name = "sceAgcDriverGetResourceRegistrationMaxNameLength", .function = trace.wrap("sceAgcDriverGetResourceRegistrationMaxNameLength", &agc.driverGetResourceRegistrationMaxNameLength), .expect_id = "uJziRsODk1c" },
+    .{ .name = "sceAgcDriverRegisterGdsResource", .function = trace.wrap("sceAgcDriverRegisterGdsResource", &agc.refuse), .expect_id = "emP3ckeS2uo" },
+    .{ .name = "sceAgcDriverUnregisterResource", .function = trace.wrap("sceAgcDriverUnregisterResource", &agc.accept), .expect_id = "pWLG7WOpVcw" },
+    .{ .name = "sceAgcDriverUnregisterOwnerAndResources", .function = trace.wrap("sceAgcDriverUnregisterOwnerAndResources", &agc.accept), .expect_id = "ZLJk9r2+2Aw" },
+    .{ .name = "sceAgcDriverUnregisterAllResourcesForOwner", .function = trace.wrap("sceAgcDriverUnregisterAllResourcesForOwner", &agc.accept), .expect_id = "SCoAN5fYlUM" },
+    .{ .name = "sceAgcDriverRegisterDefaultOwner", .function = trace.wrap("sceAgcDriverRegisterDefaultOwner", &agc.driverRegisterDefaultOwner), .expect_id = "U9ueyEhSkF4" },
+    .{ .name = "sceAgcDriverGetDefaultOwner", .function = trace.wrap("sceAgcDriverGetDefaultOwner", &agc.driverGetDefaultOwner), .expect_id = "F0ZXt5q0ZTA" },
+    .{ .name = "sceAgcDriverRegisterOwner", .function = trace.wrap("sceAgcDriverRegisterOwner", &agc.driverRegisterOwner), .expect_id = "X-Nm5KLREeg" },
+    .{ .name = "sceAgcDriverRegisterResource", .function = trace.wrap("sceAgcDriverRegisterResource", &agc.driverRegisterResource), .expect_id = "W5z4eZrjEas" },
+    .{ .name = "sceAgcDriverFindResourcesPublic", .function = trace.wrap("sceAgcDriverFindResourcesPublic", &agc.refuse), .expect_id = "5l3IfCFJxBs" },
+    .{ .name = "sceAgcDriverGetResourceName", .function = trace.wrap("sceAgcDriverGetResourceName", &agc.refuse), .expect_id = "M9yBzRKkjPc" },
+    .{ .name = "sceAgcDriverGetResourceType", .function = trace.wrap("sceAgcDriverGetResourceType", &agc.refuse), .expect_id = "rI9lNAXPMIw" },
+    .{ .name = "sceAgcDriverGetResourceBaseAddressAndSizeInBytes", .function = trace.wrap("sceAgcDriverGetResourceBaseAddressAndSizeInBytes", &agc.refuse), .expect_id = "NghWEUXp1qM" },
+    .{ .name = "sceAgcDriverGetResourceUserData", .function = trace.wrap("sceAgcDriverGetResourceUserData", &agc.refuse), .expect_id = "ls4jfY576lw" },
+    .{ .name = "sceAgcDriverSetResourceUserData", .function = trace.wrap("sceAgcDriverSetResourceUserData", &agc.accept), .expect_id = "VOMSpd9+vxU" },
+    .{ .name = "sceAgcDriverGetResourceShaderGuid", .function = trace.wrap("sceAgcDriverGetResourceShaderGuid", &agc.refuse), .expect_id = "mXn+K9E-wOA" },
+    .{ .name = "sceAgcDriverGetOwnerName", .function = trace.wrap("sceAgcDriverGetOwnerName", &agc.refuse), .expect_id = "LepGrgk77sM" },
+    // Newer driver helpers without recovered public names.  They are traced so
+    // their argument shapes can be promoted to typed implementations as soon
+    // as a title reaches them.
+    .{ .name = "sceAgcDriverUnknownICaGtkEIXTk", .function = trace.wrap("sceAgcDriverUnknownICaGtkEIXTk", &agc.accept), .id_override = "ICaGtkEIXTk" },
+    .{ .name = "sceAgcDriverUnknownWHIOMbbIIU", .function = trace.wrap("sceAgcDriverUnknownWHIOMbbIIU", &agc.accept), .id_override = "WHIOMbb+iIU" },
+    .{ .name = "sceAgcDriverUnknownChJWZcNSzjk", .function = trace.wrap("sceAgcDriverUnknownChJWZcNSzjk", &agc.accept), .id_override = "chJWZcNSzjk" },
+    .{ .name = "sceAgcDriverUnknownIAOE3jCnkk", .function = trace.wrap("sceAgcDriverUnknownIAOE3jCnkk", &agc.accept), .id_override = "+iAOE3jCnkk" },
+    // Dreaming Sarah imports these three. The jump patch is the one with
+    // known behaviour -- it points an INDIRECT_BUFFER at the buffer it should
+    // run -- so it is implemented rather than accepted; a jump left unpatched
+    // and reported as patched would run whatever the packet happened to hold.
+    // The other two have no published name, so they follow the convention the
+    // rest of this table already uses for that.
+    .{ .name = "sceAgcJumpPatchSetTarget", .function = trace.wrap("sceAgcJumpPatchSetTarget", &agc.jumpPatchSetTarget), .id_override = "2BS4EtAaF28" },
+    .{ .name = "sceAgcUnknownXb8VgcXQhvI", .function = trace.wrap("sceAgcUnknownXb8VgcXQhvI", &agc.accept), .id_override = "xb8VgcXQhvI" },
+    .{ .name = "sceAgcUnknownQmfvaYpsOcI", .function = trace.wrap("sceAgcUnknownQmfvaYpsOcI", &agc.accept), .id_override = "QmfvaYpsOcI" },
+};

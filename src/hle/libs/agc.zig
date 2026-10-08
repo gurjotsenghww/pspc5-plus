@@ -1,0 +1,1398 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! The rest of the graphics library a shipped engine builds its frames with.
+//!
+//! A title does not ask this library to draw. It asks it to *write* — each of
+//! these entry points appends one command to a buffer the title owns, and the
+//! buffer is handed to the hardware later in a single submission. So what these
+//! have to get right is not rendering but bookkeeping: how much space a command
+//! takes, and that the buffer stays a walkable sequence of commands afterwards.
+//!
+//! Implemented constructors emit executable PM4 packets with matching size
+//! queries. Remaining placeholder constructors emit correctly formed NOPs;
+//! filling their space with zeroes would instead create shorter register-write
+//! packets and corrupt the boundaries of every command that follows.
+//!
+//! Most placeholder patch entry points are accepted and change nothing. Patch
+//! operations for commands that are executed by the emulator, however, must
+//! preserve their real fields; release-memory fences are one such command.
+
+const std = @import("std");
+const abi = @import("../abi.zig");
+const gpu = @import("gpu");
+const trace = @import("../trace.zig");
+const errno = @import("../errno.zig");
+const symbols = @import("../symbols.zig");
+const event_queue = @import("kernel_event_queue.zig");
+const kernel_memory = @import("kernel_memory.zig");
+const kernel_threading = @import("kernel_threading.zig");
+const agc_submit = @import("agc_submit.zig");
+
+var eop_patch_reports: u32 = 0;
+var wait_patch_reports: u32 = 0;
+var command_buffer_grow_reports: u32 = 0;
+
+/// The cursor a title keeps over its command buffer.
+///
+/// Laid out as the library's own record: the entry points receive a pointer to
+/// it and are expected to advance it, and a title reads the same fields to work
+/// out how much room is left.
+pub const CommandBuffer = extern struct {
+    bottom: ?[*]u32,
+    top: ?[*]u32,
+    cursor_up: ?[*]u32,
+    cursor_down: ?[*]u32,
+    callback: ?*const anyopaque,
+    user_data: ?*anyopaque,
+    reserved_dwords: u32,
+};
+
+/// Words one written command occupies.
+///
+/// Uniform because the real widths vary per command and are not established
+/// here; what matters to a title is that the space it was told a command needs
+/// and the space the command takes are the same number, and that it can ask for
+/// that number in advance. Four words is wide enough for a header and a small
+/// body, which is what the narrowest real commands are.
+pub const command_words: u32 = 4;
+
+/// Writes one no-operation of `words` total size at the cursor and advances it.
+///
+/// Returns where the command was written, which is what a title uses to patch
+/// it afterwards, or null when it does not fit — the answer the library gives
+/// for a buffer with no room left.
+fn appendNop(state: ?*CommandBuffer, words: u32) ?[*]u32 {
+    const cursor = reserveDwords(state, words) orelse return null;
+
+    // A no-operation carries a body like any other command, and its header
+    // states that body's length. Writing the header alone would leave the words
+    // after it looking like commands of their own.
+    cursor[0] = (@as(u32, 3) << 30) |
+        (@as(u32, words - 1 - 1) << 16) |
+        (@as(u32, gpu.pm4.nop) << 8);
+    for (cursor[1..words]) |*word| word.* = 0;
+
+    return cursor;
+}
+
+/// One command written into the buffer named by the first argument.
+///
+/// The remaining arguments describe what the command should do and are not
+/// read: what a title checks after one of these is where the command landed and
+/// how far the cursor moved.
+pub fn writeCommand(
+    buffer: ?*CommandBuffer,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return appendNop(buffer, command_words);
+}
+
+/// Size query paired with the generic four-word placeholder commands.
+///
+/// GetSize entry points do not receive a command-buffer cursor.  Keeping a
+/// six-register signature is intentional: it lets the shared trace wrapper
+/// record the variant-specific arguments without ever interpreting the first
+/// one as a pointer.
+pub fn commandSize(
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) u32 {
+    return command_words * @sizeOf(u32);
+}
+
+/// Gates the following command-buffer words on a 32-bit guest predicate.
+///
+/// Unlike the generic placeholders this packet changes which later commands
+/// reach the command processor, so both its real width and payload matter.
+pub fn condExec(
+    buffer: ?*CommandBuffer,
+    predicate_address: u64,
+    command_words_to_execute: u32,
+) callconv(abi.guest) ?[*]u32 {
+    if (predicate_address == 0 or predicate_address & 3 != 0 or
+        command_words_to_execute > 0x3fff) return null;
+    const body = [_]u32{
+        @as(u32, @truncate(predicate_address)) & 0xffff_fffc,
+        @truncate(predicate_address >> 32),
+        0,
+        command_words_to_execute,
+    };
+    return writePacket(buffer, gpu.pm4.cond_exec, 0, &body);
+}
+
+pub fn condExecGetSize() callconv(abi.guest) u32 {
+    return 5 * @sizeOf(u32);
+}
+
+/// Links command-buffer segments, optionally selecting a target with a 64-bit
+/// memory comparison. The targets include stack arguments in the guest ABI.
+pub fn branch(
+    buffer: ?*CommandBuffer,
+    mode: u8,
+    compare_function: u8,
+    compare_address: u64,
+    mask: u64,
+    reference: u64,
+    then_cache_policy: u8,
+    then_address: u64,
+    then_words: u32,
+    else_cache_policy: u8,
+    else_address: u64,
+    else_words: u32,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{
+        (@as(u32, mode) & 3) | ((@as(u32, compare_function) & 7) << 8),
+        @as(u32, @truncate(compare_address)) & 0xffff_fff8,
+        @truncate(compare_address >> 32),
+        @truncate(mask),
+        @truncate(mask >> 32),
+        @truncate(reference),
+        @truncate(reference >> 32),
+        @as(u32, @truncate(then_address)) & 0xffff_fffc,
+        @truncate(then_address >> 32),
+        (then_words & 0x000f_ffff) | ((@as(u32, then_cache_policy) & 3) << 28),
+        @as(u32, @truncate(else_address)) & 0xffff_fffc,
+        @truncate(else_address >> 32),
+        (else_words & 0x000f_ffff) | ((@as(u32, else_cache_policy) & 3) << 28),
+    };
+    return writePacket(buffer, gpu.pm4.indirect_buffer, 0, &body);
+}
+
+pub fn branchGetSize() callconv(abi.guest) u32 {
+    return 14 * @sizeOf(u32);
+}
+
+fn availableDwords(buffer: *const CommandBuffer) u32 {
+    const cursor = buffer.cursor_up orelse buffer.bottom orelse return 0;
+    // The downward cursor separates command space from tail allocations.
+    // Older wrappers only populated top, so keep it as a fallback.
+    const end_cursor = buffer.cursor_down orelse buffer.top orelse return 0;
+    const at = @intFromPtr(cursor);
+    const end = @intFromPtr(end_cursor);
+    if (at >= end) return 0;
+    const physical_words = @min((end - at) / @sizeOf(u32), std.math.maxInt(u32));
+    if (physical_words <= buffer.reserved_dwords) return 0;
+    return @intCast(physical_words - buffer.reserved_dwords);
+}
+
+/// Reserves command words, asking the title to attach another arena when the
+/// current one is exhausted. The title retains the old segment and links it
+/// to the continuation when finalizing the submission.
+pub fn reserveDwords(state: ?*CommandBuffer, words: u32) ?[*]u32 {
+    const buffer = state orelse return null;
+    if (words == 0) return null;
+
+    if (availableDwords(buffer) < words) {
+        const callback = buffer.callback orelse return null;
+        const requested = std.math.add(u32, words, buffer.reserved_dwords) catch return null;
+        const callback_address = @intFromPtr(callback);
+        const buffer_address = @intFromPtr(buffer);
+        const user_data = if (buffer.user_data) |pointer| @intFromPtr(pointer) else 0;
+        const result = kernel_threading.callGuestCurrent(
+            callback_address,
+            &.{ buffer_address, requested, user_data },
+        ) catch |err| {
+            if (command_buffer_grow_reports < 16) {
+                std.debug.print(
+                    "[agc buffer] grow callback failed buffer=0x{x} callback=0x{x} need={d}: {s}\n",
+                    .{ buffer_address, callback_address, requested, @errorName(err) },
+                );
+                command_buffer_grow_reports += 1;
+            }
+            return null;
+        };
+        if (result == 0 or availableDwords(buffer) < words) {
+            if (command_buffer_grow_reports < 16) {
+                std.debug.print(
+                    "[agc buffer] grow rejected buffer=0x{x} callback=0x{x} result=0x{x} need={d} available={d}\n",
+                    .{ buffer_address, callback_address, result, words, availableDwords(buffer) },
+                );
+                command_buffer_grow_reports += 1;
+            }
+            return null;
+        }
+        if (command_buffer_grow_reports < 16) {
+            std.debug.print(
+                "[agc buffer] grew buffer=0x{x} callback=0x{x} need={d} available={d}\n",
+                .{ buffer_address, callback_address, words, availableDwords(buffer) },
+            );
+            command_buffer_grow_reports += 1;
+        }
+    }
+
+    const cursor = buffer.cursor_up orelse buffer.bottom orelse return null;
+    const at = @intFromPtr(cursor);
+    buffer.cursor_up = cursor + words;
+    agc_submit.trackGraphicsCommandAllocation(
+        if (buffer.bottom) |base| @intFromPtr(base) else 0,
+        at,
+        words,
+    );
+    return cursor;
+}
+
+fn writePacket(state: ?*CommandBuffer, opcode: u8, header_bits: u32, body: []const u32) ?[*]u32 {
+    if (body.len == 0) return null;
+    const cursor = reserveDwords(state, @intCast(body.len + 1)) orelse return null;
+    cursor[0] = (@as(u32, 3) << 30) |
+        (@as(u32, @intCast(body.len - 1)) << 16) |
+        (@as(u32, opcode) << 8) |
+        header_bits;
+    @memcpy(cursor[1 .. body.len + 1], body);
+    return cursor;
+}
+
+fn indirectPatchOffsets(modifier: u64, indexed: bool) u64 {
+    const low: u32 = @truncate(modifier);
+    const stage = low >> 29;
+    const sgpr_base: u32 = 0x8c + @as(u32, if (stage == 3 or stage == 5) 0x80 else 0);
+    var base_vertex: u64 = 0x280;
+    if (low & 1 != 0) base_vertex = sgpr_base + ((low >> 9) & 0x1f);
+    var start_instance: u64 = 0x280;
+    if (low & 4 != 0) start_instance = sgpr_base + ((low >> 19) & 0x1f);
+    if (indexed and (low & 2) != 0) {
+        base_vertex |= @as(u64, sgpr_base + ((low >> 14) & 0x1f)) << 16;
+        base_vertex |= @as(u64, 1) << 59;
+    }
+    return base_vertex | (start_instance << 32);
+}
+
+fn indirectDrawInitiator(modifier: u64) u32 {
+    if (modifier & (@as(u64, 1) << 32) != 0) return 2;
+    return (@as(u32, @truncate(modifier >> 3)) & 0x20) | 2;
+}
+
+fn emitIndirectDraw(
+    buffer: ?*CommandBuffer,
+    opcode: u8,
+    data_offset: u32,
+    modifier: u64,
+    indexed: bool,
+) ?[*]u32 {
+    const patch = indirectPatchOffsets(modifier, indexed);
+    const body = [_]u32{
+        data_offset,
+        @truncate(patch),
+        @truncate(patch >> 32),
+        indirectDrawInitiator(modifier),
+    };
+    return writePacket(buffer, opcode, 0, &body);
+}
+
+fn emitIndirectDrawMulti(
+    buffer: ?*CommandBuffer,
+    opcode: u8,
+    data_offset: u32,
+    count_indirect: u32,
+    max_count_or_count: u32,
+    count_address: u64,
+    stride_in_bytes: u32,
+    modifier: u64,
+    indexed: bool,
+) ?[*]u32 {
+    if (count_indirect & ~@as(u32, 1) != 0) return null;
+    const default_stride = gpu.pm4.indirectDrawArgBytes(indexed);
+    const stride = if (stride_in_bytes == 0) default_stride else stride_in_bytes;
+    const patch = indirectPatchOffsets(modifier, indexed);
+    const aligned_count = if (count_indirect == 0) 0 else count_address & ~@as(u64, 3);
+    const body = [_]u32{
+        data_offset,
+        @truncate(patch),
+        @truncate(patch >> 32),
+        count_indirect << 30,
+        max_count_or_count,
+        @truncate(aligned_count),
+        @truncate(aligned_count >> 32),
+        stride,
+        indirectDrawInitiator(modifier),
+    };
+    return writePacket(buffer, opcode, 0, &body);
+}
+
+fn directDrawInitiator(modifier: u64) u32 {
+    if (modifier & (@as(u64, 1) << 32) != 0) return 0;
+    return (@as(u32, @truncate(modifier)) >> 3) & 0x20;
+}
+
+/// Emits Prospero's indexed multi-instance packet instead of the old NOP
+/// placeholder. Yotei builds its scene object batches through this entry
+/// point; dropping it leaves the later visibility/ID image entirely empty.
+pub fn drawIndexMultiInstanced(
+    buffer: ?*CommandBuffer,
+    index_count: u32,
+    index_address: u64,
+    object_ids_address: u64,
+    instance_count: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (index_address == 0 or object_ids_address == 0 or index_address & 1 != 0) return null;
+    const body = [_]u32{
+        index_count,
+        @truncate(index_address),
+        @truncate(index_address >> 32),
+        @max(instance_count, 1),
+        @truncate(object_ids_address),
+        @truncate(object_ids_address >> 32),
+        instance_count,
+        directDrawInitiator(modifier) | 0x80,
+    };
+    return writePacket(buffer, gpu.pm4.dispatch_draw_preamble, 0, &body);
+}
+
+pub fn drawIndexMultiInstancedGetSize() callconv(abi.guest) u32 {
+    return 9 * @sizeOf(u32);
+}
+
+pub fn setBaseIndirectArgs(
+    buffer: ?*CommandBuffer,
+    shader_type: u32,
+    address: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{
+        1,
+        @as(u32, @truncate(address)) & ~@as(u32, 7),
+        @truncate(address >> 32),
+    };
+    return writePacket(buffer, gpu.pm4.set_base, (shader_type & 1) << 1, &body);
+}
+
+pub fn setBaseDrawIndirectArgsGetSize() callconv(abi.guest) u32 {
+    return 4 * @sizeOf(u32);
+}
+
+pub fn dispatchIndirect(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    modifier: u32,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{ data_offset, (modifier & 0xa038) | 0x41 };
+    return writePacket(buffer, gpu.pm4.dispatch_indirect, 0, &body);
+}
+
+pub fn dispatchIndirectGetSize() callconv(abi.guest) u32 {
+    return 3 * @sizeOf(u32);
+}
+
+pub fn dispatchIndirectAbsolute(
+    buffer: ?*CommandBuffer,
+    argument_address: u64,
+    modifier: u32,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{ @truncate(argument_address), @truncate(argument_address >> 32), (modifier & 0xa038) | 0x41 };
+    return writePacket(buffer, gpu.pm4.dispatch_indirect, 0, &body);
+}
+
+pub fn dispatchIndirectAbsoluteGetSize() callconv(abi.guest) u32 {
+    return 4 * @sizeOf(u32);
+}
+
+pub fn writeData(
+    buffer: ?*CommandBuffer,
+    destination: u32,
+    cache_policy: u32,
+    address: u64,
+    data: ?[*]align(1) const u32,
+    count: u32,
+    single_address: u32,
+    write_confirm: u32,
+) callconv(abi.guest) ?[*]u32 {
+    const source = data orelse return null;
+    if (count > 0x3ffd) return null;
+    const cursor = reserveDwords(buffer, 4 + count) orelse return null;
+    cursor[0] = (@as(u32, 3) << 30) | ((count + 2) << 16) | (@as(u32, gpu.pm4.write_data) << 8);
+    // DCB's selector packs the parser/ME choice in its low bit, followed
+    // by the hardware destination. ACB has only the latter field.
+    cursor[1] = ((destination & 1) << 30) | ((destination & 0x1e) << 7) |
+        ((single_address & 1) << 16) | ((@as(u32, if (destination == 0) 0 else write_confirm) & 1) << 20) |
+        ((cache_policy & 3) << 25);
+    cursor[2] = @as(u32, @truncate(address)) & ~@as(u32, 3);
+    cursor[3] = @truncate(address >> 32);
+    @memcpy(cursor[4..][0..count], source[0..count]);
+    return cursor;
+}
+
+pub fn writeDataAcb(
+    buffer: ?*CommandBuffer,
+    destination: u32,
+    cache_policy: u32,
+    address: u64,
+    data: ?[*]align(1) const u32,
+    count: u32,
+    single_address: u32,
+    write_confirm: u32,
+) callconv(abi.guest) ?[*]u32 {
+    return writeData(buffer, (destination & 0xf) << 1, cache_policy, address, data, count, single_address, write_confirm);
+}
+
+pub fn writeDataGetSize(count: u32) callconv(abi.guest) u32 {
+    return if (count <= 0x3ffd) (count + 4) * @sizeOf(u32) else 0;
+}
+
+pub fn acquireMemGetSize() callconv(abi.guest) u32 {
+    return 8 * @sizeOf(u32);
+}
+
+pub fn dmaDataGetSize() callconv(abi.guest) u32 {
+    return 7 * @sizeOf(u32);
+}
+
+pub fn drawIndirect(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return emitIndirectDraw(buffer, gpu.pm4.draw_indirect, data_offset, modifier, false);
+}
+
+pub fn drawIndexIndirect(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return emitIndirectDraw(buffer, gpu.pm4.draw_index_indirect, data_offset, modifier, true);
+}
+
+pub fn drawIndirectGetSize() callconv(abi.guest) u32 {
+    return 5 * @sizeOf(u32);
+}
+
+pub fn drawIndexIndirectGetSize() callconv(abi.guest) u32 {
+    return 5 * @sizeOf(u32);
+}
+
+pub fn drawIndirectMulti(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    count_indirect: u32,
+    max_count_or_count: u32,
+    count_address: u64,
+    stride_in_bytes: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return emitIndirectDrawMulti(
+        buffer,
+        gpu.pm4.draw_indirect_multi,
+        data_offset,
+        count_indirect,
+        max_count_or_count,
+        count_address,
+        stride_in_bytes,
+        modifier,
+        false,
+    );
+}
+
+pub fn drawIndexIndirectMulti(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    count_indirect: u32,
+    max_count_or_count: u32,
+    count_address: u64,
+    stride_in_bytes: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return emitIndirectDrawMulti(
+        buffer,
+        gpu.pm4.draw_index_indirect_multi,
+        data_offset,
+        count_indirect,
+        max_count_or_count,
+        count_address,
+        stride_in_bytes,
+        modifier,
+        true,
+    );
+}
+
+pub fn drawIndirectMultiGetSize() callconv(abi.guest) u32 {
+    return 10 * @sizeOf(u32);
+}
+
+pub fn drawIndexIndirectMultiGetSize() callconv(abi.guest) u32 {
+    return 10 * @sizeOf(u32);
+}
+
+/// Edits a field of a command already written.
+///
+/// Accepted and does nothing. The command being edited is a no-operation, so
+/// there is no field whose value would change anything, and a title doing this
+/// is doing something ordinary that there is no reason to stop.
+/// One register written straight into the command buffer.
+///
+/// The guest passes a `{ offset, value }` pair by value, which the calling
+/// convention packs into a single register: the offset in the low half and
+/// the value in the high half. The packet is three dwords -- header, offset,
+/// value -- and the executor writes it into the queue register file through
+/// `registerSpaceOf`, so the writer, the size below and the execution all
+/// describe the same three words.
+fn setRegisterDirect(state: ?*CommandBuffer, entry: u64, opcode: u8) ?[*]u32 {
+    const body = [_]u32{
+        @as(u32, @truncate(entry)) & 0xffff,
+        @truncate(entry >> 32),
+    };
+    return writePacket(state, opcode, 0, &body);
+}
+
+pub fn setCxRegisterDirect(
+    state: ?*CommandBuffer,
+    entry: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return setRegisterDirect(state, entry, gpu.pm4.set_context_reg);
+}
+
+pub fn setShRegisterDirect(
+    state: ?*CommandBuffer,
+    entry: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return setRegisterDirect(state, entry, gpu.pm4.set_sh_reg);
+}
+
+pub fn setUcRegisterDirect(
+    state: ?*CommandBuffer,
+    entry: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return setRegisterDirect(state, entry, gpu.pm4.set_uconfig_reg);
+}
+
+/// Bytes one `Set*RegisterDirect` packet occupies.
+pub fn registerDirectGetSize(
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) u32 {
+    return 3 * @sizeOf(u32);
+}
+pub fn patchCommand(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn condExecPacket(command_address: u64) ?*[5]u32 {
+    if (command_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(command_address, 5 * @sizeOf(u32))) return null;
+    const words: *[5]u32 = @ptrFromInt(command_address);
+    const header = words[0];
+    if ((header >> 30) != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.cond_exec) return null;
+    return words;
+}
+
+/// Extends an existing COND_EXEC packet through `range_end`.
+pub fn patchCondExecEnd(command_address: u64, range_end: u64) callconv(abi.guest) i32 {
+    const words = condExecPacket(command_address) orelse return errno.KernelError.einval.raw();
+    const packet_end = command_address + 5 * @sizeOf(u32);
+    if (range_end < packet_end or range_end & 3 != 0) return errno.KernelError.einval.raw();
+    const count = (range_end - packet_end) / @sizeOf(u32);
+    if (count > 0x3fff) return errno.KernelError.einval.raw();
+    words[4] = (words[4] & ~@as(u32, 0x3fff)) | @as(u32, @intCast(count));
+    return errno.ok;
+}
+
+/// Moves an existing COND_EXEC packet to a different predicate word.
+pub fn patchCondExecCommandAddress(command_address: u64, predicate_address: u64) callconv(abi.guest) i32 {
+    if (predicate_address == 0 or predicate_address & 3 != 0) return errno.KernelError.einval.raw();
+    const words = condExecPacket(command_address) orelse return errno.KernelError.einval.raw();
+    words[1] = (words[1] & 3) | (@as(u32, @truncate(predicate_address)) & 0xffff_fffc);
+    words[2] = @truncate(predicate_address >> 32);
+    return errno.ok;
+}
+
+fn releasePacket(command_address: u64) ?*[8]u32 {
+    if (command_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(command_address, 8 * @sizeOf(u32))) return null;
+    const words: *[8]u32 = @ptrFromInt(command_address);
+    const header = words[0];
+    if ((header >> 30) != 3) return null;
+    const opcode: u8 = @truncate(header >> 8);
+    if (opcode == gpu.pm4.release_mem) return words;
+    if (opcode != gpu.pm4.nop or
+        @as(u6, @truncate(header >> 2)) != gpu.pm4.custom.release_mem) return null;
+    return words;
+}
+
+const WaitPacket = struct {
+    words: [*]u32,
+    is_64_bit: bool,
+};
+
+fn waitPacket(command_address: u64) ?WaitPacket {
+    if (command_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(command_address, 3 * @sizeOf(u32))) return null;
+    const words: [*]u32 = @ptrFromInt(command_address);
+    const header = words[0];
+    if ((header >> 30) != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.nop) return null;
+
+    const code: u6 = @truncate(header >> 2);
+    const is_64_bit = switch (code) {
+        gpu.pm4.custom.wait_mem_32 => false,
+        gpu.pm4.custom.wait_mem_64 => true,
+        else => return null,
+    };
+    const word_count: usize = if (is_64_bit) 9 else 7;
+    if (!kernel_memory.isGuestRangeAccessible(command_address, word_count * @sizeOf(u32))) return null;
+    return .{ .words = words, .is_64_bit = is_64_bit };
+}
+
+/// Moves a custom 32/64-bit WAIT_REG_MEM packet to a new watched label.
+pub fn patchWaitRegMemAddress(command_address: u64, address: u64) callconv(abi.guest) i32 {
+    const packet = waitPacket(command_address) orelse return errno.KernelError.einval.raw();
+    const alignment_mask: u32 = if (packet.is_64_bit) 0xffff_fff8 else 0xffff_fffc;
+    packet.words[1] = @as(u32, @truncate(address)) & alignment_mask;
+    packet.words[2] = @as(u32, @truncate(address >> 32)) & 0x0003_ffff;
+    if (wait_patch_reports < 16) {
+        std.debug.print(
+            "[agc wait patch] cmd=0x{x} width={d} address=0x{x}\n",
+            .{ command_address, if (packet.is_64_bit) @as(u32, 64) else 32, address },
+        );
+        wait_patch_reports += 1;
+    }
+    return errno.ok;
+}
+
+/// Replaces the value a custom WAIT_REG_MEM packet compares against.
+pub fn patchWaitRegMemReference(command_address: u64, reference: u64) callconv(abi.guest) i32 {
+    const packet = waitPacket(command_address) orelse return errno.KernelError.einval.raw();
+    if (packet.is_64_bit) {
+        packet.words[5] = @truncate(reference);
+        packet.words[6] = @truncate(reference >> 32);
+    } else {
+        packet.words[4] = @truncate(reference);
+    }
+    return errno.ok;
+}
+
+/// Replaces only the three comparison-function bits, retaining wait operation
+/// and cache-policy fields packed alongside them.
+pub fn patchWaitRegMemCompareFunction(command_address: u64, compare_function: u32) callconv(abi.guest) i32 {
+    if (compare_function > 7) return errno.KernelError.einval.raw();
+    const packet = waitPacket(command_address) orelse return errno.KernelError.einval.raw();
+    const control_index: usize = if (packet.is_64_bit) 7 else 5;
+    packet.words[control_index] = (packet.words[control_index] & ~@as(u32, 0x7)) | compare_function;
+    return errno.ok;
+}
+
+fn eventWriteEopPacket(command_address: u64) ?*[6]u32 {
+    if (command_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(command_address, 6 * @sizeOf(u32))) return null;
+    const words: *[6]u32 = @ptrFromInt(command_address);
+    const header = words[0];
+    if ((header >> 30) != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.event_write_eop) return null;
+    return words;
+}
+
+/// Moves either a Gen5 RELEASE_MEM or legacy EVENT_WRITE_EOP completion label.
+pub fn patchQueueEndOfPipeAddress(command_address: u64, address: u64) callconv(abi.guest) i32 {
+    if (releasePacket(command_address)) |words| {
+        words[3] = @truncate(address);
+        words[4] = @truncate(address >> 32);
+    } else if (eventWriteEopPacket(command_address)) |words| {
+        words[2] = @truncate(address);
+        words[3] = (words[3] & 0xffff_0000) | (@as(u32, @truncate(address >> 32)) & 0xffff);
+    } else {
+        return errno.KernelError.einval.raw();
+    }
+    if (eop_patch_reports < 16) {
+        std.debug.print("[agc eop patch] cmd=0x{x} address=0x{x}\n", .{ command_address, address });
+        eop_patch_reports += 1;
+    }
+    return errno.ok;
+}
+
+/// Patches the coherency control in the first RELEASE_MEM control word.
+pub fn patchQueueEndOfPipeGcr(command_address: u64, gcr_control: u32) callconv(abi.guest) i32 {
+    const words = releasePacket(command_address) orelse return errno.KernelError.einval.raw();
+    var packet_gcr = gcr_control & 0x0fff;
+    // GL2 writeback implies the companion invalidate bit on Gen5.
+    if (packet_gcr & 0x300 == 0x100) packet_gcr |= 0x200;
+    words[1] = (words[1] & ~@as(u32, 0x00ff_f000)) | (packet_gcr << 12);
+    return errno.ok;
+}
+
+/// Patches a Core-ring fence payload. The AGC patch context is a monotonic
+/// segment generation; the packet stores that generation in the payload's high
+/// byte while retaining the caller-provided low 24 bits.
+pub fn patchQueueEndOfPipeData(
+    command_address: u64,
+    context_id: u32,
+    data_selection: u32,
+    data: u64,
+) callconv(abi.guest) i32 {
+    if (releasePacket(command_address)) |words| {
+        var packet_data = data;
+        if (@as(u8, @truncate(words[0] >> 8)) == gpu.pm4.nop and
+            context_id > 1 and data_selection == 1)
+        {
+            packet_data = (@as(u64, context_id - 2) << 24) | (data & 0x00ff_ffff);
+        }
+        if (eop_patch_reports < 16) {
+            std.debug.print(
+                "[agc eop patch] cmd=0x{x} context={d} selection={d} data=0x{x}->0x{x}\n",
+                .{ command_address, context_id, data_selection, data, packet_data },
+            );
+            eop_patch_reports += 1;
+        }
+        words[5] = @truncate(packet_data);
+        words[6] = @truncate(packet_data >> 32);
+    } else if (eventWriteEopPacket(command_address)) |words| {
+        words[4] = @truncate(data);
+        words[5] = @truncate(data >> 32);
+    } else {
+        return errno.KernelError.einval.raw();
+    }
+    return errno.ok;
+}
+
+/// Selects the RELEASE_MEM destination type without disturbing its interrupt
+/// selector or payload mode.
+pub fn patchQueueEndOfPipeType(command_address: u64, destination: u32) callconv(abi.guest) i32 {
+    if (destination > 3) return errno.KernelError.einval.raw();
+    const words = releasePacket(command_address) orelse return errno.KernelError.einval.raw();
+    words[2] = (words[2] & ~@as(u32, 0x0003_0000)) | (destination << 16);
+    return errno.ok;
+}
+
+/// How much room a command needs, asked before writing one.
+///
+/// Has to agree with what the writer actually consumes, or a title that
+/// reserves space by asking here will either overrun its buffer or leave a hole
+/// in it that nothing accounts for.
+/// The length of a packet that has already been written, in DWORDS.
+///
+/// This is the one size query in the library that does not answer in bytes.
+/// The GetSize family says how much room a command will need before it is
+/// written, and answers in bytes; this reads a packet that already exists and
+/// says how many dwords to step over to reach the next one, which is what a
+/// caller walking a buffer needs. The two units are not interchangeable and
+/// the distinction is the reason this lives apart from `commandSize`.
+///
+/// The rule matches the command walker in `gpu.pm4` exactly, including its
+/// treatment of alignment filler, so a caller stepping through a buffer with
+/// this lands on the same packet boundaries the executor will.
+pub fn packetSize(
+    packet: ?[*]const u32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) u32 {
+    const words = packet orelse return 0;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(words), @sizeOf(u32))) return 0;
+    const header = words[0];
+    // Type-2 padding carries no body, and the all-ones NOP header is the
+    // filler a builder emits to realign; both occupy exactly one dword.
+    if (header >> 30 == 2 or header == 0xffff_1000) return 1;
+    return ((header >> 16) & 0x3fff) + 2;
+}
+
+/// Where a data packet keeps its payload, and how much of it there is.
+///
+/// A title writes a packet that carries bytes of its own -- a marker string,
+/// a block of user data -- and comes back later to read or rewrite them
+/// without rebuilding the packet. This is how it finds them: hand over the
+/// packet and the form it was written in, and get back the address the payload
+/// starts at and its length in bytes.
+///
+/// The two forms differ only in where the payload begins. One puts it directly
+/// after the header; the other reserves a word in between, and its payload
+/// starts a word later and is a word shorter. The length is taken from the
+/// header's own count field, so the range this reports and the span the
+/// command walker steps over are the same span.
+///
+/// A packet with no body is reported as an empty range rather than as a range
+/// that starts inside the packet after it. That covers the two headers which
+/// carry no length at all: type-2 padding, which has no count field, and the
+/// all-ones count that marks the single-dword filler a builder emits to
+/// realign. Neither encodes a length, so there is nothing to point at -- and
+/// handing back the maximum the field can express would be a range over
+/// whatever follows the packet in the buffer.
+pub const MemoryRange = extern struct {
+    base: ?[*]u32,
+    size: u64,
+};
+
+pub fn dataPacketPayloadRange(
+    range: ?*MemoryRange,
+    packet: ?[*]u32,
+    payload_form: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    const out = range orelse return errno.KernelError.einval.raw();
+    const words = packet orelse return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(out), @sizeOf(MemoryRange))) {
+        return errno.KernelError.efault.raw();
+    }
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(words), @sizeOf(u32))) {
+        return errno.KernelError.efault.raw();
+    }
+
+    const header = words[0];
+    const count = (header >> 16) & 0x3fff;
+    if (header >> 30 != 3 or count == 0x3fff) {
+        out.* = .{ .base = null, .size = 0 };
+        return errno.ok;
+    }
+
+    // `count` is one less than the body, so the body is `count + 1` words and
+    // the words after a reserved one are `count`.
+    const payload_words: u64 = if (payload_form == 0) @as(u64, count) + 1 else count;
+    // An empty range has no base, so a caller that tests the pointer reaches
+    // the same conclusion as one that tests the length. The reserved form of
+    // a one-word packet is the case: every word of it is the reserved one.
+    out.* = if (payload_words == 0)
+        .{ .base = null, .size = 0 }
+    else
+        .{ .base = words + (if (payload_form == 0) @as(usize, 1) else 2), .size = payload_words * @sizeOf(u32) };
+    return errno.ok;
+}
+
+/// Answers "how many" and "which" with nothing.
+pub fn zeroQuery(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) u64 {
+    return 0;
+}
+
+/// Points a jump the title has already written at the buffer it should run.
+///
+/// A title reserves the INDIRECT_BUFFER packet before the target exists and
+/// fills it in afterwards, so the address and the length arrive separately
+/// from the packet itself. Refusing anything that is not that packet matters:
+/// the words written here are the low and high halves of an address and a
+/// twenty-bit length, and writing them over some other command would leave a
+/// stream that reads as valid and jumps somewhere it was never meant to.
+pub fn jumpPatchSetTarget(
+    command: ?[*]u32,
+    target: u64,
+    size_in_dwords: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    const words = command orelse return errno.Posix.einval;
+    if (@as(u8, @truncate(words[0] >> 8)) != gpu.pm4.indirect_buffer) return errno.Posix.einval;
+    words[1] = @truncate(target);
+    words[2] = (words[2] & 0xffff_0000) | @as(u32, @truncate(target >> 32)) & 0xffff;
+    words[3] = (words[3] & 0xfff0_0000) | (@as(u32, @truncate(size_in_dwords)) & 0x000f_ffff);
+    return errno.ok;
+}
+
+/// Accepts a setting that changes nothing observable here.
+pub fn accept(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+/// Reports a debugging facility as switched off.
+///
+/// Frame capture, submission validation and shader debugging are all things a
+/// development machine offers and a retail one does not. Reporting them off is
+/// the retail answer, and it is the one that stops a title from waiting for a
+/// capture that will never be taken.
+pub fn switchedOff(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return 0;
+}
+
+/// Refuses a request whose reply a caller stores and then follows.
+///
+/// Resource registration hands back names, addresses and identifiers that a
+/// title keeps and later dereferences. Answering without a registry behind it
+/// would furnish it with values naming nothing, and it would carry them until
+/// something failed far from here.
+pub fn refuse(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.KernelError.enosys.raw();
+}
+
+const resource_registration_bytes_per_resource: u64 = 0x118;
+const resource_registration_bytes_per_owner: u64 = 0x1e0;
+const resource_registration_max_name_length: u32 = 256;
+
+var default_owner = std.atomic.Value(u32).init(1);
+var next_owner = std.atomic.Value(u32).init(1);
+
+fn writable(comptime T: type, output: ?*T) ?*T {
+    const pointer = output orelse return null;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(pointer), @sizeOf(T))) return null;
+    return pointer;
+}
+
+/// Returns the exact backing-store requirement used by the PS5 resource
+/// registry. Leaving this output untouched makes the caller interpret stack
+/// data as a byte count and attempt multi-gigabyte direct-memory allocations.
+pub fn driverQueryResourceRegistrationUserMemoryRequirements(
+    output: ?*u64,
+    resource_count: u64,
+    owner_count: u64,
+) callconv(abi.guest) i32 {
+    const result = writable(u64, output) orelse return errno.KernelError.efault.raw();
+    if (resource_count == 0 or owner_count == 0) return errno.KernelError.einval.raw();
+    const resources = std.math.mul(u64, resource_count, resource_registration_bytes_per_resource) catch
+        return errno.KernelError.einval.raw();
+    const owners = std.math.mul(u64, owner_count, resource_registration_bytes_per_owner) catch
+        return errno.KernelError.einval.raw();
+    result.* = std.math.add(u64, resources, owners) catch
+        return errno.KernelError.einval.raw();
+    return errno.ok;
+}
+
+pub fn driverInitResourceRegistration(
+    memory_address: u64,
+    memory_size: u64,
+    owner_count: u64,
+) callconv(abi.guest) i32 {
+    if (memory_address == 0 or memory_size == 0 or owner_count == 0) {
+        return errno.KernelError.einval.raw();
+    }
+    if (!kernel_memory.isGuestRangeAccessible(memory_address, memory_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    default_owner.store(1, .release);
+    next_owner.store(1, .release);
+    return errno.ok;
+}
+
+pub fn driverGetResourceRegistrationMaxNameLength(output: ?*u32) callconv(abi.guest) i32 {
+    const result = writable(u32, output) orelse return errno.KernelError.efault.raw();
+    result.* = resource_registration_max_name_length;
+    return errno.ok;
+}
+
+pub fn driverRegisterDefaultOwner(owner: u32) callconv(abi.guest) i32 {
+    default_owner.store(owner, .release);
+    return errno.ok;
+}
+
+pub fn driverGetDefaultOwner(output: ?*u32) callconv(abi.guest) i32 {
+    const result = writable(u32, output) orelse return errno.KernelError.efault.raw();
+    result.* = default_owner.load(.acquire);
+    return errno.ok;
+}
+
+pub fn driverRegisterOwner(output: ?*u32, name: ?[*:0]const u8) callconv(abi.guest) i32 {
+    const result = writable(u32, output) orelse return errno.KernelError.efault.raw();
+    if (name == null) return errno.KernelError.einval.raw();
+    var owner = next_owner.fetchAdd(1, .acq_rel);
+    if (owner == default_owner.load(.acquire)) owner = next_owner.fetchAdd(1, .acq_rel);
+    if (owner == 0) return errno.KernelError.enospc.raw();
+    result.* = owner;
+    return errno.ok;
+}
+
+/// Registration is diagnostic metadata; command submission consumes the
+/// addresses directly. Preserve the full ABI so callers and traces retain the
+/// resource identity even though no host-side name database is needed yet.
+pub fn driverRegisterResource(
+    resource_address: u64,
+    owner: u32,
+    name: ?[*:0]const u8,
+    base_address: u64,
+    resource_type: u32,
+    flags: u32,
+) callconv(abi.guest) i32 {
+    _ = resource_address;
+    _ = owner;
+    _ = name;
+    _ = base_address;
+    _ = resource_type;
+    _ = flags;
+    return errno.ok;
+}
+
+pub fn driverAddEqEvent(equeue: i64, id: i32, user_data: u64) callconv(abi.guest) i32 {
+    return event_queue.addGraphicsEvent(equeue, id, user_data);
+}
+
+pub fn driverDeleteEqEvent(equeue: i64, id: i32) callconv(abi.guest) i32 {
+    return event_queue.deleteGraphicsEvent(equeue, id);
+}
+
+pub fn driverGetEqEventType(event: ?*const event_queue.Event) callconv(abi.guest) i32 {
+    const value = event orelse return 0;
+    return if (value.filter == event_queue.graphics_filter)
+        @bitCast(@as(u32, @truncate(value.ident)))
+    else
+        @bitCast(@as(u32, @truncate(@as(u64, @bitCast(value.data)))));
+}
+
+pub fn driverGetEqContextId(event: ?*const event_queue.Event) callconv(abi.guest) u32 {
+    const value = event orelse return 0;
+    return if (value.filter == event_queue.graphics_filter)
+        @truncate(@as(u64, @bitCast(value.data)))
+    else
+        @truncate(value.ident);
+}
+
+pub const exports = @import("agc_table.zig").exports;
+pub const driver_exports = @import("agc_table.zig").driver_exports;
+
+pub const library = symbols.Library{ .name = "libSceAgc", .version = 1 };
+pub const module = symbols.Module{ .name = "libSceAgc", .version_major = 1, .version_minor = 1 };
+pub const driver_library = symbols.Library{ .name = "libSceAgcDriver", .version = 1 };
+pub const driver_module = symbols.Module{
+    .name = "libSceAgcDriver",
+    .version_major = 1,
+    .version_minor = 1,
+};
+
+pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
+    try db.addLibrary(gpa, library, module, &exports);
+    try db.addLibrary(gpa, driver_library, driver_module, &driver_exports);
+}
+
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn fixture(storage: []u32) CommandBuffer {
+    return .{
+        .bottom = storage.ptr,
+        .top = storage.ptr + storage.len,
+        .cursor_up = storage.ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+}
+
+test "a written command leaves the buffer walkable" {
+    // Filling the space with zeroes would not: zeroes decode as a register
+    // write of one word, so the buffer becomes a different, shorter stream that
+    // nothing can walk.
+    var storage: [16]u32 = @splat(0xdead_beef);
+    var buffer = fixture(&storage);
+
+    try testing.expect(writeCommand(&buffer, 0, 0, 0, 0, 0) != null);
+    try testing.expect(writeCommand(&buffer, 0, 0, 0, 0, 0) != null);
+
+    const written = storage[0 .. 2 * command_words];
+    var walker = gpu.pm4.Walker.init(written);
+    var seen: usize = 0;
+    while (try walker.next()) |packet| {
+        try testing.expectEqual(gpu.pm4.nop, packet.opcode);
+        try testing.expectEqual(@as(usize, command_words), packet.wordCount());
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "the cursor moves by exactly what was written" {
+    var storage: [16]u32 = @splat(0);
+    var buffer = fixture(&storage);
+
+    const at = writeCommand(&buffer, 0, 0, 0, 0, 0).?;
+    try testing.expectEqual(storage[0..].ptr, at);
+    try testing.expectEqual(storage[0..].ptr + command_words, buffer.cursor_up.?);
+}
+
+test "COND_EXEC has its hardware width and patchable fields" {
+    var storage: [8]u32 = @splat(0xdead_beef);
+    var buffer = fixture(&storage);
+    try testing.expectEqual(@as(u32, 20), condExecGetSize());
+    const command = condExec(&buffer, 0x1234_5678, 7).?;
+    try testing.expectEqual(storage[0..].ptr + 5, buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(storage[0..5]);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.cond_exec, packet.opcode);
+    try testing.expectEqualSlices(u32, &.{ 0x1234_5678, 0, 0, 7 }, packet.body);
+
+    try testing.expectEqual(errno.ok, patchCondExecCommandAddress(@intFromPtr(command), 0x9abc_def0));
+    try testing.expectEqual(errno.ok, patchCondExecEnd(@intFromPtr(command), @intFromPtr(command + 8)));
+    try testing.expectEqual(@as(u32, 0x9abc_def0), storage[1]);
+    try testing.expectEqual(@as(u32, 3), storage[4]);
+}
+
+test "the size a title is told matches what a write consumes" {
+    // A title reserves space by asking first. If the two disagree it either
+    // overruns its buffer or leaves a hole nothing accounts for. The query
+    // answers in bytes, so the comparison is made in bytes.
+    var storage: [64]u32 = @splat(0);
+    var buffer = fixture(&storage);
+    const announced_bytes = commandSize(0, 0, 0, 0, 0, 0);
+
+    const before = @intFromPtr(buffer.cursor_up.?);
+    const written = writeCommand(&buffer, 0, 0, 0, 0, 0).?;
+    const consumed_bytes = @intFromPtr(buffer.cursor_up.?) - before;
+    try testing.expectEqual(@as(usize, announced_bytes), consumed_bytes);
+
+    // And the packet that was written reports the same span, in dwords, to a
+    // caller stepping over it afterwards.
+    try testing.expectEqual(
+        @as(u32, @intCast(consumed_bytes / @sizeOf(u32))),
+        packetSize(written, 0, 0, 0, 0, 0),
+    );
+}
+
+test "AGC wait patches update address reference and comparison in place" {
+    const wait32_header = (@as(u32, 3) << 30) |
+        (@as(u32, 5) << 16) |
+        (@as(u32, gpu.pm4.nop) << 8) |
+        (@as(u32, gpu.pm4.custom.wait_mem_32) << 2);
+    var wait32 = [_]u32{ wait32_header, 0, 0, 0xffff_ffff, 1, 0x0200_0113, 4 };
+    const address32: u64 = 0x0002_1234_5678_9abf;
+    try testing.expectEqual(errno.ok, patchWaitRegMemAddress(@intFromPtr(&wait32), address32));
+    try testing.expectEqual(errno.ok, patchWaitRegMemReference(@intFromPtr(&wait32), 0xfedc_ba98));
+    try testing.expectEqual(errno.ok, patchWaitRegMemCompareFunction(@intFromPtr(&wait32), 6));
+    try testing.expectEqual(@as(u32, 0x5678_9abc), wait32[1]);
+    try testing.expectEqual(@as(u32, 0x0002_1234), wait32[2]);
+    try testing.expectEqual(@as(u32, 0xfedc_ba98), wait32[4]);
+    try testing.expectEqual(@as(u32, 0x0200_0116), wait32[5]);
+
+    const wait64_header = (@as(u32, 3) << 30) |
+        (@as(u32, 7) << 16) |
+        (@as(u32, gpu.pm4.nop) << 8) |
+        (@as(u32, gpu.pm4.custom.wait_mem_64) << 2);
+    var wait64 = [_]u32{ wait64_header, 0, 0, 0xffff_ffff, 0xffff_ffff, 0, 0, 0x13, 4 };
+    const reference64: u64 = 0x0123_4567_89ab_cdef;
+    try testing.expectEqual(errno.ok, patchWaitRegMemReference(@intFromPtr(&wait64), reference64));
+    try testing.expectEqual(@as(u32, 0x89ab_cdef), wait64[5]);
+    try testing.expectEqual(@as(u32, 0x0123_4567), wait64[6]);
+}
+
+test "AGC EOP address and data patches support release and legacy packets" {
+    const release_header = (@as(u32, 3) << 30) |
+        (@as(u32, 6) << 16) |
+        (@as(u32, gpu.pm4.release_mem) << 8);
+    var release = [_]u32{ release_header, 0, 0, 0, 0, 0, 0, 0 };
+    const release_address: u64 = 0x0001_2468_ace0_1000;
+    const release_data: u64 = 0x1234_5678_9abc_def0;
+    try testing.expectEqual(errno.ok, patchQueueEndOfPipeAddress(@intFromPtr(&release), release_address));
+    try testing.expectEqual(errno.ok, patchQueueEndOfPipeData(@intFromPtr(&release), 0, 1, release_data));
+    try testing.expectEqual(@as(u32, 0xace0_1000), release[3]);
+    try testing.expectEqual(@as(u32, 0x0001_2468), release[4]);
+    try testing.expectEqual(@as(u32, 0x9abc_def0), release[5]);
+    try testing.expectEqual(@as(u32, 0x1234_5678), release[6]);
+
+    const event_header = (@as(u32, 3) << 30) |
+        (@as(u32, 4) << 16) |
+        (@as(u32, gpu.pm4.event_write_eop) << 8);
+    var event = [_]u32{ event_header, 0, 0, 0xabcd_0000, 0, 0 };
+    const event_address: u64 = 0x0000_9876_5432_1000;
+    try testing.expectEqual(errno.ok, patchQueueEndOfPipeAddress(@intFromPtr(&event), event_address));
+    try testing.expectEqual(errno.ok, patchQueueEndOfPipeData(@intFromPtr(&event), 0, 1, release_data));
+    try testing.expectEqual(@as(u32, 0x5432_1000), event[2]);
+    try testing.expectEqual(@as(u32, 0xabcd_9876), event[3]);
+    try testing.expectEqual(@as(u32, 0x9abc_def0), event[4]);
+    try testing.expectEqual(@as(u32, 0x1234_5678), event[5]);
+}
+
+test "Rita's Rewind AGC 1.1 imports resolve" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    inline for (&.{
+        "eAy8eGNsCuU",
+        "tmy-+rBpspY",
+        "y5K5tPktiL8",
+        "6nths4DHNrs",
+        "ICkECTBxrMw",
+        "EJBA4dbmvfg",
+        "RTpj-tIlvZc",
+        "SwI6QxqwAC0",
+        "d4NZIlguzv0",
+        "ICaGtkEIXTk",
+        "WHIOMbb+iIU",
+        "chJWZcNSzjk",
+        "+iAOE3jCnkk",
+    }) |id| {
+        try testing.expect(db.findById(id, .function) != null);
+    }
+}
+
+test "a buffer with no room left says so instead of writing past its end" {
+    var storage: [command_words]u32 = @splat(0);
+    var buffer = fixture(&storage);
+
+    try testing.expect(writeCommand(&buffer, 0, 0, 0, 0, 0) != null);
+    try testing.expect(writeCommand(&buffer, 0, 0, 0, 0, 0) == null);
+    // The refusal leaves the cursor where it was, so a title that frees room
+    // and retries is not writing into a gap.
+    try testing.expectEqual(storage[0..].ptr + command_words, buffer.cursor_up.?);
+}
+
+test "a buffer that names no memory is refused rather than followed" {
+    var empty = CommandBuffer{
+        .bottom = null,
+        .top = null,
+        .cursor_up = null,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    try testing.expect(writeCommand(null, 0, 0, 0, 0, 0) == null);
+    try testing.expect(writeCommand(&empty, 0, 0, 0, 0, 0) == null);
+}
+
+test "debugging facilities report themselves off, as on a retail machine" {
+    // A title told a capture is in progress waits for one that is never taken.
+    try testing.expectEqual(@as(i32, 0), switchedOff(0, 0, 0, 0, 0, 0));
+}
+
+test "AGC event accessors distinguish event type from context id" {
+    const graphics = event_queue.Event{
+        .ident = 0x40,
+        .filter = event_queue.graphics_filter,
+        .data = 0x1234,
+    };
+    try testing.expectEqual(@as(i32, 0x40), driverGetEqEventType(&graphics));
+    try testing.expectEqual(@as(u32, 0x1234), driverGetEqContextId(&graphics));
+
+    const foreign = event_queue.Event{ .ident = 7, .filter = -11, .data = 9 };
+    try testing.expectEqual(@as(i32, 9), driverGetEqEventType(&foreign));
+    try testing.expectEqual(@as(u32, 7), driverGetEqContextId(&foreign));
+}
+
+test "graphics exports register under published identifiers" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    try testing.expectEqual(exports.len + driver_exports.len, db.count());
+    try testing.expect(db.findByName("sceAgcDcbDrawIndexIndirectMulti", .function) != null);
+    try testing.expect(db.findByName("sceAgcDriverSubmitMultiAcbs", .function) != null);
+}
+
+test "indirect multi draw occupies ten words with a selectable count address" {
+    var storage: [10]u32 = @splat(0xdead_beef);
+    var buffer = fixture(&storage);
+    try testing.expectEqual(@as(u32, 40), drawIndexIndirectMultiGetSize());
+    try testing.expect(drawIndexIndirectMulti(&buffer, 0x20, 1, 4, 0x2000, 24, 0) != null);
+    try testing.expectEqual(storage[0..].ptr + storage.len, buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(&storage);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.draw_index_indirect_multi, packet.opcode);
+    const spec = gpu.pm4.decodeIndirectDrawSpec(packet).?;
+    try testing.expect(spec.indexed);
+    try testing.expect(spec.count_from_memory);
+    try testing.expectEqual(@as(u32, 0x20), spec.data_offset);
+    try testing.expectEqual(@as(u32, 4), spec.count);
+    try testing.expectEqual(@as(u64, 0x2000), spec.count_address);
+    try testing.expectEqual(@as(u32, 24), spec.stride);
+    try testing.expect((try walker.next()) == null);
+}
+
+test "indirect dispatch constructors preserve offsets addresses modifiers and exact sizes" {
+    var storage: [12]u32 = @splat(0xdead_beef);
+    var buffer = fixture(&storage);
+    const base: u64 = 0x5000_85d100;
+    try testing.expect(setBaseIndirectArgs(&buffer, 1, base) != null);
+    try testing.expectEqual(storage[0..].ptr + 4, dispatchIndirect(&buffer, 0x20, 0xffff_ffff).?);
+    try testing.expectEqual(storage[0..].ptr + 7, dispatchIndirectAbsolute(&buffer, 0x5000_855240, 1).?);
+    try testing.expectEqual(storage[0..].ptr + 11, buffer.cursor_up.?);
+    try testing.expectEqual(@as(u32, 0xdead_beef), storage[11]);
+    try testing.expectEqual(@as(u32, 12), dispatchIndirectGetSize());
+    try testing.expectEqual(@as(u32, 16), dispatchIndirectAbsoluteGetSize());
+
+    var walker = gpu.pm4.Walker.init(storage[0..11]);
+    const set_base = (try walker.next()).?;
+    try testing.expect(set_base.compute);
+    try testing.expectEqual(gpu.pm4.set_base, set_base.opcode);
+    try testing.expectEqualSlices(u32, &.{ 1, @truncate(base), @truncate(base >> 32) }, set_base.body);
+    const relative = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.dispatch_indirect, relative.opcode);
+    try testing.expectEqualSlices(u32, &.{ 0x20, 0xa079 }, relative.body);
+    const absolute = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.dispatch_indirect, absolute.opcode);
+    try testing.expectEqualSlices(u32, &.{ 0x0085_5240, 0x50, 0x41 }, absolute.body);
+    try testing.expect((try walker.next()) == null);
+    try testing.expect(dispatchIndirect(null, 0, 0) == null);
+    try testing.expect(dispatchIndirectAbsolute(null, base, 0) == null);
+}
+
+test "indexed multi-instance draw emits Prospero preamble packet" {
+    var storage: [9]u32 = @splat(0xdead_beef);
+    var buffer = fixture(&storage);
+    try testing.expectEqual(@as(u32, 36), drawIndexMultiInstancedGetSize());
+    try testing.expect(drawIndexMultiInstanced(
+        &buffer,
+        0x123,
+        0x20_1234_5000,
+        0x20_aaaa_0000,
+        7,
+        0x100,
+    ) != null);
+    try testing.expectEqual(storage[0..].ptr + storage.len, buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(&storage);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.dispatch_draw_preamble, packet.opcode);
+    try testing.expectEqual(@as(usize, 8), packet.body.len);
+    try testing.expectEqual(@as(u32, 0x123), packet.body[0]);
+    try testing.expectEqual(@as(u32, 7), packet.body[3]);
+    try testing.expectEqual(@as(u32, 7), packet.body[6]);
+    try testing.expectEqual(@as(u32, 0xa0), packet.body[7]);
+    try testing.expect((try walker.next()) == null);
+}
+
+test "AGC branch export executes a continuation and selects conditional targets" {
+    const Host = struct {
+        bytes: [256]u8 = @splat(0),
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < 0x1000) return false;
+            const offset = address - 0x1000;
+            if (offset > self.bytes.len or destination.len > self.bytes.len - offset) return false;
+            @memcpy(destination, self.bytes[@intCast(offset)..][0..destination.len]);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    const branch_export: *const @TypeOf(branch) = comptime blk: {
+        for (exports) |entry| {
+            if (std.mem.eql(u8, entry.name, "sceAgcCbBranch")) break :blk @ptrCast(entry.function);
+        }
+        @compileError("missing AGC branch export");
+    };
+    var host = Host{};
+    const then_commands = [_]u32{ 0xc0017900, 9, 0xbeef };
+    const else_commands = [_]u32{ 0xc0017900, 9, 0xcafe };
+    @memcpy(host.bytes[0x20..][0..@sizeOf(@TypeOf(then_commands))], std.mem.sliceAsBytes(&then_commands));
+    @memcpy(host.bytes[0x40..][0..@sizeOf(@TypeOf(else_commands))], std.mem.sliceAsBytes(&else_commands));
+    var state = gpu.state.State{};
+    const vtable = gpu.DcbBackend.VTable{ .read = Host.read, .write = Host.write };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = .{ .context = &host, .vtable = &vtable }, .allocator = testing.allocator };
+    var words: [14]u32 = @splat(0);
+    var buffer = fixture(&words);
+    // The continuation lives in argument eight, on the guest stack. ALWAYS
+    // has no predicate storage, as when a grow callback splits one DCB.
+    try testing.expect(branch_export(&buffer, 1, 0, 0, 0, 0, 2, 0x1020, then_commands.len, 0, 0, 0) != null);
+    try testing.expectEqual(@as(u32, @sizeOf(@TypeOf(words))), branchGetSize());
+    try testing.expectEqual(words[0..].ptr + words.len, buffer.cursor_up.?);
+    try testing.expectEqual(@as(u32, 0x2000_0003), words[10]);
+    _ = try executor.execute(&words);
+    try testing.expectEqual(@as(?u32, 0xbeef), state.readRegister(.uconfig, 9));
+
+    buffer = fixture(&words);
+    try testing.expect(branch_export(&buffer, 2, 3, 0x1000, 0xffff_ffff_ffff_ffff, 7, 0, 0x1020, then_commands.len, 3, 0x1040, else_commands.len) != null);
+    std.mem.writeInt(u64, host.bytes[0..8], 8, .little);
+    _ = try executor.execute(&words);
+    try testing.expectEqual(@as(?u32, 0xcafe), state.readRegister(.uconfig, 9));
+    std.mem.writeInt(u64, host.bytes[0..8], 7, .little);
+    _ = try executor.execute(&words);
+    try testing.expectEqual(@as(?u32, 0xbeef), state.readRegister(.uconfig, 9));
+}

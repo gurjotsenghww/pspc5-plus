@@ -1,0 +1,13 @@
+.zig-cache/
+.zig-cache-*/
+.codex-*
+zig-out/
+zig-out-*/
+zig-pkg/
+out/
+dist/
+run-logs/
+*.bin
+vulkan_pipeline_cache.bin.*.tmp
+*.elf
+savedata/
