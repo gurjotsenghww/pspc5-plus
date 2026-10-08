@@ -46,6 +46,23 @@ the two independently would promise more memory than the console has, and a
 title sizes its allocators from both answers during startup — which is exactly
 when it would budget for memory that was never going to exist.
 
+`sceKernelMemoryPoolExpand` donates 64 KiB physical blocks from that same direct
+budget. `MemoryPoolReserve` claims virtual arenas in 2 MiB units; committing an
+arena attaches donated blocks, including fragmented physical spans, to one
+contiguous virtual range. Committed pool pages use the existing shared backing
+and GPU page tracking, with pool ownership retained separately in mapping
+metadata. Virtual queries report pooled/reserved or pooled/committed state and
+do not expose the internal direct-memory offset. Flexible-memory usage is
+unchanged.
+
+Decommit retains the virtual reservation and returns its physical blocks to
+the pool. Shared backing preserves data when those blocks are reused. Ordinary
+unmap also returns committed blocks; physical release rejects donations still
+in use. Mapping and decommit operations preflight complete ranges and reserve
+interval storage before changing host pages. The implementation and its
+remaining batch-operation limitation are documented in the
+[MemoryPool report](../development/memory-pool-2026-10-08.md).
+
 Windows has permanent low-address mappings, notably `KUSER_SHARED_DATA`, inside
 the system-managed window. A single `VirtualAlloc` reservation would therefore
 fail even though almost the whole window is free. Initialization scans with

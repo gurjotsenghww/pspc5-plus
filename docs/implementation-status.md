@@ -12,6 +12,12 @@ behind them.
 
 - Native guest execution is available on Windows x86-64; inspection, decoding,
   and HLE components also build on Linux and macOS.
+- The six libkernel MemoryPool exports now reserve virtual arenas, expand
+  physical capacity, commit/decommit shared backing, execute ordered batches,
+  and report block statistics. Donated blocks cannot be mapped as ordinary
+  direct memory or released while committed. Batch commit, decommit, protect,
+  and type/protect work; MOVE remains explicitly unsupported. See the
+  [MemoryPool implementation and validation report](development/memory-pool-2026-10-08.md).
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
   guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
   returns synchronized NV12 video plus stereo PCM through the title's own

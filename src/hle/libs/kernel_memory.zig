@@ -126,6 +126,7 @@ pub const Reservation = struct {
     len: u64,
     alignment: u64,
     memory_type: MemoryType,
+    pooled: bool = false,
 
     pub fn end(self: Reservation) u64 {
         return self.start + self.len;
@@ -293,6 +294,7 @@ pub const Pool = struct {
     /// than silently succeeding.
     pub fn release(self: *Pool, gpa: std.mem.Allocator, start: u64, len: u64) PoolError!void {
         const end = std.math.add(u64, start, len) catch return PoolError.NotReserved;
+        try self.reservations.ensureUnusedCapacity(gpa, 1);
         var released = false;
 
         var index: usize = 0;
@@ -317,6 +319,7 @@ pub const Pool = struct {
                     .len = overlap_start - reservation.start,
                     .alignment = reservation.alignment,
                     .memory_type = reservation.memory_type,
+                    .pooled = reservation.pooled,
                 });
                 index += 1;
             }
@@ -326,6 +329,7 @@ pub const Pool = struct {
                     .len = reservation.end() - overlap_end,
                     .alignment = reservation.alignment,
                     .memory_type = reservation.memory_type,
+                    .pooled = reservation.pooled,
                 });
                 index += 1;
             }
@@ -346,6 +350,15 @@ var map_place_ns: u64 = 0;
 var map_metadata_ns: u64 = 0;
 var map_lock_ns: u64 = 0;
 var guest_address_space: ?*memory.AddressSpace = null;
+
+const pool_block_size: u64 = 0x10000;
+const pool_reserve_alignment: u64 = 0x200000;
+const PoolBlock = struct { physical: u64, address: u64 = 0 };
+// A zero VA is a free donated block. Commit/decommit never allocate bookkeeping
+// for these blocks, which also makes rollback independent of allocator failure.
+var pool_blocks: std.ArrayList(PoolBlock) = .empty;
+var pool_available_blocks: usize = 0;
+var has_memory_pool_reservations = false;
 
 /// Installs the allocator the pool uses for its bookkeeping.
 pub fn init(gpa: std.mem.Allocator) void {
@@ -471,7 +484,13 @@ pub fn isGuestStackRange(address: u64, length: u64) bool {
 pub fn deinit() void {
     pool_lock.lock();
     defer pool_lock.unlock();
-    if (pool_gpa) |gpa| pool.deinit(gpa);
+    if (pool_gpa) |gpa| {
+        pool.deinit(gpa);
+        pool_blocks.deinit(gpa);
+    }
+    pool_blocks = .empty;
+    pool_available_blocks = 0;
+    has_memory_pool_reservations = false;
     pool = .{};
     pool_gpa = null;
     guest_address_space = null;
@@ -575,17 +594,34 @@ fn sceKernelReleaseDirectMemory(start: u64, len: u64) callconv(abi.guest) i32 {
     {
         return KernelError.einval.raw();
     }
+    const end = std.math.add(u64, start, len) catch return KernelError.einval.raw();
+    for (pool_blocks.items) |block| {
+        if (block.physical >= end or block.physical + pool_block_size <= start) continue;
+        if (block.address != 0) return KernelError.eacces.raw();
+        if (start % pool_block_size != 0 or len % pool_block_size != 0) return KernelError.einval.raw();
+    }
     // Ordered before the unmapping so that a range owning nothing is refused
     // without having taken anything down on the way to saying so.
     if (!pool.hasAnyReservation(start, len)) return KernelError.einval.raw();
+    const gpa = pool_gpa orelse return KernelError.enomem.raw();
+    pool.reservations.ensureUnusedCapacity(gpa, 1) catch return KernelError.enomem.raw();
     if (guest_address_space) |address_space| {
         _ = address_space.unmapDirectMemoryBacking(start, len);
     }
-    const gpa = pool_gpa orelse return KernelError.enomem.raw();
     pool.release(gpa, start, len) catch |err| return switch (err) {
         error.NotReserved => KernelError.einval.raw(),
         else => KernelError.enomem.raw(),
     };
+    var retained: usize = 0;
+    for (pool_blocks.items) |block| {
+        if (block.physical >= start and block.physical < end) {
+            pool_available_blocks -= 1;
+        } else {
+            pool_blocks.items[retained] = block;
+            retained += 1;
+        }
+    }
+    pool_blocks.items.len = retained;
     return errno.ok;
 }
 
@@ -713,6 +749,12 @@ fn mapDirectMemory(
     map_lock_ns +%= gpu.frame_timing.elapsedNs(lock_started);
     defer pool_lock.unlock();
 
+    // Donated memory is owned by MemoryPool, including when the legacy batch
+    // mapping fallback accepts otherwise untracked direct allocations.
+    _ = std.math.add(u64, physical_address, len) catch return KernelError.einval.raw();
+    if (pool_blocks.items.len != 0) for (pool.reservations.items) |reservation| {
+        if (reservation.pooled and reservation.overlaps(physical_address, len)) return KernelError.eacces.raw();
+    };
     const memory_type: i32 = if (pool.findContainingRange(physical_address, len)) |reservation|
         @intFromEnum(reservation.memory_type)
     else untracked: {
@@ -738,6 +780,7 @@ fn mapDirectMemory(
         if (requested_address == 0 or requested_address % effective_alignment != 0) {
             return KernelError.einval.raw();
         }
+        if (has_memory_pool_reservations and address_space.hasPooledMappings(requested_address, len)) return KernelError.eacces.raw();
         const occupied = address_space.isMapped(requested_address, len);
         if (occupied and (!explicit_fixed or map_flags & map_no_overwrite != 0)) {
             return KernelError.enomem.raw();
@@ -931,6 +974,7 @@ fn mapFlexibleMemory(
         if (requested_address == 0 or requested_address % alignment != 0) {
             return KernelError.einval.raw();
         }
+        if (has_memory_pool_reservations and address_space.hasPooledMappings(requested_address, len)) return KernelError.eacces.raw();
 
         const occupied = address_space.isMapped(requested_address, len);
         if (occupied) {
@@ -1519,7 +1563,10 @@ fn sceKernelMunmap(address: u64, len: u64) callconv(abi.guest) i32 {
     pool_lock.lock();
     defer pool_lock.unlock();
     const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    if (has_memory_pool_reservations and address_space.hasPooledMappings(address, len) and
+        (address % pool_block_size != 0 or len % pool_block_size != 0)) return KernelError.einval.raw();
     address_space.unmap(address, len) catch |err| return mapAddressSpaceError(err);
+    returnPoolBlocks(address, len);
     return errno.ok;
 }
 
@@ -1559,10 +1606,12 @@ fn sceKernelVirtualQuery(
     info.* = .{};
     info.start = mapping.address;
     info.end = mapping.end();
-    info.offset = mapping.backing_offset orelse 0;
+    info.offset = if (mapping.pooled) 0 else mapping.backing_offset orelse 0;
     info.protection = mapping.protection_bits;
     info.memory_type = mapping.memory_type;
-    info.state = switch (mapping.kind) {
+    info.state = if (mapping.pooled)
+        state_pooled | (if (mapping.kind == .reserved) @as(u32, 0) else state_committed)
+    else switch (mapping.kind) {
         .flexible => state_flexible | state_committed,
         .direct_memory => state_direct | state_committed,
         .stack => state_stack | state_committed,
@@ -1642,6 +1691,10 @@ fn sceKernelReserveVirtualRange(
     flags: i32,
     alignment: u64,
 ) callconv(abi.guest) i32 {
+    return reserveVirtualRange(out_address, len, flags, alignment, false);
+}
+
+fn reserveVirtualRange(out_address: ?*u64, len: u64, flags: i32, alignment: u64, pooled: bool) i32 {
     const output = out_address orelse return KernelError.efault.raw();
     if (len == 0 or len % page_size != 0) return KernelError.einval.raw();
     const effective_alignment = @max(alignment, page_size);
@@ -1662,6 +1715,7 @@ fn sceKernelReserveVirtualRange(
         }
         if (address_space.isMapped(requested_address, len)) {
             if (map_flags & map_no_overwrite != 0) return KernelError.enomem.raw();
+            if (has_memory_pool_reservations and address_space.hasPooledMappings(requested_address, len)) return KernelError.eacces.raw();
             address_space.unmap(requested_address, len) catch |err|
                 return mapAddressSpaceError(err);
         }
@@ -1754,7 +1808,200 @@ fn sceKernelReserveVirtualRange(
         break :first_fit reserved;
     };
 
+    if (pooled) address_space.setMetadata(reserved_address, len, .{ .pooled = true }) catch |err| {
+        address_space.unmap(reserved_address, len) catch {};
+        return mapAddressSpaceError(err);
+    };
+    if (pooled) has_memory_pool_reservations = true;
     output.* = reserved_address;
+    return errno.ok;
+}
+
+pub const MemoryPoolBlockStats = extern struct {
+    available_flushed_blocks: i32 = 0,
+    available_cached_blocks: i32 = 0,
+    allocated_flushed_blocks: i32 = 0,
+    allocated_cached_blocks: i32 = 0,
+};
+
+/// The payload is a 24-byte union: commit/protect use addr, len, prot, type;
+/// move uses dst, src, len. Keep the union's full ABI size even for short ops.
+pub const MemoryPoolBatchEntry = extern struct {
+    operation: u32,
+    flags: u32 = 0,
+    address: u64,
+    length: u64,
+    protection: u8 = 0,
+    memory_type: u8 = 0,
+    padding: [6]u8 = .{0} ** 6,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(MemoryPoolBlockStats) == 16);
+    std.debug.assert(@sizeOf(MemoryPoolBatchEntry) == 32);
+    std.debug.assert(@offsetOf(MemoryPoolBatchEntry, "address") == 8);
+    std.debug.assert(@offsetOf(MemoryPoolBatchEntry, "protection") == 24);
+}
+
+fn poolOutputWritable(address: u64, len: usize) bool {
+    if (len == 0) return true;
+    if (address == 0) return false;
+    if (guest_address_space) |space| {
+        if (space.isWritable(address, len)) return true;
+    }
+    return memory.isHostRangeWritable(address, len);
+}
+
+fn poolNotifyWrite(address: u64, len: usize) void {
+    if (guest_address_space) |space| space.notifyGuestWrite(address, len);
+}
+
+fn sceKernelMemoryPoolExpand(search_start: i64, search_end: i64, len: u64, alignment: u64, out_physical: ?*u64) callconv(abi.guest) i32 {
+    if (search_start < 0 or search_end <= search_start or len == 0 or len % pool_block_size != 0 or
+        (alignment != 0 and (!std.math.isPowerOfTwo(alignment) or alignment % pool_block_size != 0))) return KernelError.einval.raw();
+    const output = out_physical orelse return KernelError.einval.raw();
+    if (!poolOutputWritable(@intFromPtr(output), @sizeOf(u64))) return KernelError.efault.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const gpa = pool_gpa orelse return KernelError.enomem.raw();
+    if (len > pool.size or len > @as(u64, @intCast(search_end - search_start))) return KernelError.enomem.raw();
+    const count: usize = @intCast(len / pool_block_size);
+    pool_blocks.ensureUnusedCapacity(gpa, count) catch return KernelError.enomem.raw();
+    const physical = pool.reserve(gpa, @intCast(search_start), @intCast(search_end), len, @max(alignment, pool_block_size), .wb_onion) catch return KernelError.enomem.raw();
+    pool.reservations.items[pool.reservations.items.len - 1].pooled = true;
+    for (0..count) |index| pool_blocks.appendAssumeCapacity(.{ .physical = physical + index * pool_block_size });
+    pool_available_blocks += count;
+    poolNotifyWrite(@intFromPtr(output), @sizeOf(u64));
+    output.* = physical;
+    return errno.ok;
+}
+
+fn sceKernelMemoryPoolReserve(address: u64, len: u64, alignment: u64, flags: i32, out_address: ?*u64) callconv(abi.guest) i32 {
+    const output = out_address orelse return KernelError.einval.raw();
+    if (len == 0 or len % pool_reserve_alignment != 0 or
+        (alignment != 0 and (!std.math.isPowerOfTwo(alignment) or alignment % pool_reserve_alignment != 0))) return KernelError.einval.raw();
+    if (!poolOutputWritable(@intFromPtr(output), @sizeOf(u64))) return KernelError.efault.raw();
+    var result = address;
+    const status = reserveVirtualRange(&result, len, flags, @max(alignment, pool_reserve_alignment), true);
+    if (status == errno.ok) {
+        poolNotifyWrite(@intFromPtr(output), @sizeOf(u64));
+        output.* = result;
+    }
+    return status;
+}
+
+fn sceKernelMemoryPoolCommit(address: u64, len: u64, memory_type: i32, protection_bits: i32, flags: i32) callconv(abi.guest) i32 {
+    _ = flags;
+    if (address == 0 or len == 0 or address % pool_block_size != 0 or len % pool_block_size != 0) return KernelError.einval.raw();
+    _ = std.math.add(u64, address, len) catch return KernelError.einval.raw();
+    if (protection_bits & prot_cpu_execute != 0) return KernelError.eacces.raw();
+    const protection = decodeProtection(protection_bits) orelse return KernelError.einval.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const space = guest_address_space orelse return KernelError.enosys.raw();
+    const gpa = pool_gpa orelse return KernelError.enomem.raw();
+    const count: usize = @intCast(len / pool_block_size);
+    if (count > pool_available_blocks) return KernelError.enomem.raw();
+    // Group adjacent free physical blocks; fragmented donations still form one
+    // contiguous virtual commit. Publish block ownership only after host success.
+    var backing: std.ArrayList(memory.PoolBacking) = .empty;
+    defer backing.deinit(gpa);
+    var selected: usize = 0;
+    for (pool_blocks.items) |block| {
+        if (block.address != 0) continue;
+        if (backing.items.len != 0 and backing.items[backing.items.len - 1].offset + backing.items[backing.items.len - 1].size == block.physical) {
+            backing.items[backing.items.len - 1].size += pool_block_size;
+        } else backing.append(gpa, .{ .offset = block.physical, .size = pool_block_size }) catch return KernelError.enomem.raw();
+        selected += 1;
+        if (selected == count) break;
+    }
+    space.commitPooled(address, len, backing.items, protection, protection_bits, memory_type) catch |err| return mapAddressSpaceError(err);
+    var cursor = address;
+    for (pool_blocks.items) |*block| {
+        if (block.address != 0) continue;
+        block.address = cursor;
+        cursor += pool_block_size;
+        if (cursor == address + len) break;
+    }
+    pool_available_blocks -= count;
+    return errno.ok;
+}
+
+fn returnPoolBlocks(address: u64, len: u64) void {
+    for (pool_blocks.items) |*block| {
+        if (block.address >= address and block.address < address + len and block.address != 0) {
+            block.address = 0;
+            pool_available_blocks += 1;
+        }
+    }
+}
+
+fn sceKernelMemoryPoolDecommit(address: u64, len: u64, flags: i32) callconv(abi.guest) i32 {
+    _ = flags;
+    if (address == 0 or len == 0 or address % pool_block_size != 0 or len % pool_block_size != 0) return KernelError.einval.raw();
+    _ = std.math.add(u64, address, len) catch return KernelError.einval.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const space = guest_address_space orelse return KernelError.enosys.raw();
+    space.decommitPooled(address, len) catch |err| return mapAddressSpaceError(err);
+    returnPoolBlocks(address, len);
+    return errno.ok;
+}
+
+fn protectPoolEntry(entry: MemoryPoolBatchEntry, change_type: bool) i32 {
+    if (entry.address == 0 or entry.length == 0 or entry.address % page_size != 0 or entry.length % page_size != 0) return KernelError.einval.raw();
+    if (entry.protection & prot_cpu_execute != 0) return KernelError.eacces.raw();
+    const protection = decodeProtection(entry.protection) orelse return KernelError.einval.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const space = guest_address_space orelse return KernelError.enosys.raw();
+    space.protectGuestWithType(entry.address, entry.length, protection, entry.protection, if (change_type) entry.memory_type else null) catch |err| return mapAddressSpaceError(err);
+    return errno.ok;
+}
+
+fn sceKernelMemoryPoolBatch(entries_pointer: ?[*]align(1) const MemoryPoolBatchEntry, count: i32, processed_pointer: ?*i32, flags: i32) callconv(abi.guest) i32 {
+    _ = flags;
+    if (count < 0) return KernelError.einval.raw();
+    const entries = entries_pointer orelse return KernelError.einval.raw();
+    const bytes = @as(usize, @intCast(count)) * @sizeOf(MemoryPoolBatchEntry);
+    if (bytes != 0 and !isGuestRangeAccessible(@intFromPtr(entries), bytes)) return KernelError.efault.raw();
+    if (processed_pointer) |output| {
+        if (!poolOutputWritable(@intFromPtr(output), @sizeOf(i32))) return KernelError.efault.raw();
+        poolNotifyWrite(@intFromPtr(output), @sizeOf(i32));
+    }
+    var processed: i32 = 0;
+    defer if (processed_pointer) |output| {
+        output.* = processed;
+    };
+    while (processed < count) : (processed += 1) {
+        const entry = entries[@intCast(processed)];
+        const result = switch (entry.operation) {
+            1 => sceKernelMemoryPoolCommit(entry.address, entry.length, entry.memory_type, entry.protection, @bitCast(entry.flags)),
+            2 => sceKernelMemoryPoolDecommit(entry.address, entry.length, @bitCast(entry.flags)),
+            3 => protectPoolEntry(entry, false),
+            4 => protectPoolEntry(entry, true),
+            // MOVE's contract is not established by the available reference.
+            // Match its explicit EINVAL instead of reporting an unperformed move.
+            else => KernelError.einval.raw(),
+        };
+        if (result != errno.ok) return result;
+    }
+    return errno.ok;
+}
+
+fn sceKernelMemoryPoolGetBlockStats(out_stats: ?*align(1) MemoryPoolBlockStats, output_size: u64) callconv(abi.guest) i32 {
+    const len: usize = @intCast(@min(output_size, @sizeOf(MemoryPoolBlockStats)));
+    if (len == 0) return errno.ok;
+    const output = out_stats orelse return KernelError.efault.raw();
+    if (!poolOutputWritable(@intFromPtr(output), len)) return KernelError.efault.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const stats = MemoryPoolBlockStats{
+        .available_flushed_blocks = @intCast(pool_available_blocks),
+        .allocated_flushed_blocks = @intCast(pool_blocks.items.len - pool_available_blocks),
+    };
+    poolNotifyWrite(@intFromPtr(output), len);
+    @memcpy(std.mem.asBytes(output)[0..len], std.mem.asBytes(&stats)[0..len]);
     return errno.ok;
 }
 
@@ -1780,6 +2027,12 @@ fn mapAddressSpaceError(err: memory.Error) i32 {
 /// by. The identifiers are asserted rather than trusted: a mistyped name fails
 /// at registration instead of becoming an unresolved import at load time.
 pub const exports = [_]symbols.Export{
+    .{ .name = "sceKernelMemoryPoolReserve", .function = trace.wrap("sceKernelMemoryPoolReserve", &sceKernelMemoryPoolReserve), .expect_id = "pU-QydtGcGY" },
+    .{ .name = "sceKernelMemoryPoolExpand", .function = trace.wrap("sceKernelMemoryPoolExpand", &sceKernelMemoryPoolExpand), .expect_id = "qCSfqDILlns" },
+    .{ .name = "sceKernelMemoryPoolCommit", .function = trace.wrap("sceKernelMemoryPoolCommit", &sceKernelMemoryPoolCommit), .expect_id = "Vzl66WmfLvk" },
+    .{ .name = "sceKernelMemoryPoolDecommit", .function = trace.wrap("sceKernelMemoryPoolDecommit", &sceKernelMemoryPoolDecommit), .expect_id = "LXo1tpFqJGs" },
+    .{ .name = "sceKernelMemoryPoolBatch", .function = trace.wrap("sceKernelMemoryPoolBatch", &sceKernelMemoryPoolBatch), .expect_id = "YN878uKRBbE" },
+    .{ .name = "sceKernelMemoryPoolGetBlockStats", .function = trace.wrap("sceKernelMemoryPoolGetBlockStats", &sceKernelMemoryPoolGetBlockStats), .expect_id = "bvD+95Q6asU" },
     .{
         .name = "sceKernelAllocateDirectMemory",
         .function = trace.wrap("sceKernelAllocateDirectMemory", &sceKernelAllocateDirectMemory),
@@ -1948,6 +2201,191 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+fn expectPoolStats(available: i32, allocated: i32) !void {
+    var stats: MemoryPoolBlockStats = undefined;
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolGetBlockStats(&stats, @sizeOf(MemoryPoolBlockStats)));
+    try testing.expectEqualDeep(MemoryPoolBlockStats{ .available_flushed_blocks = available, .allocated_flushed_blocks = allocated }, stats);
+}
+
+test "MemoryPool lifetime preserves physical data and virtual ownership" {
+    var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, 4 * pool_block_size);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+    var physical: u64 = undefined;
+    var address: u64 = undefined;
+    var flexible_before: u64 = undefined;
+    try testing.expectEqual(errno.ok, sceKernelAvailableFlexibleMemorySize(&flexible_before));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolExpand(0, direct_memory_size, 4 * pool_block_size, 0, &physical));
+    try expectPoolStats(4, 0);
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolReserve(memory.user.start, pool_reserve_alignment, 0, 0, &address));
+    try testing.expectEqual(@as(u64, 0), address % pool_reserve_alignment);
+    try testing.expectEqual(errno.ok, sceKernelSetVirtualRangeName(address, pool_reserve_alignment, "pool-arena"));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolCommit(address, 2 * pool_block_size, 10, 0x33, 0));
+    try space.write(address, "first block");
+    try space.write(address + pool_block_size, "second block");
+    try expectPoolStats(2, 2);
+    var query: VirtualQueryInfo = undefined;
+    try testing.expectEqual(errno.ok, sceKernelVirtualQuery(address, 0, &query, @sizeOf(VirtualQueryInfo)));
+    try testing.expectEqual(state_pooled | state_committed, query.state);
+    try testing.expectEqual(@as(u64, 0), query.offset);
+    try testing.expectEqual(@as(i32, 10), query.memory_type);
+    try testing.expectEqualStrings("pool-arena", std.mem.sliceTo(&query.name, 0));
+    var flexible_after: u64 = undefined;
+    try testing.expectEqual(errno.ok, sceKernelAvailableFlexibleMemorySize(&flexible_after));
+    try testing.expectEqual(flexible_before, flexible_after);
+    try testing.expectEqual(KernelError.eacces.raw(), sceKernelCheckedReleaseDirectMemory(physical, 4 * pool_block_size));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolDecommit(address, pool_block_size, 0));
+    try testing.expect(!space.isReadable(address, pool_block_size));
+    try expectPoolStats(3, 1);
+    try testing.expectEqual(errno.ok, sceKernelVirtualQuery(address, 0, &query, @sizeOf(VirtualQueryInfo)));
+    try testing.expectEqual(state_pooled, query.state);
+    try testing.expectEqual(@as(i32, 0), query.protection);
+    try testing.expectEqualStrings("second block", @as([*]const u8, @ptrFromInt(address + pool_block_size))[0..12]);
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolCommit(address, pool_block_size, 3, 3, 0));
+    try testing.expectEqualStrings("first block", @as([*]const u8, @ptrFromInt(address))[0..11]);
+    // Munmap also returns committed blocks; the virtual arena itself is gone.
+    try testing.expectEqual(errno.ok, sceKernelMunmap(address, pool_reserve_alignment));
+    try testing.expect(space.query(address, false) == null);
+    try expectPoolStats(4, 0);
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(physical, 4 * pool_block_size));
+    try expectPoolStats(0, 0);
+}
+
+test "MemoryPool fragmented backing exhaustion and safe coexistence with direct memory" {
+    var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, 4 * pool_block_size);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+    var first: u64 = undefined;
+    var gap: u64 = undefined;
+    var second: u64 = undefined;
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolExpand(0, direct_memory_size, pool_block_size, 0, &first));
+    try testing.expectEqual(errno.ok, sceKernelAllocateDirectMemory(0, direct_memory_size, pool_block_size, pool_block_size, 0, &gap));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolExpand(0, direct_memory_size, pool_block_size, 0, &second));
+    try testing.expectEqual(first + 2 * pool_block_size, second);
+    var alias: u64 = 0;
+    try testing.expectEqual(KernelError.eacces.raw(), sceKernelMapDirectMemory(&alias, pool_block_size, 3, 0, first, 0));
+    // Even BatchMap's untracked-range fallback must reject donated pages.
+    var ordinary = [_]BatchMapEntry{.{ .start = 0, .offset = gap, .length = 2 * pool_block_size, .protection = 3, .memory_type = 0, .reserved = 0, .operation = 0 }};
+    var processed: i32 = -1;
+    try testing.expectEqual(KernelError.eacces.raw(), batchMapCore(&ordinary, 1, &processed, 0));
+    try testing.expectEqual(@as(i32, 0), processed);
+    var address: u64 = undefined;
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolReserve(memory.user.start, pool_reserve_alignment, 0, 0, &address));
+    alias = address;
+    try testing.expectEqual(KernelError.eacces.raw(), sceKernelMapDirectMemory(&alias, pool_block_size, 3, map_fixed, gap, 0));
+    alias = address;
+    try testing.expectEqual(KernelError.eacces.raw(), mapFlexibleMemory(&alias, pool_block_size, 3, map_fixed, "wrong"));
+    alias = address;
+    try testing.expectEqual(KernelError.eacces.raw(), sceKernelReserveVirtualRange(&alias, pool_block_size, map_fixed, 0));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolCommit(address, 2 * pool_block_size, 0, 3, 0));
+    try testing.expectEqual(first, space.query(address, false).?.backing_offset.?);
+    try testing.expectEqual(second, space.query(address + pool_block_size, false).?.backing_offset.?);
+    try testing.expectEqual(KernelError.enomem.raw(), sceKernelMemoryPoolCommit(address + 2 * pool_block_size, pool_block_size, 0, 3, 0));
+    try testing.expectEqual(memory.MappingKind.reserved, space.query(address + 2 * pool_block_size, false).?.kind);
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolDecommit(address, 3 * pool_block_size, 0));
+    try expectPoolStats(2, 0);
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(first, pool_block_size));
+    try expectPoolStats(1, 0);
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolCommit(address, pool_block_size, 0, 3, 0));
+    try testing.expectEqual(second, space.query(address, false).?.backing_offset.?);
+}
+
+test "MemoryPool batch reports completed prefix and applies protection and type" {
+    var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, 4 * pool_block_size);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+    var physical: u64 = undefined;
+    var address: u64 = undefined;
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolExpand(0, direct_memory_size, 4 * pool_block_size, 0, &physical));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolReserve(memory.user.start, pool_reserve_alignment, 0, 0, &address));
+    const entries = [_]MemoryPoolBatchEntry{
+        .{ .operation = 1, .address = address, .length = 2 * pool_block_size, .protection = 3, .memory_type = 3 },
+        .{ .operation = 3, .address = address, .length = page_size, .protection = 1 },
+        .{ .operation = 4, .address = address + page_size, .length = page_size, .protection = 0x33, .memory_type = 10 },
+        .{ .operation = 5, .address = address, .length = pool_block_size },
+        .{ .operation = 2, .address = address, .length = 2 * pool_block_size },
+    };
+    var processed: i32 = -1;
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMemoryPoolBatch(&entries, entries.len, &processed, 0));
+    try testing.expectEqual(@as(i32, 3), processed);
+    try testing.expect(!space.isWritable(address, page_size));
+    const changed = space.query(address + page_size, false).?;
+    try testing.expect(changed.pooled);
+    try testing.expectEqual(@as(i32, 10), changed.memory_type);
+    try testing.expectEqual(@as(i32, 0x33), changed.protection_bits);
+    try expectPoolStats(2, 2);
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolBatch(entries[4..].ptr, 1, &processed, 0));
+    try testing.expectEqual(@as(i32, 1), processed);
+    try expectPoolStats(4, 0);
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolBatch(&entries, 0, null, 0));
+}
+
+test "MemoryPool rejects invalid ranges before changing earlier blocks" {
+    var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, 2 * pool_block_size);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+    var address: u64 = 0;
+    var physical: u64 = 0;
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMemoryPoolReserve(0, page_size, 0, 0, &address));
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMemoryPoolExpand(0, direct_memory_size, page_size, 0, &physical));
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMemoryPoolExpand(0, direct_memory_size, pool_block_size, page_size, &physical));
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMemoryPoolExpand(-1, direct_memory_size, pool_block_size, 0, &physical));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolExpand(0, direct_memory_size, 2 * pool_block_size, 0, &physical));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolReserve(memory.user.start, pool_reserve_alignment, 0, 0, &address));
+    const last = address + pool_reserve_alignment - pool_block_size;
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolCommit(last, pool_block_size, 0, 3, 0));
+    try space.write(last, "untouched");
+    try testing.expectEqual(KernelError.eacces.raw(), sceKernelMemoryPoolDecommit(last, 2 * pool_block_size, 0));
+    try testing.expectEqualStrings("untouched", @as([*]const u8, @ptrFromInt(last))[0..9]);
+    try expectPoolStats(1, 1);
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMemoryPoolDecommit(last, page_size, 0));
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMunmap(last, page_size));
+    try testing.expectEqual(KernelError.eacces.raw(), sceKernelMemoryPoolCommit(address, pool_block_size, 0, 5, 0));
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMemoryPoolCommit(address, pool_block_size, 0, 0x400, 0));
+    try testing.expectEqual(KernelError.eacces.raw(), sceKernelMemoryPoolCommit(last, pool_block_size, 0, 3, 0));
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMemoryPoolDecommit(0xffffffffffff0000, 2 * pool_block_size, 0));
+    try testing.expectEqual(KernelError.efault.raw(), sceKernelMemoryPoolGetBlockStats(@ptrFromInt(1), 16));
+    try testing.expectEqual(KernelError.efault.raw(), sceKernelMemoryPoolExpand(0, direct_memory_size, pool_block_size, 0, @ptrFromInt(8)));
+    try testing.expectEqual(KernelError.efault.raw(), sceKernelMemoryPoolBatch(@ptrFromInt(8), 1, null, 0));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolGetBlockStats(null, 0));
+    var short: [16]u8 = .{0xaa} ** 16;
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolGetBlockStats(@ptrCast(&short), 4));
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, short[0..4], .little));
+    try testing.expectEqualSlices(u8, &(.{0xaa} ** 12), short[4..]);
+}
+
+test "MemoryPool host commit failure rolls back fragmented mappings and accounting" {
+    // Only the first donation fits the test's deliberately smaller host backing.
+    var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, pool_block_size);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+    var first: u64 = undefined;
+    var gap: u64 = undefined;
+    var second: u64 = undefined;
+    var address: u64 = undefined;
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolExpand(0, direct_memory_size, pool_block_size, 0, &first));
+    try testing.expectEqual(errno.ok, sceKernelAllocateDirectMemory(0, direct_memory_size, pool_block_size, pool_block_size, 0, &gap));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolExpand(0, direct_memory_size, pool_block_size, 0, &second));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolReserve(memory.user.start, pool_reserve_alignment, 0, 0, &address));
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelMemoryPoolCommit(address, 2 * pool_block_size, 0, 3, 0));
+    try expectPoolStats(2, 0);
+    try testing.expect(!space.isReadable(address, pool_block_size));
+    try testing.expectEqual(memory.MappingKind.reserved, space.query(address, false).?.kind);
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolCommit(address, pool_block_size, 0, 3, 0));
+    try space.write(address, "retry");
+    try expectPoolStats(1, 1);
+}
 
 test "guest GPU protection does not grant native CPU access" {
     const protection = decodeProtection(prot_gpu_read | prot_gpu_write).?;

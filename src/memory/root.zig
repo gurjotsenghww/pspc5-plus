@@ -290,6 +290,8 @@ pub const Mapping = struct {
     /// Original guest ABI protection mask, including GPU access bits.
     protection_bits: i32 = 0,
     memory_type: i32 = 0,
+    /// Kernel MemoryPool ownership; retained by commits and interval splits.
+    pooled: bool = false,
     name: [maximum_name_length]u8 = [_]u8{0} ** maximum_name_length,
 
     pub fn end(self: Mapping) u64 {
@@ -302,7 +304,10 @@ pub const MappingMetadata = struct {
     protection_bits: ?i32 = null,
     memory_type: ?i32 = null,
     name: ?[]const u8 = null,
+    pooled: ?bool = null,
 };
+
+pub const PoolBacking = struct { offset: u64, size: u64 };
 
 test "mapping identities survive splits and reject remapped allocation backing" {
     const base = user.start;
@@ -788,6 +793,17 @@ pub const AddressSpace = struct {
         protection: Protection,
         protection_bits: i32,
     ) Error!void {
+        return self.protectGuestWithType(address, size, protection, protection_bits, null);
+    }
+
+    pub fn protectGuestWithType(
+        self: *AddressSpace,
+        address: u64,
+        size: u64,
+        protection: Protection,
+        protection_bits: i32,
+        memory_type: ?i32,
+    ) Error!void {
         try validateMappedRange(address, size);
 
         self.mutex.lock();
@@ -810,6 +826,9 @@ pub const AddressSpace = struct {
             protection_bits,
             false,
         );
+        if (memory_type) |value| for (replacement.items) |*mapping| {
+            if (mapping.address >= address and mapping.end() <= address + size) mapping.memory_type = value;
+        };
 
         hostProtect(address, size, protection) catch {
             self.host_mapping_state_uncertain = true;
@@ -1456,6 +1475,12 @@ pub const AddressSpace = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        const found = firstOverlappingMapping(self.mappings.items, address);
+        if (found < self.mappings.items.len and self.mappings.items[found].pooled) return Error.RangeNotMapped;
+        return self.mapInReservationLocked(address, size, protection, kind, backing_offset);
+    }
+
+    fn mapInReservationLocked(self: *AddressSpace, address: u64, size: u64, protection: Protection, kind: MappingKind, backing_offset: ?u64) Error!void {
         const index = firstOverlappingMapping(self.mappings.items, address);
         if (index == self.mappings.items.len) return Error.RangeNotMapped;
         const reservation = self.mappings.items[index];
@@ -1506,8 +1531,117 @@ pub const AddressSpace = struct {
             // the memory, in particular — names the wrong region.
             .backing_offset = backing_offset,
             .protection_bits = 0,
-            .name = namedMapping("anon"),
+            .pooled = reservation.pooled,
+            .name = if (reservation.pooled) reservation.name else namedMapping("anon"),
         });
+    }
+
+    pub fn hasPooledMappings(self: *AddressSpace, address: u64, size: u64) bool {
+        const end = std.math.add(u64, address, size) catch return true;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const first = firstOverlappingMapping(self.mappings.items, address);
+        for (self.mappings.items[first..]) |mapping| {
+            if (mapping.address >= end) break;
+            if (mapping.pooled) return true;
+        }
+        return false;
+    }
+
+    /// Commit donated physical spans as one operation. Allocate all interval
+    /// storage before touching native pages; failure restores the reservations.
+    pub fn commitPooled(self: *AddressSpace, address: u64, size: u64, backing: []const PoolBacking, protection: Protection, bits: i32, memory_type: i32) Error!void {
+        try validateMappedRange(address, size);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.validatePooledLocked(address, size, true);
+        var total: u64 = 0;
+        for (backing) |part| {
+            if (part.size == 0 or part.size % page_size != 0) return Error.InvalidSize;
+            total = std.math.add(u64, total, part.size) catch return Error.InvalidSize;
+        }
+        if (total != size) return Error.InvalidSize;
+        // Existing reservation/name boundaries do not add entries: only the
+        // physical-span boundaries and the two ends of this commit can do so.
+        // Keep two spare slots for rollback without scaling to the whole table.
+        try self.mappings.ensureUnusedCapacity(self.allocator, backing.len + 3);
+        var cursor = address;
+        errdefer if (cursor != address) {
+            self.decommitPooledLocked(address, cursor - address) catch {
+                self.host_mapping_state_uncertain = true;
+            };
+        };
+        for (backing) |part| {
+            var remaining = part.size;
+            var offset = part.offset;
+            while (remaining != 0) {
+                const index = firstOverlappingMapping(self.mappings.items, cursor);
+                const len = @min(remaining, self.mappings.items[index].end() - cursor);
+                try self.mapInReservationLocked(cursor, len, protection, .direct_memory, offset);
+                const mapped = &self.mappings.items[firstOverlappingMapping(self.mappings.items, cursor)];
+                mapped.protection_bits = bits;
+                mapped.memory_type = memory_type;
+                cursor += len;
+                offset += len;
+                remaining -= len;
+            }
+        }
+    }
+
+    fn validatePooledLocked(self: *AddressSpace, address: u64, size: u64, reserved_only: bool) Error!void {
+        if (!self.coversLocked(address, size, null)) return Error.RangeNotMapped;
+        const first = firstOverlappingMapping(self.mappings.items, address);
+        for (self.mappings.items[first..]) |mapping| {
+            if (mapping.address >= address + size) break;
+            if (!mapping.pooled or (reserved_only and mapping.kind != .reserved)) return Error.RangeNotMapped;
+        }
+    }
+
+    /// Return backing to the pool without giving up the guest's virtual arena.
+    pub fn decommitPooled(self: *AddressSpace, address: u64, size: u64) Error!void {
+        try validateMappedRange(address, size);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.decommitPooledLocked(address, size);
+    }
+
+    fn decommitPooledLocked(self: *AddressSpace, address: u64, size: u64) Error!void {
+        try self.validatePooledLocked(address, size, false);
+        try self.mappings.ensureUnusedCapacity(self.allocator, 2);
+        try self.hostUnmapLocked(address, size, true);
+        self.invalidateGpuTrackingLocked(address, size);
+        self.hostUnmapLocked(address, size, false) catch |err| {
+            self.host_mapping_state_uncertain = true;
+            return err;
+        };
+        // Capacity was reserved above, so splitting and publishing cannot fail.
+        try updateMappingMetadata(self.allocator, &self.mappings, address, size, .{});
+        const first = firstOverlappingMapping(self.mappings.items, address);
+        for (self.mappings.items[first..]) |*mapping| {
+            if (mapping.address >= address + size) break;
+            mapping.kind = .reserved;
+            mapping.protection = .none;
+            mapping.protection_bits = 0;
+            mapping.memory_type = 0;
+            mapping.backing_offset = null;
+            mapping.identity = 0;
+        }
+        // Repeated partial decommits must not grow the interval table forever.
+        var retained = first -| 1;
+        var scanned = retained + 1;
+        while (scanned < self.mappings.items.len and self.mappings.items[retained].address <= address + size) : (scanned += 1) {
+            const a = &self.mappings.items[retained];
+            const b = self.mappings.items[scanned];
+            if (a.pooled and b.pooled and a.kind == .reserved and b.kind == .reserved and a.end() == b.address and std.mem.eql(u8, &a.name, &b.name)) {
+                a.size += b.size;
+            } else {
+                retained += 1;
+                self.mappings.items[retained] = b;
+            }
+        }
+        const tail = self.mappings.items.len - scanned;
+        std.mem.copyForwards(Mapping, self.mappings.items[retained + 1 ..][0..tail], self.mappings.items[scanned..]);
+        self.mappings.items.len = retained + 1 + tail;
     }
 
     fn reserveFixedLocked(self: *AddressSpace, address: u64, size: u64) Error!void {
@@ -1990,6 +2124,7 @@ fn updateMappingMetadata(allocator: std.mem.Allocator, mappings: *std.ArrayList(
         mapping.* = offsetMapping(mapping.*, start, stop - start);
         if (metadata.protection_bits) |bits| mapping.protection_bits = bits;
         if (metadata.memory_type) |memory_type| mapping.memory_type = memory_type;
+        if (metadata.pooled) |pooled| mapping.pooled = pooled;
         if (metadata.name) |name| mapping.name = namedMapping(name);
     }
 }
@@ -2064,6 +2199,7 @@ fn appendMetadataTransformed(
         var middle = offsetMapping(mapping, middle_start, middle_end - middle_start);
         if (metadata.protection_bits) |bits| middle.protection_bits = bits;
         if (metadata.memory_type) |memory_type| middle.memory_type = memory_type;
+        if (metadata.pooled) |pooled| middle.pooled = pooled;
         if (metadata.name) |name| middle.name = namedMapping(name);
         try out.append(allocator, middle);
 
@@ -3427,6 +3563,36 @@ test "failed reservation and metadata edits preserve the mapping table" {
     defer testing.allocator.free(committed);
     try testing.expectError(Error.RangeNotMapped, space.mapInReservation(address, 3 * page_size, .read_write, .direct_memory, 0));
     try testing.expectEqualDeep(committed, space.mappings.items);
+}
+
+test "MemoryPool allocation failure leaves reservations and committed pages intact" {
+    const block = windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 2 * block);
+    defer space.deinit();
+    const address = try space.reserve(.system_managed, 0x200000000, 4 * block, block);
+    try space.setMetadata(address, 4 * block, .{ .pooled = true, .name = "pool" });
+    var exact = try testing.allocator.dupe(Mapping, space.mappings.items);
+    space.mappings.deinit(testing.allocator);
+    space.mappings = .fromOwnedSlice(exact);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    space.allocator = failing.allocator();
+    defer space.allocator = testing.allocator;
+    try testing.expectError(error.OutOfMemory, space.commitPooled(address + block, block, &.{.{ .offset = 0, .size = block }}, .read_write, 3, 3));
+    try testing.expectEqual(@as(usize, 1), space.mappingCount());
+    try testing.expect(!space.isReadable(address + block, block));
+    space.allocator = testing.allocator;
+    try space.commitPooled(address + block, 2 * block, &.{.{ .offset = 0, .size = 2 * block }}, .read_write, 3, 3);
+    try space.write(address + block, "kept");
+    exact = try testing.allocator.dupe(Mapping, space.mappings.items);
+    space.mappings.deinit(testing.allocator);
+    space.mappings = .fromOwnedSlice(exact);
+    space.allocator = failing.allocator();
+    try testing.expectError(error.OutOfMemory, space.decommitPooled(address + block, block));
+    try testing.expectEqualStrings("kept", @as([*]const u8, @ptrFromInt(address + block))[0..4]);
+    try testing.expect(space.query(address + block, false).?.pooled);
+    space.allocator = testing.allocator;
+    try space.decommitPooled(address + block, 2 * block);
+    try testing.expectEqual(@as(usize, 1), space.mappingCount());
 }
 
 test "host placeholder bounds match a full table scan around reserved runs" {
