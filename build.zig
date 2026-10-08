@@ -139,7 +139,7 @@ pub fn build(b: *std.Build) void {
     font_lib.root_module.addIncludePath(b.path("src/hle/fonts"));
     font_lib.root_module.addCMacro("FT2_BUILD_LIBRARY", "1");
     font_lib.root_module.addCMacro("TT_CONFIG_OPTION_GPOS_KERNING", "1");
-    font_lib.root_module.addCMacro("FT_CONFIG_MODULES_H", "\"ps5pcem_ft_modules.h\"");
+    font_lib.root_module.addCMacro("FT_CONFIG_MODULES_H", "\"pspc5_plus_ft_modules.h\"");
     font_lib.root_module.addCSourceFiles(.{
         .root = freetype.path("src"),
         .files = &.{
@@ -586,7 +586,7 @@ pub fn build(b: *std.Build) void {
         game_run.root_module.linkSystemLibrary("mfuuid", .{});
         game_run.root_module.linkSystemLibrary("ole32", .{});
         game_run.root_module.addWin32ResourceFile(.{
-            .file = b.path("assets/windows/ps5pcem-runner.rc"),
+            .file = b.path("assets/windows/pspc5-plus-runner.rc"),
             .include_paths = &.{b.path("assets/windows")},
         });
     }
@@ -649,7 +649,7 @@ pub fn build(b: *std.Build) void {
         });
         native_launcher.subsystem = .windows;
         native_launcher.root_module.addWin32ResourceFile(.{
-            .file = b.path("assets/windows/ps5pcem-launcher.rc"),
+            .file = b.path("assets/windows/pspc5-plus-launcher.rc"),
             .include_paths = &.{b.path("assets/windows")},
         });
         inline for (&.{ "user32", "gdi32", "gdiplus", "shell32", "ole32", "comdlg32", "dwmapi", "setupapi", "hid" }) |library| {

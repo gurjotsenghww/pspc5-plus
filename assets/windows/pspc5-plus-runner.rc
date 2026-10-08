@@ -1,6 +1,6 @@
 #include <windows.h>
 
-1 ICON "ps5pcem.ico"
+1 ICON "pspc5-plus.ico"
 
 1 VERSIONINFO
 FILEVERSION 0,3,3,0
@@ -20,11 +20,11 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName", "PSPC5 Plus Project\0"
-            VALUE "FileDescription", "PSPC5 Plus Launcher\0"
+            VALUE "FileDescription", "PSPC5 Plus Game Runner\0"
             VALUE "FileVersion", "0.3.3\0"
-            VALUE "InternalName", "pspc5-plus\0"
+            VALUE "InternalName", "game-run\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 Artur Strazewicz / PSPC5 Plus Contributors\0"
-            VALUE "OriginalFilename", "pspc5-plus.exe\0"
+            VALUE "OriginalFilename", "game-run.exe\0"
             VALUE "ProductName", "PSPC5 Plus\0"
             VALUE "ProductVersion", "0.3.3\0"
         END

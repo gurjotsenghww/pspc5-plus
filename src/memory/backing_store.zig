@@ -103,7 +103,7 @@ pub const SharedBacking = struct {
     }
 
     fn initLinux(size: u64) Error!SharedBacking {
-        const fd = std.posix.memfd_create("ps5pcem-direct-memory", 0) catch
+        const fd = std.posix.memfd_create("pspc5-plus-direct-memory", 0) catch
             return Error.CreateFailed;
         errdefer _ = std.posix.system.close(fd);
         try resize(fd, size);
@@ -114,7 +114,7 @@ pub const SharedBacking = struct {
         var name_buffer: [96:0]u8 = undefined;
         const name = std.fmt.bufPrintZ(
             &name_buffer,
-            "/ps5pcem-direct-{d}-{x}",
+            "/pspc5-plus-direct-{d}-{x}",
             .{ std.c.getpid(), @intFromPtr(&name_buffer) },
         ) catch return Error.CreateFailed;
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Native Windows launcher for PS5PCEM.
+//! Native Windows launcher for PSPC5 Plus.
 //!
 //! The interface deliberately uses only Win32/GDI so the emulator keeps its
 //! zero-dependency build. Settings are persisted next to the executable and
@@ -20,7 +20,7 @@ comptime {
     @setEvalBranchQuota(20_000);
 }
 
-const site_url = "https://ps5pcem.com";
+const site_url = "https://github.com/gurjotsenghww/pspc5-plus";
 const github_url = "https://github.com/gurjotsenghww/pspc5-plus";
 const boosty_url = "https://boosty.to/ps5pcem";
 const window_width = 1180;
@@ -309,7 +309,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_preset_saved => "Rendering preset saved for the next launch",
             .compatibility => "Compatibility",
             .compatibility_text => "PSPC5 Plus is at an early stage. Not every title boots yet; advanced DualSense features, native PS5 keyboard/mouse and controller-to-keyboard conversion still need more HLE support.",
-            .author => "PSPC5 Plus · Derived from PS5PCEM (Author: Artur Strazewicz · GitHub: iStark/PS5PCEM)",
+            .author => "PSPC5 Plus · Lead: Gurjotpal Singh, Antigravity · Upstream: Artur Strazewicz (PS5PCEM)",
             .browse_dialog => "Choose the folder containing a decrypted PS5 game",
             .nav_saves => "Saves",
             .saves_heading => "Saved games",
@@ -411,8 +411,8 @@ fn tr(phrase: Phrase) []const u8 {
             .preset_graphics => "画质",
             .status_preset_saved => "渲染预设已保存，下次启动时生效",
             .compatibility => "兼容性",
-            .compatibility_text => "PS5PCEM 仍处于早期开发阶段，部分游戏尚无法启动。DualSense 高级功能、PS5 原生键鼠和手柄转键盘功能仍需进一步完善 HLE 支持。",
-            .author => "作者：Artur Strazewicz · GitHub：iStark/PS5PCEM",
+            .compatibility_text => "PSPC5 Plus 仍处于早期开发阶段，部分游戏尚无法启动。DualSense 高级功能、PS5 原生键鼠和手柄转键盘功能仍需进一步完善 HLE 支持。",
+            .author => "PSPC5 Plus · 开发者：Gurjotpal Singh, Antigravity · 原作者：Artur Strazewicz (PS5PCEM)",
             .browse_dialog => "选择包含已解密 PS5 游戏的文件夹",
             .nav_saves => "存档",
             .saves_heading => "游戏存档",
@@ -514,8 +514,8 @@ fn tr(phrase: Phrase) []const u8 {
             .preset_graphics => "Gráficos",
             .status_preset_saved => "Ajuste de render guardado para el próximo inicio",
             .compatibility => "Compatibilidad",
-            .compatibility_text => "PS5PCEM está en una fase temprana: algunos juegos no arrancan. Las funciones avanzadas de DualSense, el teclado y ratón nativos de PS5 y la conversión de mando a teclado aún necesitan más soporte HLE.",
-            .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
+            .compatibility_text => "PSPC5 Plus está en una fase temprana: algunos juegos no arrancan. Las funciones avanzadas de DualSense, el teclado y ratón nativos de PS5 y la conversión de mando a teclado aún necesitan más soporte HLE.",
+            .author => "PSPC5 Plus · Desarrolladores: Gurjotpal Singh, Antigravity · Original: Artur Strazewicz (PS5PCEM)",
             .browse_dialog => "Elige la carpeta que contiene un juego de PS5 descifrado",
             .nav_saves => "Partidas",
             .saves_heading => "Partidas guardadas",
@@ -617,8 +617,8 @@ fn tr(phrase: Phrase) []const u8 {
             .preset_graphics => "الرسوم",
             .status_preset_saved => "تم حفظ نمط العرض للتشغيل التالي",
             .compatibility => "التوافق",
-            .compatibility_text => "لا يزال PS5PCEM في مرحلة مبكرة، وبعض الألعاب لا تعمل بعد. تحتاج ميزات DualSense المتقدمة ولوحة المفاتيح والفأرة الأصلية لـ PS5 وتحويل يد التحكم إلى لوحة مفاتيح إلى مزيد من دعم HLE.",
-            .author => "المؤلف: Artur Strazewicz · GitHub: iStark/PS5PCEM",
+            .compatibility_text => "لا يزال PSPC5 Plus في مرحلة مبكرة، وبعض الألعاب لا تعمل بعد. تحتاج ميزات DualSense المتقدمة ولوحة المفاتيح والفأرة الأصلية لـ PS5 وتحويل يد التحكم إلى لوحة مفاتيح إلى مزيد من دعم HLE.",
+            .author => "PSPC5 Plus · المطورون: Gurjotpal Singh, Antigravity · الأصل: Artur Strazewicz (PS5PCEM)",
             .browse_dialog => "اختر المجلد الذي يحتوي على لعبة PS5 مفكوكة التشفير",
             .nav_saves => "الحفظ",
             .saves_heading => "الألعاب المحفوظة",
@@ -720,8 +720,8 @@ fn tr(phrase: Phrase) []const u8 {
             .preset_graphics => "Gráficos",
             .status_preset_saved => "Predefinição salva para a próxima execução",
             .compatibility => "Compatibilidade",
-            .compatibility_text => "O PS5PCEM está em fase inicial: alguns jogos ainda não iniciam. Recursos avançados do DualSense, teclado e mouse nativos do PS5 e a conversão de controle para teclado precisam de mais suporte HLE.",
-            .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
+            .compatibility_text => "O PSPC5 Plus está em fase inicial: alguns jogos ainda não iniciam. Recursos avançados do DualSense, teclado e mouse nativos do PS5 e a conversão de controle para teclado precisam de mais suporte HLE.",
+            .author => "PSPC5 Plus · Desenvolvedores: Gurjotpal Singh, Antigravity · Original: Artur Strazewicz (PS5PCEM)",
             .browse_dialog => "Escolha a pasta que contém um jogo de PS5 descriptografado",
             .nav_saves => "Jogos salvos",
             .saves_heading => "Jogos salvos",
@@ -823,8 +823,8 @@ fn tr(phrase: Phrase) []const u8 {
             .preset_graphics => "Графика",
             .status_preset_saved => "Пресет сохранён для следующего запуска",
             .compatibility => "Совместимость",
-            .compatibility_text => "PS5PCEM находится на ранней стадии. Не все игры загружаются; функции DualSense, нативные PS5-клавиатура/мышь и преобразование геймпада в клавиши требуют дальнейшей HLE-поддержки.",
-            .author => "Автор: Artur Strazewicz · GitHub: iStark/PS5PCEM",
+            .compatibility_text => "PSPC5 Plus находится на ранней стадии. Не все игры загружаются; функции DualSense, нативные PS5-клавиатура/мышь и преобразование геймпада в клавиши требуют дальнейшей HLE-поддержки.",
+            .author => "PSPC5 Plus · Разработчики: Gurjotpal Singh, Antigravity · Оригинал: Artur Strazewicz (PS5PCEM)",
             .browse_dialog => "Выберите папку с расшифрованной игрой PS5",
             .nav_saves => "Сохранения",
             .saves_heading => "Сохранения",
@@ -926,8 +926,8 @@ fn tr(phrase: Phrase) []const u8 {
             .preset_graphics => "Grafik",
             .status_preset_saved => "Render-Profil für den nächsten Start gespeichert",
             .compatibility => "Kompatibilität",
-            .compatibility_text => "PS5PCEM ist in einer frühen Phase. Nicht jedes Spiel startet; erweiterte DualSense-Funktionen, native PS5-Tastatur/Maus und Controller-zu-Tastatur benötigen weitere HLE-Unterstützung.",
-            .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
+            .compatibility_text => "PSPC5 Plus ist in einer frühen Phase. Nicht jedes Spiel startet; erweiterte DualSense-Funktionen, native PS5-Tastatur/Maus und Controller-zu-Tastatur benötigen weitere HLE-Unterstützung.",
+            .author => "PSPC5 Plus · Entwickler: Gurjotpal Singh, Antigravity · Original: Artur Strazewicz (PS5PCEM)",
             .browse_dialog => "Ordner mit dem entschlüsselten PS5-Spiel wählen",
             .nav_saves => "Speicherstände",
             .saves_heading => "Speicherstände",
@@ -1029,8 +1029,8 @@ fn tr(phrase: Phrase) []const u8 {
             .preset_graphics => "Graphismes",
             .status_preset_saved => "Profil de rendu enregistré pour le prochain lancement",
             .compatibility => "Compatibilité",
-            .compatibility_text => "PS5PCEM est encore expérimental. Tous les jeux ne démarrent pas ; les fonctions DualSense avancées, le clavier/souris PS5 natif et la conversion manette-clavier demandent davantage de prise en charge HLE.",
-            .author => "Auteur : Artur Strazewicz · GitHub : iStark/PS5PCEM",
+            .compatibility_text => "PSPC5 Plus est encore expérimental. Tous les jeux ne démarrent pas ; les fonctions DualSense avancées, le clavier/souris PS5 natif et la conversion manette-clavier demandent davantage de prise en charge HLE.",
+            .author => "PSPC5 Plus · Développeurs : Gurjotpal Singh, Antigravity · Original : Artur Strazewicz (PS5PCEM)",
             .browse_dialog => "Choisissez le dossier du jeu PS5 déchiffré",
             .nav_saves => "Sauvegardes",
             .saves_heading => "Sauvegardes",
@@ -1701,7 +1701,7 @@ fn drawNavigation(dc: Win32.DeviceContext) void {
     roundFill(dc, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
     localizedText(dc, .support_boosty, .{ .left = 32, .top = 639, .right = 192, .bottom = 660 }, 0x00ffac64, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     text(dc, w("GitHub · PSPC5 Plus  ↗"), -1, .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00b9afa8, regular_font, Win32.dt_left);
-    text(dc, w("ps5pcem.com  ↗"), -1, .{ .left = 28, .top = 588, .right = 198, .bottom = 612 }, 0x00ffac64, regular_font, Win32.dt_left);
+    text(dc, w("pspc5-plus  ↗"), -1, .{ .left = 28, .top = 588, .right = 198, .bottom = 612 }, 0x00ffac64, regular_font, Win32.dt_left);
 }
 
 /// Says what the probe found, in the place that used to assert success.
@@ -3213,7 +3213,7 @@ fn initializeIniPath() void {
     ini_path_length = Win32.GetModuleFileNameW(null, &ini_path, ini_path.len);
     if (ini_path_length == 0 or ini_path_length >= ini_path.len) return;
     while (ini_path_length > 0 and ini_path[ini_path_length - 1] != '\\') : (ini_path_length -= 1) {}
-    const name = w("ps5pcem.ini");
+    const name = w("pspc5-plus.ini");
     const name_length = wideLength(name);
     if (ini_path_length + name_length >= ini_path.len) return;
     @memcpy(ini_path[ini_path_length..][0..name_length], name[0..name_length]);

@@ -65,3 +65,12 @@ zig test src/rdna2/root.zig --test-filter "your_test_name"
 3. Add unit tests for any new functionality, instruction lowerings, or bug fixes.
 4. Verify all tests pass locally.
 5. Submit a Pull Request targeting `development`.
+
+---
+
+## Core Team & Contributors
+
+- **Gurjotpal Singh** ([@gurjotsenghww](https://github.com/gurjotsenghww)) — Project Lead, Architecture & Development
+- **Antigravity** (Google DeepMind) — Core System Engineering, Diagnostics & Verification Contributor
+- **Artur Strazewicz** ([@iStark](https://github.com/iStark)) — Upstream Creator (PS5PCEM)
+

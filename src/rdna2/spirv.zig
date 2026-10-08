@@ -9564,6 +9564,7 @@ const Builder = struct {
             }
             return;
         }
+        if (inst.src1.kind != .sgpr) return Error.UnsupportedBufferAddressing;
         try self.bufferLoadWords(asBufferFromFlat(inst), count);
     }
 
@@ -13401,7 +13402,7 @@ test "float transcendental VOP1 operations use explicit SPIR-V math" {
 
     var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
     defer module.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 11), countOpcode(module.words, 12)); // OpExtInst
+    try std.testing.expectEqual(@as(usize, 13), countOpcode(module.words, 12)); // OpExtInst (9 unary + 2 sin + 2 cos)
     try std.testing.expect(containsOpcode(module.words, 136)); // OpFDiv
 }
 
@@ -13978,7 +13979,7 @@ test "permlane mix and image resinfo lower" {
         .sampled_images = &images,
     });
     defer resinfo_module.deinit(std.testing.allocator);
-    try std.testing.expect(containsOpcode(resinfo_module.words, 50) or containsOpcode(resinfo_module.words, 107));
+    try std.testing.expect(containsOpcode(resinfo_module.words, 103) or containsOpcode(resinfo_module.words, 106) or containsOpcode(resinfo_module.words, 203));
 }
 
 test "packed integer add and mad mix lower" {
@@ -14253,7 +14254,7 @@ test "GETPC SETPC continuation still exports position" {
         .vertex_index_vgpr = 0,
     });
     defer module.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 62)); // OpStore Position
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 62)); // OpStore Position (initialize and export)
 }
 
 test "merged NGG vertex prolog reaches its position export" {
@@ -14307,7 +14308,7 @@ test "merged NGG vertex prolog reaches its position export" {
 
     // The wave-info read no longer rejects the program, the primitive export is
     // dropped rather than translated, and the position still reaches Vulkan.
-    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 62)); // OpStore Position
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 62)); // OpStore Position (initialize and export)
     try std.testing.expect(containsOpcode(module.words, 111)); // OpConvertSToF from V5
     // Position, VertexIndex and InstanceIndex are decorated: a vertex prolog
     // selects between the latter two, so neither may be left undefined.
@@ -14359,7 +14360,7 @@ test "vertex PARAM export and fragment interpolation share a location" {
     // and extracts ATTR0 in the PS instead of manufacturing screen-space UVs.
     try std.testing.expectEqual(@as(usize, 2), countOpcode(vertex_module.words, 71)); // OpDecorate
     try std.testing.expectEqual(@as(usize, 3), countOpcode(vertex_module.words, 62)); // initialize Position/PARAM0, then export PARAM0
-    try std.testing.expectEqual(@as(usize, 3), countOpcode(fragment_module.words, 71)); // OpDecorate
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 71)); // OpDecorate
     try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 61)); // OpLoad
     try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 81)); // OpCompositeExtract
 }
@@ -15050,7 +15051,7 @@ test "fragment sample level zero accepts a packed texel offset before NSA coordi
 
     try std.testing.expect(containsOpcode(module.words, 88)); // OpImageSampleExplicitLod
     try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 202));
-    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 81)); // dmask:w
+    try std.testing.expectEqual(@as(usize, 7), countOpcode(module.words, 81)); // offset unpack + coords + dmask:w
 }
 
 test "compute image sample level zero uses explicit lod" {
@@ -15290,7 +15291,7 @@ test "three-coordinate image load follows a two-dimensional storage descriptor" 
     defer module.deinit(std.testing.allocator);
 
     try std.testing.expect(containsOpcode(module.words, 98)); // OpImageRead
-    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 23)); // uint2 coordinates
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 23)); // uint2 coords + one shared float4 texel type
 }
 
 test "two-coordinate image store into an array view writes slice zero" {
@@ -15979,10 +15980,13 @@ test "MUBUF glc controls atomic return-value writeback" {
 
         const atomic_result = firstInstructionOperand(module.words, 234, 1).?;
         const stored_value = firstInstructionOperand(module.words, 62, 1).?;
+        const phi_result = firstInstructionOperand(module.words, 245, 1);
+        const phi_source = firstInstructionOperand(module.words, 245, 2);
         if (glc) {
-            try std.testing.expectEqual(atomic_result, stored_value);
+            try std.testing.expectEqual(phi_result, stored_value);
+            try std.testing.expectEqual(atomic_result, phi_source);
         } else {
-            try std.testing.expect(atomic_result != stored_value);
+            try std.testing.expect(phi_result != stored_value);
         }
     }
 }
@@ -16001,7 +16005,8 @@ test "cross-dword short load and store lower as two byte accesses" {
     const storage = [_]StorageBufferBinding{.{ .resource_sgpr = 4, .descriptor_index = 0 }};
     var module = try translate(std.testing.allocator, &program, .{ .stage = .compute, .storage_buffers = &storage });
     defer module.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 62)); // two byte stores
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 240)); // two byte stores via OpAtomicAnd
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 241)); // two byte stores via OpAtomicOr
     try std.testing.expect(containsOpcode(module.words, 195)); // signed extension
 }
 

@@ -5711,9 +5711,9 @@ pub const Renderer = struct {
         };
 
         const application_info = vk.ApplicationInfo{
-            .application_name = "PS5PCEM",
+            .application_name = "PSPC5 Plus",
             .application_version = vk.makeApiVersion(0, 0, 4, 0),
-            .engine_name = "PS5PCEM",
+            .engine_name = "PSPC5 Plus Engine",
             .engine_version = vk.makeApiVersion(0, 0, 4, 0),
             .api_version = vk.api_version_1_2,
         };

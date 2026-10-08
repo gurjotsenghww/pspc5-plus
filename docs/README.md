@@ -1,4 +1,4 @@
-# PS5PCEM documentation
+# PSPC5 Plus documentation
 
 This directory contains the detailed user, compatibility, architecture, and
 release documentation. The repository [README](../README.md) stays intentionally
@@ -8,7 +8,7 @@ short and visual; implementation details live here.
 
 | Document | Purpose |
 |---|---|
-| [Building and command-line usage](getting-started.md) | Build PS5PCEM, run its tools, package Windows releases, or integrate the RDNA2 module |
+| [Building and command-line usage](getting-started.md) | Build PSPC5 Plus, run its tools, package Windows releases, or integrate the RDNA2 module |
 | [Project status and compatibility](project-status.md) | See the development captures and the measured milestone reached in each observed title |
 | [Implementation status](implementation-status.md) | Read what the emulator can do, subsystem by subsystem |
 | [Latest release notes](release-notes/v0.3.3.md) | See the changes and requirements for the current prototype |
@@ -36,11 +36,12 @@ short and visual; implementation details live here.
 - [Screenshots and captures](images/)
 - [1080p startup and buffer reuse, 27 September 2026](development/1080p-buffer-reuse-2026-09-27.md)
 - [GPU submission and Yotei performance report, 24 September 2026](development/yotei-performance-2026-09-24.md)
-- [GitHub releases](https://github.com/iStark/PS5PCEM/releases)
+- [PSPC5 Plus GitHub Releases](https://github.com/gurjotsenghww/pspc5-plus/releases)
+- [Upstream PS5PCEM Releases](https://github.com/iStark/PS5PCEM/releases)
 
 ## Project boundaries
 
-PS5PCEM is experimental and incomplete. Compatibility milestones describe only
+PSPC5 Plus is experimental and incomplete. Compatibility milestones describe only
 the furthest repeatable point observed with legally supplied local content; they
 are not general compatibility ratings. No games, firmware, keys, system
 libraries, or console software are distributed by this repository.

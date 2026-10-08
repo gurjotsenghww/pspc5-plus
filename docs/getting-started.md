@@ -40,7 +40,7 @@ built for verification, but the publishing script rejects it:
 .\scripts\publish-release.ps1
 ```
 
-The portable archive and installer contain only `ps5pcem.exe`, `game-run.exe`,
+The portable archive and installer contain only `pspc5-plus.exe`, `game-run.exe`,
 `pkgextractor.exe`, documentation, licensing, version, and branding files. Generated settings,
 caches, and savedata are intentionally not packaged.
 

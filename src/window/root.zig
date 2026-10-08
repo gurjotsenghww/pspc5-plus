@@ -114,7 +114,7 @@ pub const HostWindow = struct {
         var title: [96]u8 = undefined;
         const title_z = std.fmt.bufPrintZ(
             &title,
-            "PS5PCEM - Vulkan guest output - {d}.{d} FPS",
+            "PSPC5 Plus - Vulkan guest output - {d}.{d} FPS",
             .{ fps_tenths / 10, fps_tenths % 10 },
         ) catch return;
         _ = Win32.SetWindowTextA(@ptrFromInt(value), title_z.ptr);
@@ -166,7 +166,7 @@ pub const HostWindow = struct {
         const window = Win32.CreateWindowExA(
             0,
             Win32.class_name,
-            "PS5PCEM - Vulkan guest output",
+            "PSPC5 Plus - Vulkan guest output",
             Win32.window_style,
             x,
             y,
@@ -255,7 +255,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
         small_icon: Icon,
     };
 
-    const class_name: [*:0]const u8 = "PS5PCEM_VULKAN_WINDOW";
+    const class_name: [*:0]const u8 = "PSPC5_PLUS_VULKAN_WINDOW";
     const class_redraw: u32 = 0x0001 | 0x0002;
     const window_style: u32 = 0x00c0_0000 | 0x0008_0000 | 0x0002_0000;
     const use_default: i32 = @bitCast(@as(u32, 0x8000_0000));

@@ -242,8 +242,8 @@ test "Windows debug output returns on firmware stacks and restores native bounds
             try testing.expect(@intFromPtr(&local) >= state.stack_limit);
             try testing.expect(@intFromPtr(&local) < state.stack_base);
             try testing.expectEqual(@as(u64, stack_size), state.stack_base - state.stack_limit);
-            DebugOutput.OutputDebugStringA("PS5PCEM firmware stack regression");
-            DebugOutput.OutputDebugStringW(std.unicode.utf8ToUtf16LeStringLiteral("PS5PCEM firmware stack regression"));
+            DebugOutput.OutputDebugStringA("PSPC5 Plus firmware stack regression");
+            DebugOutput.OutputDebugStringW(std.unicode.utf8ToUtf16LeStringLiteral("PSPC5 Plus firmware stack regression"));
         }
         fn nested() !void {
             const before = CallState.capture();
@@ -253,7 +253,7 @@ test "Windows debug output returns on firmware stacks and restores native bounds
     };
     try call(anyerror!void, Probe.nested, .{});
     try testing.expectEqualDeep(original, CallState.capture());
-    DebugOutput.OutputDebugStringA("PS5PCEM restored native stack regression");
+    DebugOutput.OutputDebugStringA("PSPC5 Plus restored native stack regression");
 }
 
 comptime {

@@ -107,7 +107,7 @@ pub fn describe(module: *const Module, info: *Info) void {
 pub fn describeHostBoundary(address: u64, info: *Info) void {
     const segment_size: u64 = 0x10_0000;
     info.* = .{};
-    const name = "PS5PCEMHostBoundary";
+    const name = "PSPC5PlusHostBoundary";
     @memcpy(info.name[0..name.len], name);
     info.segment_address = address & ~(segment_size - 1);
     info.segment_size = segment_size;
@@ -204,7 +204,7 @@ test "a native bridge boundary has no guest unwind tables" {
     var info = Info{};
     describeHostBoundary(0x7ff6_4d53_e622, &info);
 
-    try testing.expectEqualStrings("PS5PCEMHostBoundary", std.mem.sliceTo(&info.name, 0));
+    try testing.expectEqualStrings("PSPC5PlusHostBoundary", std.mem.sliceTo(&info.name, 0));
     try testing.expectEqual(@as(u64, 0x7ff6_4d50_0000), info.segment_address);
     try testing.expectEqual(@as(u64, 0x10_0000), info.segment_size);
     try testing.expectEqual(@as(u64, 0), info.eh_frame_header);
