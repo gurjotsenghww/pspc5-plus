@@ -341,6 +341,11 @@ pub const Options = struct {
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
     native_window: ?NativeWindow = null,
+    /// Optional on-disk driver pipeline cache path. If null, falls back to
+    /// "cache/shaders/<title_id>.bin" if title_id is set, or "vulkan_pipeline_cache.bin".
+    pipeline_cache_path: ?[]const u8 = null,
+    /// Title identifier (e.g. "PPSA12345") used to namespace persistent pipeline caches.
+    title_id: ?[]const u8 = null,
 };
 
 pub const graphics_probe_width: u32 = 64;
@@ -1333,26 +1338,46 @@ const maximum_cmask_bytes = 4 * 1024 * 1024;
 const maximum_htile_bytes = 8 * 1024 * 1024;
 /// On-disk driver pipeline cache. Reused across runs so per-title shader
 /// compilation is paid once instead of on every launch.
-const pipeline_cache_path = "vulkan_pipeline_cache.bin";
 /// Streamed 3D scenes can exceed 2 GiB of driver pipelines. Keep persistence
 /// bounded without dropping every subsequent save once that scene is loaded.
 const maximum_pipeline_cache_bytes = 4 * 1024 * 1024 * 1024;
 
 /// Reads the persisted driver pipeline cache, if any. Any failure — missing
-/// file, unreadable file, unreasonable size — returns null; the caller then
-/// creates an empty cache and saves over it later.
-fn loadPipelineCacheBytes(allocator: std.mem.Allocator) ?[]u8 {
+/// file, unreadable file, unreasonable size, or driver/GPU mismatch — returns null;
+/// the caller then creates an empty cache and saves over it later.
+fn loadPipelineCacheBytes(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    vendor_id: u32,
+    device_id: u32,
+    uuid: *const [16]u8,
+) ?[]u8 {
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const file = std.Io.Dir.cwd().openFile(io, pipeline_cache_path, .{}) catch return null;
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);
     const size = file.length(io) catch return null;
     if (size == 0 or size > maximum_pipeline_cache_bytes) return null;
     const bytes = allocator.alloc(u8, @intCast(size)) catch return null;
     errdefer allocator.free(bytes);
-    const read = file.readPositionalAll(io, bytes, 0) catch return null;
-    if (read != bytes.len) return null;
+    const read = file.readPositionalAll(io, bytes, 0) catch {
+        allocator.free(bytes);
+        return null;
+    };
+    if (read != bytes.len) {
+        allocator.free(bytes);
+        return null;
+    }
+    if (!pipeline_cache_save.Header.validate(bytes, vendor_id, device_id, uuid)) {
+        std.debug.print(
+            "[vulkan cache] discarded cache '{s}': driver or GPU mismatch (size={d} bytes); rebuilding fresh cache\n",
+            .{ path, bytes.len },
+        );
+        allocator.free(bytes);
+        return null;
+    }
+    std.debug.print("[vulkan cache] loaded valid pipeline cache '{s}' ({d} bytes)\n", .{ path, bytes.len });
     return bytes;
 }
 
@@ -1367,7 +1392,7 @@ fn pipelineCacheSaveSource(self: *Renderer) pipeline_cache_save.Source {
         .generation = self.pipeline_cache_generation.load(.acquire),
         .maximum_bytes = maximum_pipeline_cache_bytes,
         .directory = .cwd(),
-        .path = pipeline_cache_path,
+        .path = self.pipelineCachePath(),
     };
 }
 
@@ -5161,6 +5186,8 @@ pub const Renderer = struct {
     specialize_detile: bool = true,
     detile_variants: [64]?struct { key: detile_spirv.Specialization, pipeline: vk.Pipeline } = @splat(null),
     driver_pipeline_cache: vk.PipelineCache,
+    pipeline_cache_path_storage: [512]u8 = @splat(0),
+    pipeline_cache_path_len: usize = 0,
     pipeline_compile_queue: pipeline_compiler.Queue = .{},
     compute_warmup: ?*pipeline_warmup.Cache = null,
     memory_properties: vk.PhysicalDeviceMemoryProperties,
@@ -5682,6 +5709,10 @@ pub const Renderer = struct {
         self.compute_watch_hit_count = 0;
     }
 
+    pub fn pipelineCachePath(self: *const Renderer) []const u8 {
+        return self.pipeline_cache_path_storage[0..self.pipeline_cache_path_len];
+    }
+
     pub fn init(allocator: std.mem.Allocator, options: Options) (Error || std.mem.Allocator.Error)!Renderer {
         const wants_presentation = options.native_window != null;
         if (wants_presentation and builtin.os.tag != .windows) return Error.UnsupportedPresentationPlatform;
@@ -6117,7 +6148,41 @@ pub const Renderer = struct {
         // compiled pipelines seed this one, so the first frames of a title do
         // not pay full driver compilation again. Stale or foreign cache bytes
         // are rejected by the driver; any failure falls back to an empty cache.
-        const cached_bytes = loadPipelineCacheBytes(allocator);
+        var cache_path_buf: [512]u8 = @splat(0);
+        var cache_path: []const u8 = "";
+        if (options.pipeline_cache_path) |custom| {
+            const len = @min(custom.len, cache_path_buf.len);
+            @memcpy(cache_path_buf[0..len], custom[0..len]);
+            cache_path = cache_path_buf[0..len];
+        } else if (options.title_id) |title| {
+            if (title.len > 0) {
+                cache_path = std.fmt.bufPrint(&cache_path_buf, "cache/shaders/{s}.bin", .{title}) catch blk: {
+                    @memcpy(cache_path_buf[0.."vulkan_pipeline_cache.bin".len], "vulkan_pipeline_cache.bin");
+                    break :blk cache_path_buf[0.."vulkan_pipeline_cache.bin".len];
+                };
+            } else {
+                @memcpy(cache_path_buf[0.."vulkan_pipeline_cache.bin".len], "vulkan_pipeline_cache.bin");
+                cache_path = cache_path_buf[0.."vulkan_pipeline_cache.bin".len];
+            }
+        } else {
+            @memcpy(cache_path_buf[0.."vulkan_pipeline_cache.bin".len], "vulkan_pipeline_cache.bin");
+            cache_path = cache_path_buf[0.."vulkan_pipeline_cache.bin".len];
+        }
+        if (std.fs.path.dirname(cache_path)) |parent| {
+            if (parent.len > 0) {
+                var threaded_dir = std.Io.Threaded.init(allocator, .{});
+                defer threaded_dir.deinit();
+                std.Io.Dir.cwd().createDirPath(threaded_dir.io(), parent) catch {};
+            }
+        }
+
+        const cached_bytes = loadPipelineCacheBytes(
+            allocator,
+            cache_path,
+            candidate.info.vendor_id,
+            candidate.info.device_id,
+            &candidate.info.pipeline_cache_uuid,
+        );
         defer if (cached_bytes) |bytes| allocator.free(bytes);
         const pipeline_cache_info = vk.PipelineCacheCreateInfo{
             .initial_data_size = if (cached_bytes) |bytes| bytes.len else 0,
@@ -6182,6 +6247,8 @@ pub const Renderer = struct {
             .descriptor_set = descriptor_set,
             .compute_pipeline_layout = compute_pipeline_layout,
             .driver_pipeline_cache = driver_pipeline_cache,
+            .pipeline_cache_path_storage = cache_path_buf,
+            .pipeline_cache_path_len = cache_path.len,
             .pipeline_compile_queue = .{ .worker_limit = std.math.clamp(options.pipeline_compiler_workers, 1, pipeline_compiler.Queue.maximum_workers), .adaptation = .{ .enabled = options.adaptive_compiler_workers } },
             .memory_properties = memory_properties,
             .host_import_alignment = host_properties.alignment,
@@ -6324,11 +6391,11 @@ pub const Renderer = struct {
             // Descriptor capacity and generated code can depend on the GPU's
             // features. Never replay another device/driver's SPIR-V catalog.
             var path_buffer: [1024]u8 = undefined;
-            const cache_path = std.fmt.bufPrint(&path_buffer, "{s}/{x:0>8}-{x:0>8}-{s}", .{
+            const warmup_path = std.fmt.bufPrint(&path_buffer, "{s}/{x:0>8}-{x:0>8}-{s}", .{
                 directory,                                                            renderer.device_info.vendor_id, renderer.device_info.device_id,
                 std.fmt.bytesToHex(renderer.device_info.pipeline_cache_uuid, .lower),
             }) catch null;
-            if (cache_path) |path| renderer.compute_warmup = pipeline_warmup.Cache.open(path) catch null;
+            if (warmup_path) |path| renderer.compute_warmup = pipeline_warmup.Cache.open(path) catch null;
         }
         return renderer;
     }

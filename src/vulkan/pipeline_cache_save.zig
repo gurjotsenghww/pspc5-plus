@@ -7,6 +7,54 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vk = @import("api.zig");
 
+pub const Header = struct {
+    header_size: u32,
+    header_version: u32,
+    vendor_id: u32,
+    device_id: u32,
+    pipeline_cache_uuid: [16]u8,
+
+    pub const current_version: u32 = 1;
+    pub const header_size_bytes: usize = 32;
+
+    pub fn read(bytes: []const u8) ?Header {
+        if (bytes.len < header_size_bytes) return null;
+        var uuid: [16]u8 = undefined;
+        @memcpy(&uuid, bytes[16..32]);
+        return .{
+            .header_size = std.mem.readInt(u32, bytes[0..4], .little),
+            .header_version = std.mem.readInt(u32, bytes[4..8], .little),
+            .vendor_id = std.mem.readInt(u32, bytes[8..12], .little),
+            .device_id = std.mem.readInt(u32, bytes[12..16], .little),
+            .pipeline_cache_uuid = uuid,
+        };
+    }
+
+    pub fn validate(
+        bytes: []const u8,
+        expected_vendor_id: u32,
+        expected_device_id: u32,
+        expected_uuid: *const [16]u8,
+    ) bool {
+        const header = read(bytes) orelse return false;
+        if (header.header_size < header_size_bytes) return false;
+        if (header.header_version != current_version) return false;
+        if (header.vendor_id != expected_vendor_id) return false;
+        if (header.device_id != expected_device_id) return false;
+        if (!std.mem.eql(u8, &header.pipeline_cache_uuid, expected_uuid)) return false;
+        return true;
+    }
+
+    pub fn write(self: Header, destination: []u8) !void {
+        if (destination.len < header_size_bytes) return error.BufferTooSmall;
+        std.mem.writeInt(u32, destination[0..4], self.header_size, .little);
+        std.mem.writeInt(u32, destination[4..8], self.header_version, .little);
+        std.mem.writeInt(u32, destination[8..12], self.vendor_id, .little);
+        std.mem.writeInt(u32, destination[12..16], self.device_id, .little);
+        @memcpy(destination[16..32], &self.pipeline_cache_uuid);
+    }
+};
+
 pub const Source = struct {
     device: vk.Device,
     cache: vk.PipelineCache,
@@ -364,3 +412,63 @@ test "pipeline cache checkpoints persist loading progress without flips and coal
     saver.finish(source);
     try std.testing.expectEqual(@as(u64, 4), saver.persisted_generation);
 }
+
+test "pipeline cache header validation accepts matching driver and rejects mismatches" {
+    var uuid: [16]u8 = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const header = Header{
+        .header_size = 32,
+        .header_version = 1,
+        .vendor_id = 0x10de, // NVIDIA
+        .device_id = 0x25a0,
+        .pipeline_cache_uuid = uuid,
+    };
+    var buffer: [64]u8 = @splat(0);
+    try header.write(buffer[0..32]);
+
+    // Matching header passes validation
+    try std.testing.expect(Header.validate(buffer[0..64], 0x10de, 0x25a0, &uuid));
+
+    // Vendor mismatch fails
+    try std.testing.expect(!Header.validate(buffer[0..64], 0x1002, 0x25a0, &uuid));
+
+    // Device mismatch fails
+    try std.testing.expect(!Header.validate(buffer[0..64], 0x10de, 0x9999, &uuid));
+
+    // UUID mismatch fails
+    var other_uuid = uuid;
+    other_uuid[0] ^= 0xff;
+    try std.testing.expect(!Header.validate(buffer[0..64], 0x10de, 0x25a0, &other_uuid));
+
+    // Truncated buffer fails
+    try std.testing.expect(!Header.validate(buffer[0..16], 0x10de, 0x25a0, &uuid));
+
+    // Wrong version fails
+    std.mem.writeInt(u32, buffer[4..8], 2, .little);
+    try std.testing.expect(!Header.validate(buffer[0..64], 0x10de, 0x25a0, &uuid));
+}
+
+test "pipeline cache saver saves to nested paths when parent directory exists" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var driver = TestDriver{ .released = .init(true) };
+    var saver = Saver{};
+    defer saver.join();
+    const nested_path = "nested/cache/dir/cache.bin";
+    try temporary.dir.createDirPath(std.testing.io, "nested/cache/dir");
+    const source = Source{
+        .device = @ptrCast(&driver),
+        .cache = 1,
+        .get_data = TestDriver.get,
+        .generation = 1,
+        .maximum_bytes = 128,
+        .directory = temporary.dir,
+        .path = nested_path,
+    };
+    saver.finish(source);
+    try std.testing.expectEqual(@as(u64, 1), saver.persisted_generation);
+    try std.testing.expectEqual(null, saver.last_failure);
+    const after = try temporary.dir.readFileAlloc(std.testing.io, nested_path, std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, "complete snapshot", after);
+}
+

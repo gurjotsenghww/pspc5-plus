@@ -27,7 +27,7 @@ const window_width = 1180;
 const window_height = 760;
 const sidebar_width = 222;
 
-const Page = enum { library, input, saves, settings };
+const Page = enum { library, input, saves, settings, logs };
 const InputMode = enum(u8) { controller = 0, keyboard = 1, hybrid = 2 };
 // Append languages to preserve IDs saved by earlier launcher versions.
 const Language = enum(u8) { english = 0, russian = 1, german = 2, french = 3, chinese_simplified = 4, spanish = 5, arabic = 6, portuguese = 7 };
@@ -101,6 +101,12 @@ const Phrase = enum {
     saves_subtitle,
     saves_empty,
     saves_open_folder,
+    nav_logs,
+    logs_heading,
+    logs_subtitle,
+    logs_empty,
+    clear_log,
+    status_log_cleared,
     pad_test,
     pad_test_unavailable,
     pad_absent,
@@ -235,6 +241,32 @@ var extract_dirty: std.atomic.Value(bool) = .init(false);
 const extract_panel_rect = Rect{ .left = 282, .top = 158, .right = 1086, .bottom = 510 };
 const extract_copy_rect = Rect{ .left = 882, .top = 174, .right = 1062, .bottom = 208 };
 
+const game_timer_id: usize = 4;
+const wm_game_finished: u32 = Win32.wm_app + 2;
+const game_log_capacity = 64;
+const game_log_bytes = 256;
+const GameLogFeed = struct {
+    log: [game_log_capacity][game_log_bytes]u8 = undefined,
+    log_lengths: [game_log_capacity]u16 = @splat(0),
+    log_is_err: [game_log_capacity]bool = @splat(false),
+    log_next: usize = 0,
+    log_count: usize = 0,
+};
+var game_feed: GameLogFeed = .{};
+var game_full_log: std.ArrayList(u8) = .empty;
+const game_full_log_limit = 16 * 1024 * 1024;
+var game_lock: std.atomic.Mutex = .unlocked;
+var game_dirty: std.atomic.Value(bool) = .init(false);
+var game_process: Win32.Handle = null;
+var game_running = false;
+var game_exit_code: ?u32 = null;
+var game_title: [128]u16 = @splat(0);
+var game_title_len: usize = 0;
+
+const logs_copy_rect = Rect{ .left = 870, .top = 138, .right = 970, .bottom = 174 };
+const logs_clear_rect = Rect{ .left = 980, .top = 138, .right = 1066, .bottom = 174 };
+const logs_console_rect = Rect{ .left = 282, .top = 188, .right = 1086, .bottom = 714 };
+
 var status_text: [256]u16 = [_]u16{0} ** 256;
 var status_length: usize = 0;
 var status_error = false;
@@ -244,6 +276,7 @@ var regular_font: Win32.Font = null;
 var medium_font: Win32.Font = null;
 var title_font: Win32.Font = null;
 var small_font: Win32.Font = null;
+var console_font: Win32.Font = null;
 var application_icon: Win32.Icon = null;
 var gdiplus_ready = false;
 
@@ -316,6 +349,12 @@ fn tr(phrase: Phrase) []const u8 {
             .saves_subtitle => "All local save slots, grouped by title ID and kept beside the emulator.",
             .saves_empty => "No local saved games were found",
             .saves_open_folder => "Open folder",
+            .nav_logs => "Logs",
+            .logs_heading => "Execution Logs",
+            .logs_subtitle => "Live stdout and stderr diagnostics from running game processes.",
+            .logs_empty => "No log output yet. Launch a game to view real-time diagnostics.",
+            .clear_log => "Clear",
+            .status_log_cleared => "Log buffer cleared",
             .pad_test => "Test",
             .pad_test_unavailable => "Controller cannot be driven",
             .pad_searching => "Searching for a controller",
@@ -419,6 +458,12 @@ fn tr(phrase: Phrase) []const u8 {
             .saves_subtitle => "所有本地存档按游戏 ID 分组，保存在模拟器所在目录中。",
             .saves_empty => "未找到本地游戏存档",
             .saves_open_folder => "打开文件夹",
+            .nav_logs => "日志",
+            .logs_heading => "执行日志",
+            .logs_subtitle => "来自游戏进程的实时标准输出与诊断日志。",
+            .logs_empty => "暂无日志输出。启动游戏即可查看实时诊断信息。",
+            .clear_log => "清除",
+            .status_log_cleared => "日志已清空",
             .pad_test => "测试",
             .pad_test_unavailable => "无法控制此手柄",
             .pad_searching => "正在搜索手柄",
@@ -522,6 +567,12 @@ fn tr(phrase: Phrase) []const u8 {
             .saves_subtitle => "Partidas locales agrupadas por ID del juego, en la carpeta del emulador.",
             .saves_empty => "No se encontraron partidas guardadas locales",
             .saves_open_folder => "Abrir carpeta",
+            .nav_logs => "Registros",
+            .logs_heading => "Registros de ejecución",
+            .logs_subtitle => "Diagnósticos en directo de stdout y stderr del juego.",
+            .logs_empty => "Aún no hay registros. Inicia un juego para ver el diagnóstico.",
+            .clear_log => "Limpiar",
+            .status_log_cleared => "Registro borrado",
             .pad_test => "Probar",
             .pad_test_unavailable => "No se puede activar el mando",
             .pad_searching => "Buscando un mando",
@@ -625,6 +676,12 @@ fn tr(phrase: Phrase) []const u8 {
             .saves_subtitle => "ملفات الحفظ المحلية مجمّعة حسب معرّف اللعبة ومحفوظة بجوار المحاكي.",
             .saves_empty => "لم يتم العثور على ملفات حفظ محلية",
             .saves_open_folder => "فتح المجلد",
+            .nav_logs => "السجلات",
+            .logs_heading => "سجلات التشغيل",
+            .logs_subtitle => "تشخيصات فورية من مخرجات اللعبة.",
+            .logs_empty => "لا توجد سجلات بعد.",
+            .clear_log => "مسح",
+            .status_log_cleared => "تم مسح السجل",
             .pad_test => "اختبار",
             .pad_test_unavailable => "لا يمكن تنشيط يد التحكم",
             .pad_searching => "جارٍ البحث عن يد تحكم",
@@ -728,6 +785,12 @@ fn tr(phrase: Phrase) []const u8 {
             .saves_subtitle => "Jogos salvos locais agrupados por ID do título, na pasta do emulador.",
             .saves_empty => "Nenhum jogo salvo local encontrado",
             .saves_open_folder => "Abrir pasta",
+            .nav_logs => "Registros",
+            .logs_heading => "Registros de execução",
+            .logs_subtitle => "Diagnósticos em tempo real de stdout e stderr dos jogos.",
+            .logs_empty => "Nenhum registro ainda. Inicie um jogo para ver os diagnósticos.",
+            .clear_log => "Limpar",
+            .status_log_cleared => "Registro limpo",
             .pad_test => "Testar",
             .pad_test_unavailable => "Não é possível acionar o controle",
             .pad_searching => "Procurando um controle",
@@ -831,6 +894,12 @@ fn tr(phrase: Phrase) []const u8 {
             .saves_subtitle => "Все локальные сохранения по Title ID, хранящиеся рядом с эмулятором.",
             .saves_empty => "Локальные сохранения не найдены",
             .saves_open_folder => "Открыть папку",
+            .nav_logs => "Логи",
+            .logs_heading => "Журнал выполнения",
+            .logs_subtitle => "Диагностика stdout и stderr запущенных процессов в реальном времени.",
+            .logs_empty => "Логов пока нет. Запустите игру для просмотра диагностики.",
+            .clear_log => "Очистить",
+            .status_log_cleared => "Журнал очищен",
             .pad_test => "Тест",
             .pad_test_unavailable => "Контроллер недоступен для управления",
             .pad_searching => "Поиск контроллера",
@@ -934,6 +1003,12 @@ fn tr(phrase: Phrase) []const u8 {
             .saves_subtitle => "Alle lokalen Speicherstände, nach Titel-ID gruppiert und neben dem Emulator abgelegt.",
             .saves_empty => "Keine lokalen Speicherstände gefunden",
             .saves_open_folder => "Ordner öffnen",
+            .nav_logs => "Protokolle",
+            .logs_heading => "Ausführungsprotokoll",
+            .logs_subtitle => "Live-Diagnosedaten aus stdout und stderr laufender Spiele.",
+            .logs_empty => "Noch keine Protokolle. Starte ein Spiel für Live-Diagnosen.",
+            .clear_log => "Leeren",
+            .status_log_cleared => "Protokoll geleert",
             .pad_test => "Test",
             .pad_test_unavailable => "Controller nicht ansteuerbar",
             .pad_searching => "Controller wird gesucht",
@@ -1037,6 +1112,12 @@ fn tr(phrase: Phrase) []const u8 {
             .saves_subtitle => "Toutes les sauvegardes locales, regroupées par identifiant et stockées près de l’émulateur.",
             .saves_empty => "Aucune sauvegarde locale trouvée",
             .saves_open_folder => "Ouvrir le dossier",
+            .nav_logs => "Journaux",
+            .logs_heading => "Journaux d'exécution",
+            .logs_subtitle => "Diagnostics en direct de stdout et stderr des jeux.",
+            .logs_empty => "Aucun journal pour l'instant. Lancez un jeu pour voir les diagnostics.",
+            .clear_log => "Effacer",
+            .status_log_cleared => "Journal effacé",
             .pad_test => "Test",
             .pad_test_unavailable => "Manette non pilotable",
             .pad_searching => "Recherche d'une manette",
@@ -1170,6 +1251,14 @@ fn windowProcedure(
         },
         Win32.wm_erase_background => return 1,
         Win32.wm_timer => {
+            if (word_parameter == game_timer_id) {
+                if (game_dirty.swap(false, .acq_rel)) {
+                    if (current_page == .logs) {
+                        _ = Win32.InvalidateRect(window, null, 0);
+                    }
+                }
+                return 0;
+            }
             if (word_parameter == extract_timer_id) {
                 if (extract_dirty.swap(false, .acq_rel)) invalidateExtractPanel(window);
                 return 0;
@@ -1288,10 +1377,15 @@ fn windowProcedure(
             finishExtraction(window, @truncate(word_parameter));
             return 0;
         },
+        wm_game_finished => {
+            finishGame(window, @truncate(word_parameter));
+            return 0;
+        },
         Win32.wm_destroy => {
             // Closing the launcher abandons the extraction; the extractor has
             // no window of its own to be stopped from.
             if (extract_process != null) _ = Win32.TerminateProcess(extract_process, 1);
+            if (game_process != null) _ = Win32.CloseHandle(game_process);
             input.hid.stopTest();
             Win32.PostQuitMessage(0);
             return 0;
@@ -1312,6 +1406,7 @@ const nav_rects = [_]Rect{
     .{ .left = 20, .top = 184, .right = 202, .bottom = 232 },
     .{ .left = 20, .top = 242, .right = 202, .bottom = 290 },
     .{ .left = 20, .top = 300, .right = 202, .bottom = 348 },
+    .{ .left = 20, .top = 358, .right = 202, .bottom = 406 },
     // The project site, under the PROJECT heading and above the Boosty pill.
     .{ .left = 20, .top = 584, .right = 202, .bottom = 616 },
     .{ .left = 20, .top = 626, .right = 202, .bottom = 670 },
@@ -1528,6 +1623,7 @@ fn clickableAt(x: i32, y: i32) bool {
             indexOfRect(&resolution_rects, x, y) != null or
             indexOfRect(&preset_rects, x, y) != null or
             indexOfRect(&settings_toggle_rects, x, y) != null,
+        .logs => logs_copy_rect.contains(x, y) or logs_clear_rect.contains(x, y),
     };
 }
 
@@ -1538,8 +1634,9 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
             1 => current_page = .input,
             2 => current_page = .saves,
             3 => current_page = .settings,
-            4 => openSite(window),
-            5 => openBoosty(window),
+            4 => current_page = .logs,
+            5 => openSite(window),
+            6 => openBoosty(window),
             else => openGithub(window),
         }
         if (current_page != .library) {
@@ -1551,6 +1648,7 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
         .input => handleInputClick(x, y),
         .saves => handleSavesClick(window, x, y),
         .settings => handleSettingsClick(x, y),
+        .logs => handleLogsClick(window, x, y),
     }
     _ = Win32.InvalidateRect(window, null, 0);
 }
@@ -1673,6 +1771,7 @@ fn paint(window: Win32.Window) void {
         .input => drawInput(dc),
         .saves => drawSaves(dc),
         .settings => drawSettings(dc),
+        .logs => drawLogs(dc),
     }
     drawFooter(dc);
 }
@@ -1696,6 +1795,7 @@ fn drawNavigation(dc: Win32.DeviceContext) void {
     drawNavItem(dc, .input, 184, .nav_input, "02");
     drawNavItem(dc, .saves, 242, .nav_saves, "03");
     drawNavItem(dc, .settings, 300, .nav_settings, "04");
+    drawNavItem(dc, .logs, 358, .nav_logs, "05");
     drawVulkanStatus(dc);
     localizedText(dc, .project, .{ .left = 28, .top = 560, .right = 190, .bottom = 580 }, 0x007c716a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     roundFill(dc, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
@@ -2525,6 +2625,17 @@ fn handleSavesClick(window: Win32.Window, x: i32, y: i32) void {
     _ = Win32.ShellExecuteW(window, w("open"), @ptrCast(&path), null, null, Win32.show_normal);
 }
 
+fn handleLogsClick(window: Win32.Window, x: i32, y: i32) void {
+    if (logs_copy_rect.contains(x, y)) {
+        copyGameLog(window);
+        return;
+    }
+    if (logs_clear_rect.contains(x, y)) {
+        clearGameLog(window);
+        return;
+    }
+}
+
 fn drawSaves(dc: Win32.DeviceContext) void {
     pageHeading(dc, .saves_heading, .saves_subtitle);
     if (!save_scan_done) scanSaves();
@@ -2589,6 +2700,68 @@ fn drawSettings(dc: Win32.DeviceContext) void {
     text(dc, w("PSPC5 Plus"), -1, .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, medium_font, Win32.dt_left);
     localizedText(dc, .author, .{ .left = 310, .top = 684, .right = 840, .bottom = 708 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 684, .right = 1048, .bottom = 708 }, 0x008b817a, regular_font, Win32.dt_right);
+}
+
+fn drawLogs(dc: Win32.DeviceContext) void {
+    pageHeading(dc, .logs_heading, .logs_subtitle);
+
+    button(dc, logs_copy_rect, .copy_log, false);
+    button(dc, logs_clear_rect, .clear_log, false);
+
+    if (game_running) {
+        roundFill(dc, .{ .left = 282, .top = 138, .right = 430, .bottom = 174 }, 10, 0x00243818);
+        roundFill(dc, .{ .left = 296, .top = 152, .right = 304, .bottom = 160 }, 4, 0x0068d391);
+        text(dc, w("RUNNING"), -1, .{ .left = 312, .top = 146, .right = 422, .bottom = 168 }, 0x0068d391, small_font, Win32.dt_left);
+        if (game_title_len > 0) {
+            text(dc, &game_title, @intCast(game_title_len), .{ .left = 444, .top = 146, .right = 850, .bottom = 168 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        }
+    } else if (game_exit_code) |code| {
+        roundFill(dc, .{ .left = 282, .top = 138, .right = 430, .bottom = 174 }, 10, 0x002c2520);
+        roundFill(dc, .{ .left = 296, .top = 152, .right = 304, .bottom = 160 }, 4, if (code == 0) 0x0068d391 else 0x006b77ff);
+        var code_buf: [32]u8 = undefined;
+        const code_str = std.fmt.bufPrint(&code_buf, "EXITED ({d})", .{code}) catch "EXITED";
+        drawAscii(dc, code_str, .{ .left = 312, .top = 146, .right = 422, .bottom = 168 }, if (code == 0) 0x0068d391 else 0x006b77ff, small_font, Win32.dt_left);
+        if (game_title_len > 0) {
+            text(dc, &game_title, @intCast(game_title_len), .{ .left = 444, .top = 146, .right = 850, .bottom = 168 }, 0x009b9088, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        }
+    } else {
+        roundFill(dc, .{ .left = 282, .top = 138, .right = 380, .bottom = 174 }, 10, 0x00251f1b);
+        roundFill(dc, .{ .left = 296, .top = 152, .right = 304, .bottom = 160 }, 4, 0x006d625b);
+        text(dc, w("IDLE"), -1, .{ .left = 312, .top = 146, .right = 372, .bottom = 168 }, 0x007c716a, small_font, Win32.dt_left);
+    }
+
+    roundFill(dc, logs_console_rect, 10, 0x00130f0c);
+
+    lockGameFeed();
+    defer game_lock.unlock();
+
+    if (game_feed.log_count == 0) {
+        localizedText(dc, .logs_empty, .{ .left = 306, .top = 210, .right = 1062, .bottom = 240 }, 0x007c716a, regular_font, Win32.dt_left);
+        return;
+    }
+
+    const max_visible: usize = 24;
+    const total = game_feed.log_count;
+    const visible = @min(total, max_visible);
+    const start_idx = (game_feed.log_next + game_log_capacity - visible) % game_log_capacity;
+    for (0..visible) |i| {
+        const slot = (start_idx + i) % game_log_capacity;
+        const len = game_feed.log_lengths[slot];
+        if (len == 0) continue;
+        const line_str = game_feed.log[slot][0..len];
+        const y = 202 + @as(i32, @intCast(i)) * 21;
+        var text_color: u32 = 0x00d0c8c0;
+        if (game_feed.log_is_err[slot]) {
+            text_color = 0x006b77ff;
+        } else if (std.mem.indexOf(u8, line_str, "[vulkan cache]") != null or std.mem.indexOf(u8, line_str, "[vulkan]") != null) {
+            text_color = 0x005cd69a;
+        } else if (std.mem.indexOf(u8, line_str, "warn") != null or std.mem.indexOf(u8, line_str, "Warn") != null) {
+            text_color = 0x00ffac64;
+        } else if (std.mem.startsWith(u8, line_str, "[process exited")) {
+            text_color = 0x008080ff;
+        }
+        textUtf8(dc, line_str, .{ .left = 302, .top = y, .right = 1066, .bottom = y + 21 }, text_color, console_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    }
 }
 
 fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void {
@@ -2991,6 +3164,118 @@ fn finishExtraction(window: Win32.Window, exit_code: u32) void {
     setStatusPhrase(extract_result, !found);
 }
 
+fn lockGameFeed() void {
+    while (!game_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn readGameOutput(window: Win32.Window, pipe: Win32.Handle, process: Win32.Handle) void {
+    var chunk: [4096]u8 = undefined;
+    var line: [512]u8 = undefined;
+    var line_length: usize = 0;
+    while (true) {
+        var read: u32 = 0;
+        if (Win32.ReadFile(pipe, &chunk, chunk.len, &read, null) == 0 or read == 0) break;
+        for (chunk[0..read]) |byte| {
+            if (byte == '\n') {
+                acceptGameLine(line[0..line_length]);
+                line_length = 0;
+            } else if (byte != '\r' and line_length < line.len) {
+                line[line_length] = byte;
+                line_length += 1;
+            }
+        }
+    }
+    if (line_length != 0) acceptGameLine(line[0..line_length]);
+    _ = Win32.CloseHandle(pipe);
+    _ = Win32.WaitForSingleObject(process, Win32.infinite);
+    var exit_code: u32 = 0;
+    _ = Win32.GetExitCodeProcess(process, &exit_code);
+    _ = Win32.PostMessageW(window, wm_game_finished, exit_code, 0);
+}
+
+fn acceptGameLine(raw: []const u8) void {
+    const value = std.mem.trim(u8, raw, " \t\r");
+    if (value.len == 0) return;
+
+    var length = value.len;
+    while (length > 0 and !std.unicode.utf8ValidateSlice(value[0..length])) length -= 1;
+    if (length == 0) return;
+
+    const is_error = std.mem.indexOf(u8, value, "error") != null or
+        std.mem.indexOf(u8, value, "Error") != null or
+        std.mem.indexOf(u8, value, "fail") != null or
+        std.mem.indexOf(u8, value, "Fail") != null or
+        std.mem.indexOf(u8, value, "fault") != null or
+        std.mem.indexOf(u8, value, "panic") != null;
+
+    const drawn_len = @min(length, game_log_bytes);
+
+    lockGameFeed();
+    if (game_full_log.items.len + length + 2 <= game_full_log_limit) {
+        game_full_log.appendSlice(std.heap.page_allocator, value[0..length]) catch {};
+        game_full_log.appendSlice(std.heap.page_allocator, "\r\n") catch {};
+    }
+    const slot = game_feed.log_next;
+    @memcpy(game_feed.log[slot][0..drawn_len], value[0..drawn_len]);
+    game_feed.log_lengths[slot] = @intCast(drawn_len);
+    game_feed.log_is_err[slot] = is_error;
+    game_feed.log_next = (slot + 1) % game_log_capacity;
+    game_feed.log_count = @min(game_feed.log_count + 1, game_log_capacity);
+    game_lock.unlock();
+
+    game_dirty.store(true, .release);
+}
+
+fn copyGameLog(window: Win32.Window) void {
+    lockGameFeed();
+    defer game_lock.unlock();
+    const log = game_full_log.items;
+    if (log.len == 0) return;
+    const units = std.unicode.calcUtf16LeLen(log) catch return;
+    const memory = Win32.GlobalAlloc(Win32.gmem_moveable, (units + 1) * 2) orelse return;
+    const locked: [*]u16 = @ptrCast(@alignCast(Win32.GlobalLock(memory) orelse {
+        _ = Win32.GlobalFree(memory);
+        return;
+    }));
+    const written = std.unicode.utf8ToUtf16Le(locked[0..units], log) catch 0;
+    locked[written] = 0;
+    _ = Win32.GlobalUnlock(memory);
+    if (Win32.OpenClipboard(window) == 0) {
+        _ = Win32.GlobalFree(memory);
+        return;
+    }
+    defer _ = Win32.CloseClipboard();
+    _ = Win32.EmptyClipboard();
+    if (Win32.SetClipboardData(Win32.cf_unicode_text, memory) == null) {
+        _ = Win32.GlobalFree(memory);
+        return;
+    }
+    setStatusPhrase(.status_log_copied, false);
+}
+
+fn clearGameLog(window: Win32.Window) void {
+    lockGameFeed();
+    game_full_log.clearRetainingCapacity();
+    game_feed = .{};
+    game_lock.unlock();
+    setStatusPhrase(.status_log_cleared, false);
+    _ = Win32.InvalidateRect(window, null, 0);
+}
+
+fn finishGame(window: Win32.Window, exit_code: u32) void {
+    _ = Win32.KillTimer(window, game_timer_id);
+    if (game_process != null) {
+        _ = Win32.CloseHandle(game_process);
+        game_process = null;
+    }
+    game_running = false;
+    game_exit_code = exit_code;
+    var exit_msg: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&exit_msg, "[process exited with code {d}]", .{exit_code}) catch "";
+    acceptGameLine(msg);
+    _ = Win32.InvalidateRect(window, null, 0);
+}
+
 fn launchGame(owner: Win32.Window) void {
     if (game_folder_length == 0) {
         setStatusPhrase(.status_choose_folder, true);
@@ -3035,33 +3320,87 @@ fn launchGame(owner: Win32.Window) void {
     appendWide(&command, &length, w("\""));
     command[length] = 0;
 
-    var startup = Win32.StartupInfoW{ .size = @sizeOf(Win32.StartupInfoW) };
-    var process: Win32.ProcessInformation = undefined;
-    var emulator_home: [1024]u16 = @splat(0);
-    if (emulatorHomeDirectory(&emulator_home) == 0) {
+    if (game_process != null) {
+        _ = Win32.CloseHandle(game_process);
+        game_process = null;
+    }
+
+    var security = Win32.SecurityAttributes{ .inherit = 1 };
+    var read_end: Win32.Handle = null;
+    var write_end: Win32.Handle = null;
+    if (Win32.CreatePipe(&read_end, &write_end, &security, 0) == 0) {
         setStatusPhrase(.status_launch_failed, true);
         return;
     }
-    if (Win32.CreateProcessW(
+    _ = Win32.SetHandleInformation(read_end, Win32.handle_flag_inherit, 0);
+
+    var startup = Win32.StartupInfoW{
+        .size = @sizeOf(Win32.StartupInfoW),
+        .flags = Win32.startf_use_std_handles,
+        .std_output = write_end,
+        .std_error = write_end,
+    };
+    var process: Win32.ProcessInformation = undefined;
+    var emulator_home: [1024]u16 = @splat(0);
+    if (emulatorHomeDirectory(&emulator_home) == 0) {
+        _ = Win32.CloseHandle(write_end);
+        _ = Win32.CloseHandle(read_end);
+        setStatusPhrase(.status_launch_failed, true);
+        return;
+    }
+    const started = Win32.CreateProcessW(
         @ptrCast(&runner),
         @ptrCast(&command),
         null,
         null,
-        0,
-        Win32.create_new_console,
+        1,
+        Win32.create_no_window,
         null,
         @ptrCast(&emulator_home),
         &startup,
         &process,
-    ) == 0) {
+    );
+    _ = Win32.CloseHandle(write_end);
+    if (started == 0) {
+        _ = Win32.CloseHandle(read_end);
         reportLaunchFailure(owner, Win32.GetLastError());
         return;
     }
     _ = Win32.CloseHandle(process.thread);
-    _ = Win32.CloseHandle(process.process);
+
+    lockGameFeed();
+    game_feed = .{};
+    game_full_log.clearRetainingCapacity();
+    game_lock.unlock();
+    game_dirty.store(false, .release);
+
+    game_running = true;
+    game_exit_code = null;
+    game_process = process.process;
+
+    if (recent_game_count > 0 and sameFolder(recent_games[0].folder[0..recent_games[0].folder_length], game_folder[0..game_folder_length])) {
+        game_title_len = recent_games[0].title_length;
+        @memcpy(game_title[0..game_title_len], recent_games[0].title[0..game_title_len]);
+    } else {
+        game_title_len = fallbackFolderTitle(game_folder[0..game_folder_length], &game_title);
+    }
+
+    const reader = std.Thread.spawn(.{}, readGameOutput, .{ owner, read_end, process.process }) catch {
+        _ = Win32.TerminateProcess(process.process, 1);
+        _ = Win32.CloseHandle(process.process);
+        _ = Win32.CloseHandle(read_end);
+        game_process = null;
+        game_running = false;
+        setStatusPhrase(.status_launch_failed, true);
+        return;
+    };
+    reader.detach();
+
     rememberGameFolder(game_folder[0..game_folder_length], true);
     setStatusPhrase(.status_launched, false);
-    _ = Win32.ShowWindow(owner, Win32.show_minimized);
+    current_page = .logs;
+    _ = Win32.SetTimer(owner, game_timer_id, 100, null);
+    _ = Win32.InvalidateRect(owner, null, 0);
 }
 
 /// What a player can do about a refused process creation. The code is the
@@ -3311,6 +3650,7 @@ fn createFonts() void {
     medium_font = Win32.CreateFontW(-17, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, w("Segoe UI"));
     title_font = Win32.CreateFontW(-27, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, w("Segoe UI"));
     small_font = Win32.CreateFontW(-13, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, w("Segoe UI"));
+    console_font = Win32.CreateFontW(-13, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w("Consolas"));
 }
 
 fn destroyFonts() void {
@@ -3318,6 +3658,7 @@ fn destroyFonts() void {
     if (medium_font != null) _ = Win32.DeleteObject(medium_font);
     if (title_font != null) _ = Win32.DeleteObject(title_font);
     if (small_font != null) _ = Win32.DeleteObject(small_font);
+    if (console_font != null) _ = Win32.DeleteObject(console_font);
 }
 
 fn appendWide(output: *[4096]u16, length: *usize, value: [*:0]const u16) void {

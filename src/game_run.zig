@@ -904,6 +904,8 @@ fn run(init: std.process.Init) !bool {
         };
         renderer = vulkan.Renderer.init(allocator, .{
             .enable_validation = enable_vulkan_validation,
+            .title_id = if (title_identifier.len > 0) title_identifier else null,
+            .pipeline_cache_path = if (init.minimal.environ.getAlloc(allocator, "PS5_VULKAN_PIPELINE_CACHE")) |custom| custom else |_| null,
             .capture_first_graphics_frame = capture_first_graphics_frame,
             .trace_graphics_frame = trace_graphics_frame,
             .trace_gpu_completion_from_frame = trace_gpu_completion_from_frame,

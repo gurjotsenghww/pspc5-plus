@@ -10,6 +10,7 @@ pub const detile_spirv = @import("detile_spirv.zig");
 pub const image_alias = @import("image_alias.zig");
 pub const image_state = @import("image_state.zig");
 pub const pipeline_compiler = @import("pipeline_compiler.zig");
+pub const pipeline_cache_save = @import("pipeline_cache_save.zig");
 
 pub const Error = backend.Error;
 pub const Options = backend.Options;
@@ -41,4 +42,5 @@ test {
     _ = @import("buffer_write_history.zig");
     _ = @import("buffer_write_ranges.zig");
     _ = @import("spirv_cache.zig");
+    _ = pipeline_cache_save;
 }
