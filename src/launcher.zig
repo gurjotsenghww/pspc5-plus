@@ -3766,12 +3766,16 @@ fn acceptGameLine(raw: []const u8) void {
     while (length > 0 and !std.unicode.utf8ValidateSlice(value[0..length])) length -= 1;
     if (length == 0) return;
 
-    const is_error = std.mem.indexOf(u8, value, "error") != null or
+    var is_error = std.mem.indexOf(u8, value, "error") != null or
         std.mem.indexOf(u8, value, "Error") != null or
         std.mem.indexOf(u8, value, "fail") != null or
         std.mem.indexOf(u8, value, "Fail") != null or
         std.mem.indexOf(u8, value, "fault") != null or
         std.mem.indexOf(u8, value, "panic") != null;
+
+    if (is_error and std.mem.startsWith(u8, value, "[gpu gaps]") and std.mem.indexOf(u8, value, "draw_failures=0 dispatch_failures=0") != null) {
+        is_error = false;
+    }
 
     const drawn_len = @min(length, game_log_bytes);
 
