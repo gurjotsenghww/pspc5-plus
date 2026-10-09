@@ -159,19 +159,46 @@ pub fn decodeCblock(raw: []const u8) Error!CblockInfo {
     };
 }
 
+fn hasAdjacentRuns(blob: []const u8, u2c_pos: usize, counts: Counts) bool {
+    const num_u2c_bytes = @as(usize, counts.numU2c()) * u2c_stride;
+    const cbi_pos = std.mem.alignForward(usize, u2c_pos + num_u2c_bytes, 8);
+    const total_cblocks = counts.num_cblock_info;
+    const check_n = @min(total_cblocks, 64);
+    if (cbi_pos >= blob.len) return false;
+    const avail_n = @min(check_n, (blob.len - cbi_pos) / cblock_stride);
+    var last_was_run = false;
+    var i: usize = 0;
+    while (i < avail_n) : (i += 1) {
+        const rec = blob[cbi_pos + i * cblock_stride ..][0..cblock_stride];
+        const is_run = (decodeCblock(rec) catch return true).is_run_base;
+        if (is_run and last_was_run) return true;
+        last_was_run = is_run;
+    }
+    return false;
+}
+
+fn detectU2cOffset(blob: []const u8, pos: usize, counts: Counts) usize {
+    const pos_unaligned = pos;
+    const pos_aligned = std.mem.alignForward(usize, pos, 16);
+    if (pos_unaligned == pos_aligned) return pos_unaligned;
+    if (hasAdjacentRuns(blob, pos_aligned, counts)) {
+        return pos_unaligned;
+    }
+    return pos_aligned;
+}
+
 pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
     const counts = try decodeHeader(blob);
     const fidx_n = counts.numFileOffsets();
-    const map_end = sectionEnd(counts, fidx_n);
+
+    const map_end = sectionEnd(blob, counts, fidx_n);
     if (blob.len < map_end) return error.TruncatedNaps;
 
-    // Outer digests and shuffle entries are 8-byte records packed after the
-    // header. The file-offset table is padded to 16 bytes; the u2c table
-    // ends on an 8-byte boundary, which need not also be 16-byte aligned.
     var pos: usize = header_size;
     pos += @as(usize, counts.num_outer_blocks) * outer_stride;
     pos += @as(usize, counts.num_shuffle) * shuffle_stride;
 
+    if (pos + fidx_n * file_offset_stride > blob.len) return error.TruncatedNaps;
     const file_offsets = allocator.alloc(FileOffset, fidx_n) catch return error.TruncatedNaps;
     errdefer allocator.free(file_offsets);
     var i: usize = 0;
@@ -183,27 +210,30 @@ pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
         file_offsets[i] = .{ .kind = rec[5], .uncompressed_offset = off };
     }
     pos += fidx_n * file_offset_stride;
-    pos = std.mem.alignForward(usize, pos, 16);
+
+    pos = detectU2cOffset(blob, pos, counts);
     pos += @as(usize, counts.numU2c()) * u2c_stride;
     pos = std.mem.alignForward(usize, pos, 8);
 
+    if (pos + @as(usize, counts.num_cblock_info) * cblock_stride > blob.len) return error.TruncatedNaps;
     const cblocks = allocator.alloc(CblockInfo, counts.num_cblock_info) catch return error.TruncatedNaps;
     errdefer allocator.free(cblocks);
     i = 0;
     while (i < counts.num_cblock_info) : (i += 1) {
         const rec_off = pos + i * cblock_stride;
-        if (rec_off + cblock_stride > blob.len) return error.TruncatedNaps;
         cblocks[i] = try decodeCblock(blob[rec_off..][0..cblock_stride]);
     }
 
     return .{ .counts = counts, .file_offsets = file_offsets, .cblocks = cblocks };
 }
 
-fn sectionEnd(counts: Counts, fidx_n: usize) usize {
+fn sectionEnd(blob: []const u8, counts: Counts, fidx_n: usize) usize {
     var pos = header_size + @as(usize, counts.num_outer_blocks) * outer_stride;
     pos += @as(usize, counts.num_shuffle) * shuffle_stride;
-    pos = std.mem.alignForward(usize, pos + fidx_n * file_offset_stride, 16);
-    pos = std.mem.alignForward(usize, pos + @as(usize, counts.numU2c()) * u2c_stride, 8);
+    pos += fidx_n * file_offset_stride;
+    pos = detectU2cOffset(blob, pos, counts);
+    pos += @as(usize, counts.numU2c()) * u2c_stride;
+    pos = std.mem.alignForward(usize, pos, 8);
     return pos + @as(usize, counts.num_cblock_info) * cblock_stride;
 }
 
@@ -291,3 +321,77 @@ test "CblockInfo starts after 8-byte u2c padding even when not 16-byte aligned" 
     }
     try std.testing.expectError(error.TruncatedNaps, parse(std.testing.allocator, blob[0..89]));
 }
+
+test "inspect WALL-E package naps layout" {
+    const pkg_path = "D:\\PS5-TG\\[SuperPSX]-Disney.Pixar.WALL-E-PPSA14383 – USA-Game (v01.000.001)(4.xx BackPort)-FPKG-PS5.pkg";
+    var file = std.Io.Dir.cwd().openFile(std.testing.io, pkg_path, .{ .mode = .read_only }) catch return;
+    defer file.close(std.testing.io);
+    const flen = try file.length(std.testing.io);
+
+    var header: [0x100]u8 = undefined;
+    _ = try file.readPositionalAll(std.testing.io, &header, 0);
+    const root = @import("root.zig");
+    const fih = try root.parseFih(&header, flen);
+
+    var sb_buf: [0x400]u8 = undefined;
+    _ = try file.readPositionalAll(std.testing.io, &sb_buf, fih.superblock_offset);
+    const sb = try root.pfs.parseSuperblock(&sb_buf, 0);
+
+    const inodes = try root.pfs.loadInodes(file, std.testing.io, std.testing.allocator, fih.pfs_offset, sb);
+    defer std.testing.allocator.free(inodes);
+
+    const naps_blob = (root.pfs.loadNamedOuter(file, std.testing.io, std.testing.allocator, fih.pfs_offset, sb, inodes, "naps_pkg_layout.dat")).?;
+    defer std.testing.allocator.free(naps_blob);
+
+    var layout = try parse(std.testing.allocator, naps_blob);
+    defer layout.deinit(std.testing.allocator);
+
+    var blocks: std.ArrayList(root.inner.UBlock) = .empty;
+    defer blocks.deinit(std.testing.allocator);
+    try root.inner.walkBlocks(std.testing.allocator, layout, layout.mountSize(), &blocks);
+
+    const meta_base_logical = blk: {
+        var best: u64 = 0;
+        for (layout.file_offsets) |entry_fo| {
+            if (entry_fo.uncompressed_offset > 0 and entry_fo.uncompressed_offset < layout.mountSize() and entry_fo.uncompressed_offset > best) {
+                best = entry_fo.uncompressed_offset;
+            }
+        }
+        break :blk best;
+    };
+
+    const image = try root.pfs.findPfsImage(inodes, file, std.testing.io, fih.pfs_offset, sb);
+    const image_offset = fih.pfs_offset + @as(u64, @intCast(image.startBlock())) * sb.block_size;
+    const image_size = image.size;
+
+    const meta = try root.inner.decodeTail(std.testing.allocator, file, std.testing.io, image_offset, image_size, blocks.items, meta_base_logical);
+    defer std.testing.allocator.free(meta.buf);
+
+    const sb_off = root.inner.findSuperblock(meta.buf, layout.mountSize()).?;
+    try std.testing.expectEqual(@as(usize, 0), sb_off);
+
+    const files = try root.inner.readFileTree(std.testing.allocator, file, std.testing.io, image_offset, image_size, blocks.items, meta.buf, meta.logical_base, sb_off);
+    defer {
+        for (files) |f| std.testing.allocator.free(f.path);
+        std.testing.allocator.free(files);
+    }
+    try std.testing.expect(files.len > 0);
+
+    var eboot_file: ?root.inner.MappedFile = null;
+    for (files) |f| {
+        if (std.mem.eql(u8, f.path, "eboot.bin")) {
+            eboot_file = f;
+            break;
+        }
+    }
+    const eb = eboot_file.?;
+    const eboot_buf = try std.testing.allocator.alloc(u8, @intCast(eb.size));
+    defer std.testing.allocator.free(eboot_buf);
+    try root.inner.copyLogical(file, std.testing.io, std.testing.allocator, image_offset, image_size, blocks.items, eb.logical, eboot_buf);
+
+    const magic = std.mem.readInt(u32, eboot_buf[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0x1d3d154f), magic);
+    const elf_off = root.pfs.self_elf_offset;
+    try std.testing.expectEqualStrings("\x7fELF", eboot_buf[elf_off..][0..4]);
+}
+

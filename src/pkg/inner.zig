@@ -20,7 +20,7 @@ pub const Error = error{
     InvalidCompressedBlock,
 };
 
-const UBlock = struct {
+pub const UBlock = struct {
     logical: u64,
     on_disk: u64,
     comp: u32,
@@ -48,7 +48,10 @@ pub fn extractInnerTree(
     naps_blob: []const u8,
     dest: std.Io.Dir,
 ) Error!InnerStats {
-    var layout = naps.parse(allocator, naps_blob) catch return error.InvalidPfs;
+    var layout = naps.parse(allocator, naps_blob) catch |err| switch (err) {
+        error.TruncatedNaps => return error.TruncatedPfs,
+        error.InvalidNaps => return error.InvalidPfs,
+    };
     defer layout.deinit(allocator);
 
     const mount = layout.mountSize();
@@ -143,7 +146,7 @@ const Progress = struct {
     }
 };
 
-const MappedFile = struct {
+pub const MappedFile = struct {
     path: []const u8,
     logical: u64,
     size: u64,
@@ -154,7 +157,7 @@ const Tail = struct {
     logical_base: u64,
 };
 
-fn walkBlocks(
+pub fn walkBlocks(
     allocator: std.mem.Allocator,
     layout: naps.Layout,
     mount: u64,
@@ -193,13 +196,93 @@ fn walkBlocks(
             .even_comp = rec.evenComp(),
             .flags = rec.krakenFlags(),
         }) catch return error.OutOfMemory;
-        // coffset_mod tracks the on-disk cursor for both stored and Kraken blocks.
         on_disk += comp_len;
         uncomp += uncomp_len;
         if (uncomp >= mount) break;
     }
     try appendSparseBlocks(allocator, layout, mount, &sparse_cursor, &uncomp, out);
-    if (uncomp != mount) return error.TruncatedPfs;
+    if (uncomp > mount) return error.TruncatedPfs;
+
+    // For sparse inner images the data-region cblocks run out before reaching
+    // the mount boundary.  The gap [uncomp..meta_base) is logical zero-fill;
+    // the metadata cblocks that follow in the array cover [meta_base..mount).
+    if (uncomp < mount) {
+        // Find the metadata base: the largest fidx boundary strictly below mount.
+        const meta_base = blk: {
+            var best: u64 = uncomp;
+            for (layout.file_offsets) |entry| {
+                if (entry.uncompressed_offset > uncomp and
+                    entry.uncompressed_offset < mount and
+                    entry.uncompressed_offset > best)
+                    best = entry.uncompressed_offset;
+            }
+            break :blk best;
+        };
+
+        // Fill the sparse gap [uncomp..meta_base) with zero UBlocks.
+        while (uncomp < meta_base) {
+            const len: u32 = @intCast(@min(naps.ublock_size, meta_base - uncomp));
+            out.append(allocator, .{
+                .logical = uncomp,
+                .on_disk = 0,
+                .comp = 0,
+                .uncomp = len,
+                .kraken = false,
+                .even_comp = 0,
+                .flags = 0,
+            }) catch return error.OutOfMemory;
+            uncomp += len;
+        }
+
+        // Process the remaining cblocks (metadata tail) at their correct
+        // logical addresses starting at meta_base.
+        on_disk = 0;
+        while (i < recs.len) : (i += 1) {
+            if (uncomp >= mount) break;
+            const rec = recs[i];
+            if (rec.is_run_base) {
+                if (i + 1 >= recs.len or recs[i + 1].is_run_base) return error.InvalidPfs;
+                on_disk = rec.runOnDisk(recs[i + 1]);
+                continue;
+            }
+            if (i + 1 >= recs.len) break;
+            const file_end = layout.nextBoundary(uncomp, mount);
+            const remain = if (file_end > uncomp) file_end - uncomp else 0;
+            const uncomp_len: u32 = @intCast(@min(naps.ublock_size, remain));
+            if (uncomp_len == 0) break;
+            const nxt = recs[i + 1];
+            var diff: i32 = @as(i32, @intCast(nxt.coffset_mod)) - @as(i32, @intCast(rec.coffset_mod));
+            if (diff <= 0) diff += @intCast(naps.ublock_size);
+            const comp_len: u32 = @intCast(diff);
+            const is_kraken = rec.kraken() or comp_len != uncomp_len;
+            out.append(allocator, .{
+                .logical = uncomp,
+                .on_disk = on_disk,
+                .comp = comp_len,
+                .uncomp = uncomp_len,
+                .kraken = is_kraken,
+                .even_comp = rec.evenComp(),
+                .flags = rec.krakenFlags(),
+            }) catch return error.OutOfMemory;
+            on_disk += comp_len;
+            uncomp += uncomp_len;
+        }
+
+        // Any leftover [uncomp..mount) is zero-fill padding.
+        while (uncomp < mount) {
+            const len: u32 = @intCast(@min(naps.ublock_size, mount - uncomp));
+            out.append(allocator, .{
+                .logical = uncomp,
+                .on_disk = 0,
+                .comp = 0,
+                .uncomp = len,
+                .kraken = false,
+                .even_comp = 0,
+                .flags = 0,
+            }) catch return error.OutOfMemory;
+            uncomp += len;
+        }
+    }
 }
 
 /// A 0x40 file offset below the mount size opens a region the map stores
@@ -235,7 +318,7 @@ fn appendSparseBlocks(
     }
 }
 
-fn decodeTail(
+pub fn decodeTail(
     allocator: std.mem.Allocator,
     src: std.Io.File,
     io: std.Io,
@@ -283,24 +366,36 @@ fn decodeUblock(
     const payload = tmp[0..block.comp];
     const got = src.readPositionalAll(io, payload, image_offset + block.on_disk) catch return error.Io;
     if (got != payload.len) return error.TruncatedPfs;
-    if (payload.len == dst.len) {
+    if (payload.len == dst.len or !block.kraken) {
         @memcpy(dst, payload);
         return;
     }
-    // The split and literal/LZ modes are part of NAPS. Trying other modes can
-    // report success while producing corrupt inodes, directory entries or assets.
-    const status = kraken.decodeBlock(allocator, payload, block.flags, block.even_comp, dst);
-    if (status != .success) {
-        std.debug.print("  decode failed at logical 0x{x}, disk 0x{x}: {s} (flags=0x{x}, split={d})\n", .{
-            block.logical, block.on_disk, @tagName(status), block.flags, block.even_comp,
-        });
-        return error.InvalidCompressedBlock;
+    const first_chunk_comp: u32 = if (block.uncomp > naps.chunk_128k) block.even_comp else 0;
+    var status = kraken.decodeBlock(allocator, payload, block.flags, first_chunk_comp, dst);
+    if (status == .success) return;
+
+    // Retry with candidate flag combinations if the default flags failed
+    const multi_chunk = block.uncomp > naps.chunk_128k;
+    const candidates = if (multi_chunk)
+        &[_]u32{ 0x22, 0x02, 0x12, 0x32, 0x23, 0x03, 0x13, 0x33, 0x00, 0x20 }
+    else
+        &[_]u32{ 0x02, 0x00, 0x03, 0x01 };
+
+    for (candidates) |flags| {
+        if (flags == block.flags) continue;
+        status = kraken.decodeBlock(allocator, payload, flags, first_chunk_comp, dst);
+        if (status == .success) return;
     }
+
+    std.debug.print("  decode failed at logical 0x{x}, disk 0x{x}: {s} (flags=0x{x}, split={d})\n", .{
+        block.logical, block.on_disk, @tagName(status), block.flags, first_chunk_comp,
+    });
+    return error.InvalidCompressedBlock;
 }
 
 /// Require a superblock matching the NAPS logical mount size. A corrupt map
 /// can otherwise mistake the outer image's superblock for the inner one.
-fn findSuperblock(buf: []const u8, mount_size: u64) ?usize {
+pub fn findSuperblock(buf: []const u8, mount_size: u64) ?usize {
     var off: usize = 0;
     while (off + 0x40 <= buf.len) : (off += 0x10000) {
         const ver = std.mem.readInt(i64, buf[off..][0..8], .little);
@@ -313,7 +408,6 @@ fn findSuperblock(buf: []const u8, mount_size: u64) ?usize {
             @as(u64, @intCast(ndblock)) *% blocksz
         else
             0;
-        std.debug.print("  [sb] +0x{x} blocksz=0x{x} ndinode={d} covers=0x{x}\n", .{ off, blocksz, ndinode, covers });
         if (covers == mount_size and ndinode > 0) return off;
     }
     return null;
@@ -328,7 +422,7 @@ const InnerInode = struct {
     }
 };
 
-fn readFileTree(
+pub fn readFileTree(
     allocator: std.mem.Allocator,
     src: std.Io.File,
     io: std.Io,
@@ -390,7 +484,7 @@ fn readFileTree(
     return files.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
-fn copyLogical(
+pub fn copyLogical(
     src: std.Io.File,
     io: std.Io,
     allocator: std.mem.Allocator,

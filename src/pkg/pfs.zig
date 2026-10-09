@@ -267,7 +267,7 @@ fn loadSuperblock(file: std.Io.File, io: std.Io, pfs_offset: u64, pfs_size: u64,
     return parseSuperblock(&buf, 0);
 }
 
-fn loadInodes(
+pub fn loadInodes(
     file: std.Io.File,
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -330,7 +330,7 @@ fn parseDinodeS64(buf: []const u8) Error!Inode {
     return inode;
 }
 
-fn findPfsImage(inodes: []const Inode, file: std.Io.File, io: std.Io, pfs_offset: u64, sb: Superblock) Error!Inode {
+pub fn findPfsImage(inodes: []const Inode, file: std.Io.File, io: std.Io, pfs_offset: u64, sb: Superblock) Error!Inode {
     var dir_buf: [0x10000]u8 = undefined;
     // Superroot (inode 0) lists uroot; uroot lists pfs_image.dat.
     for (inodes) |inode| {
@@ -445,14 +445,18 @@ pub fn extractAppFiles(
             pfs_offset + pfs_size - image_offset
         else
             image_size;
-        const stats = try inner.extractInnerTree(file, io, allocator, image_offset, image_size, image_limit, naps_blob, dest);
-        return .{ .files = stats.files, .eboot = stats.eboot, .modules = stats.modules };
+        if (inner.extractInnerTree(file, io, allocator, image_offset, image_size, image_limit, naps_blob, dest)) |stats| {
+            return .{ .files = stats.files, .eboot = stats.eboot, .modules = stats.modules };
+        } else |err| {
+            std.debug.print("inner PFS unpack via NAPS failed ({s}); falling back to raw SELF scan\n", .{@errorName(err)});
+        }
+    } else {
+        std.debug.print("NAPS layout missing; extracting SELF modules only (application content is incomplete)\n", .{});
     }
-    std.debug.print("NAPS layout missing; extracting SELF modules only (application content is incomplete)\n", .{});
     return extractSelfs(file, io, image_offset, image_size, dest);
 }
 
-fn loadNamedOuter(
+pub fn loadNamedOuter(
     file: std.Io.File,
     io: std.Io,
     allocator: std.mem.Allocator,
