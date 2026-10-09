@@ -360,7 +360,7 @@ pub const razorcpu_exports = [_]symbols.Export{
 pub const pngenc_exports = [_]symbols.Export{
     .{ .name = "scePngEncQueryMemorySize", .function = trace.wrap("scePngEncQueryMemorySize", &services.accept), .expect_id = "9030RnBDoh4" },
     .{ .name = "scePngEncCreate", .function = trace.wrap("scePngEncCreate", &services.accept), .expect_id = "7aGTPfrqT9s" },
-    .{ .name = "scePngEncEncode", .function = trace.wrap("scePngEncEncode", &services.absent), .expect_id = "xgDjJKpcyHo" },
+    .{ .name = "scePngEncEncode", .function = trace.wrap("scePngEncEncode", &services.pngEncEncode), .expect_id = "xgDjJKpcyHo" },
     .{ .name = "scePngEncDelete", .function = trace.wrap("scePngEncDelete", &services.accept), .expect_id = "RUrWdwTWZy8" },
 };
 
@@ -441,10 +441,10 @@ pub const savedata_native_exports = [_]symbols.Export{
 };
 
 pub const share_exports = [_]symbols.Export{
-    .{ .name = "sceShareFeatureProhibit", .function = trace.wrap("sceShareFeatureProhibit", &services.absent), .expect_id = "5wjxESwX68I" },
-    .{ .name = "sceShareInitialize", .function = trace.wrap("sceShareInitialize", &services.absent), .expect_id = "nBDD66kiFW8" },
-    .{ .name = "sceShareTerminate", .function = trace.wrap("sceShareTerminate", &services.absent), .expect_id = "0IL1keINExQ" },
-    .{ .name = "sceShareFeaturePermit", .function = trace.wrap("sceShareFeaturePermit", &services.absent), .expect_id = "YBiIdcDPrxs" },
+    .{ .name = "sceShareFeatureProhibit", .function = trace.wrap("sceShareFeatureProhibit", &services.accept), .expect_id = "5wjxESwX68I" },
+    .{ .name = "sceShareInitialize", .function = trace.wrap("sceShareInitialize", &services.accept), .expect_id = "nBDD66kiFW8" },
+    .{ .name = "sceShareTerminate", .function = trace.wrap("sceShareTerminate", &services.accept), .expect_id = "0IL1keINExQ" },
+    .{ .name = "sceShareFeaturePermit", .function = trace.wrap("sceShareFeaturePermit", &services.accept), .expect_id = "YBiIdcDPrxs" },
 };
 
 pub const videoout_exports = [_]symbols.Export{

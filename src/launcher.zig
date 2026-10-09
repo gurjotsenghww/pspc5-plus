@@ -272,6 +272,7 @@ var game_running = false;
 var game_exit_code: ?u32 = null;
 var game_title: [128]u16 = @splat(0);
 var game_title_len: usize = 0;
+var live_log_handle: Win32.Handle = null;
 
 const logs_open_file_rect = Rect{ .left = 574, .top = 138, .right = 718, .bottom = 174 };
 const logs_error_rect = Rect{ .left = 730, .top = 138, .right = 858, .bottom = 174 };
@@ -3742,6 +3743,13 @@ fn acceptGameLine(raw: []const u8) void {
     game_feed.log_count = @min(game_feed.log_count + 1, game_log_capacity);
     game_lock.unlock();
 
+    if (live_log_handle != null and @intFromPtr(live_log_handle) != Win32.invalid_handle) {
+        var written: u32 = 0;
+        _ = Win32.WriteFile(live_log_handle, value.ptr, @intCast(length), &written, null);
+        _ = Win32.WriteFile(live_log_handle, "\r\n", 2, &written, null);
+        _ = Win32.FlushFileBuffers(live_log_handle);
+    }
+
     if (is_error) {
         if (std.mem.indexOf(u8, value, "fatal") != null or
             std.mem.indexOf(u8, value, "panic") != null or
@@ -3801,6 +3809,10 @@ fn finishGame(window: Win32.Window, exit_code: u32) void {
     var exit_msg: [64]u8 = undefined;
     const msg = std.fmt.bufPrint(&exit_msg, "[process exited with code {d}]", .{exit_code}) catch "";
     acceptGameLine(msg);
+    if (live_log_handle != null and @intFromPtr(live_log_handle) != Win32.invalid_handle) {
+        _ = Win32.CloseHandle(live_log_handle);
+        live_log_handle = null;
+    }
     if (exit_code != 0) {
         var fail_buf: [128]u8 = undefined;
         const fail_str = std.fmt.bufPrint(&fail_buf, "Game runner process terminated with non-zero exit code {d}.", .{exit_code}) catch "Game runner process terminated with error.";
@@ -3924,6 +3936,37 @@ fn launchGame(owner: Win32.Window) void {
     game_running = true;
     game_exit_code = null;
     game_process = process.process;
+
+    if (live_log_handle != null and @intFromPtr(live_log_handle) != Win32.invalid_handle) {
+        _ = Win32.CloseHandle(live_log_handle);
+        live_log_handle = null;
+    }
+    var live_log_dir: [1024]u16 = @splat(0);
+    const home_len = emulatorHomeDirectory(&live_log_dir);
+    if (home_len > 0) {
+        const logs_dir_suffix = w("logs");
+        const logs_dir_len = wideLength(logs_dir_suffix);
+        var logs_path: [1024]u16 = @splat(0);
+        @memcpy(logs_path[0..home_len], live_log_dir[0..home_len]);
+        logs_path[home_len] = '\\';
+        @memcpy(logs_path[home_len + 1 ..][0..logs_dir_len], logs_dir_suffix[0..logs_dir_len]);
+        logs_path[home_len + 1 + logs_dir_len] = 0;
+        _ = Win32.CreateDirectoryW(@ptrCast(&logs_path), null);
+
+        const live_file_suffix = w("\\live_output.log");
+        const live_file_len = wideLength(live_file_suffix);
+        @memcpy(logs_path[home_len + 1 + logs_dir_len ..][0..live_file_len], live_file_suffix[0..live_file_len]);
+        logs_path[home_len + 1 + logs_dir_len + live_file_len] = 0;
+        live_log_handle = Win32.CreateFileW(
+            @ptrCast(&logs_path),
+            Win32.generic_write,
+            Win32.file_share_read,
+            null,
+            Win32.create_always,
+            0,
+            null,
+        );
+    }
 
     if (recent_game_count > 0 and sameFolder(recent_games[0].folder[0..recent_games[0].folder_length], game_folder[0..game_folder_length])) {
         game_title_len = recent_games[0].title_length;
@@ -4625,6 +4668,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn CreateFileW([*:0]const u16, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) callconv(.winapi) Handle;
     extern "kernel32" fn ReadFile(Handle, [*]u8, u32, ?*u32, ?*anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn WriteFile(Handle, [*]const u8, u32, ?*u32, ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn FlushFileBuffers(Handle) callconv(.winapi) i32;
     extern "kernel32" fn CreateDirectoryW([*:0]const u16, ?*anyopaque) callconv(.winapi) i32;
     extern "user32" fn GetCursorPos(*NativePoint) callconv(.winapi) i32;
     extern "user32" fn ScreenToClient(Window, *NativePoint) callconv(.winapi) i32;
