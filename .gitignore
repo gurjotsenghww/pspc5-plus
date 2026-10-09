@@ -11,3 +11,4 @@ run-logs/
 vulkan_pipeline_cache.bin.*.tmp
 *.elf
 savedata/
+logs/
