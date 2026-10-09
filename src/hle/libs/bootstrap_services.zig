@@ -1164,6 +1164,7 @@ const posix_exports = [_]symbols.Export{
     .{ .name = "recvmsg", .function = trace.wrap("recvmsg", &posixMessageOperation), .expect_id = "hI7oVeOluPM" },
     .{ .name = "inet_ntop", .function = trace.wrap("inet_ntop", &posixInetNtop), .expect_id = "5jRCs2axtr4" },
     .{ .name = "select", .function = trace.wrap("select", &posixSelect), .expect_id = "T8fER+tIGgk" },
+    .{ .name = "munmap", .function = trace.wrap("munmap", &kernel_memory.sceKernelMunmap), .expect_id = "UqDGjXA5yUM" },
     .{ .name = "libScePosix:w5IHyvahg-o", .function = trace.wrap("libScePosix:w5IHyvahg-o", &success), .id_override = "w5IHyvahg-o" },
 };
 

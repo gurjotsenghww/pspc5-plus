@@ -2313,6 +2313,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelSleep", .function = trace.wrap("sceKernelSleep", &kernelSleep), .expect_id = "-ZR+hG7aDHw" },
     .{ .name = "sceKernelUuidCreate", .function = trace.wrap("sceKernelUuidCreate", &uuidCreate), .expect_id = "Xjoosiw+XPI" },
     .{ .name = "sceKernelFstat", .function = trace.wrap("sceKernelFstat", &kernelUnsupported), .expect_id = "kBwCPsYX-m4" },
+    .{ .name = "libkernel:uWyW3v98sU4", .function = trace.wrap("libkernel:uWyW3v98sU4", &compatSuccess), .id_override = "uWyW3v98sU4" },
     .{ .name = "scePthreadRename", .function = trace.wrap("scePthreadRename", &compatSuccess), .expect_id = "GBUY7ywdULE" },
     .{ .name = "sceKernelCreateEventFlag", .function = trace.wrap("sceKernelCreateEventFlag", &createEventFlag), .expect_id = "BpFoboUJoZU" },
     .{ .name = "sceKernelDeleteEventFlag", .function = trace.wrap("sceKernelDeleteEventFlag", &deleteEventFlag), .expect_id = "8mql9OcQnd4" },
@@ -2402,6 +2403,7 @@ pub const posix_exports = [_]symbols.Export{
     // most often sets here is non-blocking, and claiming that took effect on a
     // descriptor that ignores it invites the title to spin.
     .{ .name = "fcntl", .function = trace.wrap("fcntl", &posixUnsupported), .expect_id = "8nY19bKoiZk" },
+    .{ .name = "munmap", .function = trace.wrap("munmap", &memory_api.sceKernelMunmap), .expect_id = "UqDGjXA5yUM" },
 };
 
 const open_ps_id_exports = [_]symbols.Export{

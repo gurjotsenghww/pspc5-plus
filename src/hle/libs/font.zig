@@ -475,6 +475,10 @@ fn selectRenderer(value: i32) callconv(abi.guest) ?*const RendererSelection {
     return if (value == 0) &renderer_selection else null;
 }
 
+fn fontSuccess(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
 pub const exports = [_]symbols.Export{
     .{ .name = "sceFontCreateLibrary", .function = trace.wrap("sceFontCreateLibrary", &createLibraryDefault), .expect_id = "nWrfPI4Okmg" },
     .{ .name = "sceFontOpenFontInstance", .function = trace.wrap("sceFontOpenFontInstance", &openFontInstance), .expect_id = "JzCH3SCFnAU" },
@@ -503,6 +507,34 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceFontGetCharGlyphMetrics", .function = trace.wrap("sceFontGetCharGlyphMetrics", &glyphMetrics), .expect_id = "L97d+3OgMlE" },
     .{ .name = "sceFontRenderCharGlyphImageHorizontal", .function = trace.wrap("sceFontRenderCharGlyphImageHorizontal", &renderGlyph), .expect_id = "kAenWy1Zw5o" },
     .{ .name = "sceFontSetScalePixel", .function = trace.wrap("sceFontSetScalePixel", &setScalePixel), .expect_id = "N1EBMeGhf7E" },
+    .{ .name = "sceFontAttachDeviceCacheBuffer", .function = trace.wrap("sceFontAttachDeviceCacheBuffer", &fontSuccess), .expect_id = "CUKn5pX-NVY" },
+    .{ .name = "sceFontTextSourceInit", .function = trace.wrap("sceFontTextSourceInit", &fontSuccess), .expect_id = "oaJ1BpN2FQk" },
+    .{ .name = "sceFontTextSourceSetWritingForm", .function = trace.wrap("sceFontTextSourceSetWritingForm", &fontSuccess), .expect_id = "OqQKX0h5COw" },
+    .{ .name = "sceFontTextSourceSetDefaultFont", .function = trace.wrap("sceFontTextSourceSetDefaultFont", &fontSuccess), .expect_id = "eCRMCSk96NU" },
+    .{ .name = "sceFontStringRefersRenderCharacters", .function = trace.wrap("sceFontStringRefersRenderCharacters", &fontSuccess), .expect_id = "hq5LffQjz-s" },
+    .{ .name = "sceFontWritingInit", .function = trace.wrap("sceFontWritingInit", &fontSuccess), .expect_id = "fD5rqhEXKYQ" },
+    .{ .name = "sceFontWritingRefersRenderStep", .function = trace.wrap("sceFontWritingRefersRenderStep", &fontSuccess), .expect_id = "W-2WOXEHGck" },
+    .{ .name = "sceFontWritingRefersRenderStepCharacter", .function = trace.wrap("sceFontWritingRefersRenderStepCharacter", &fontSuccess), .expect_id = "f4Onl7efPEY" },
+    .{ .name = "sceFontCharacterGetTextOrder", .function = trace.wrap("sceFontCharacterGetTextOrder", &fontSuccess), .expect_id = "mxgmMj-Mq-o" },
+    .{ .name = "sceFontWritingGetRenderMetrics", .function = trace.wrap("sceFontWritingGetRenderMetrics", &fontSuccess), .expect_id = "fljdejMcG1c" },
+    .{ .name = "sceFontStringGetWritingForm", .function = trace.wrap("sceFontStringGetWritingForm", &fontSuccess), .expect_id = "o1vIEHeb6tw" },
+    .{ .name = "sceFontCharacterLooksWhiteSpace", .function = trace.wrap("sceFontCharacterLooksWhiteSpace", &fontSuccess), .expect_id = "SaRlqtqaCew" },
+    .{ .name = "sceFontCharacterGetTextFontCode", .function = trace.wrap("sceFontCharacterGetTextFontCode", &fontSuccess), .expect_id = "zN3+nuA0SFQ" },
+    .{ .name = "sceFontStringRefersTextCharacters", .function = trace.wrap("sceFontStringRefersTextCharacters", &fontSuccess), .expect_id = "Avv7OApgCJk" },
+    .{ .name = "sceFontCharacterGetBidiLevel", .function = trace.wrap("sceFontCharacterGetBidiLevel", &fontSuccess), .expect_id = "6DFUkCwQLa8" },
+    .{ .name = "sceFontCharacterGetSyllableStringState", .function = trace.wrap("sceFontCharacterGetSyllableStringState", &fontSuccess), .expect_id = "coCrV6IWplE" },
+    .{ .name = "sceFontCharacterRefersTextNext", .function = trace.wrap("sceFontCharacterRefersTextNext", &fontSuccess), .expect_id = "BkjBP+YC19w" },
+    .{ .name = "sceFontStringGetTerminateOrder", .function = trace.wrap("sceFontStringGetTerminateOrder", &fontSuccess), .expect_id = "+B-xlbiWDJ4" },
+    .{ .name = "sceFontCreateWritingLine", .function = trace.wrap("sceFontCreateWritingLine", &fontSuccess), .expect_id = "7rogx92EEyc" },
+    .{ .name = "sceFontWritingLineWritesOrder", .function = trace.wrap("sceFontWritingLineWritesOrder", &fontSuccess), .expect_id = "wyKFUOWdu3Q" },
+    .{ .name = "sceFontWritingLineGetOrderingSpace", .function = trace.wrap("sceFontWritingLineGetOrderingSpace", &fontSuccess), .expect_id = "JQKWIsS9joE" },
+    .{ .name = "sceFontWritingLineClear", .function = trace.wrap("sceFontWritingLineClear", &fontSuccess), .expect_id = "1+DgKL0haWQ" },
+    .{ .name = "sceFontWritingLineRefersRenderStep", .function = trace.wrap("sceFontWritingLineRefersRenderStep", &fontSuccess), .expect_id = "+FYcYefsVX0" },
+    .{ .name = "sceFontWritingLineGetRenderMetrics", .function = trace.wrap("sceFontWritingLineGetRenderMetrics", &fontSuccess), .expect_id = "nlU2VnfpqTM" },
+    .{ .name = "sceFontDestroyWritingLine", .function = trace.wrap("sceFontDestroyWritingLine", &fontSuccess), .expect_id = "PEjv7CVDRYs" },
+    .{ .name = "sceFontCreateString", .function = trace.wrap("sceFontCreateString", &fontSuccess), .expect_id = "MO24vDhmS4E" },
+    .{ .name = "sceFontStringGetTerminateCode", .function = trace.wrap("sceFontStringGetTerminateCode", &fontSuccess), .expect_id = "ObkDGDBsVtw" },
+    .{ .name = "sceFontDestroyString", .function = trace.wrap("sceFontDestroyString", &fontSuccess), .expect_id = "SSCaczu2aMQ" },
 };
 
 pub const ft_exports = [_]symbols.Export{

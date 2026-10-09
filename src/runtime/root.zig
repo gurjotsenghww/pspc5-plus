@@ -644,6 +644,12 @@ fn unsupportedServiceFunction(import: *const loader.Import) ?u64 {
     if (std.mem.eql(u8, library, "libSceJson2")) {
         return @intFromPtr(&hle.libs.services.absent);
     }
+    if (std.mem.eql(u8, library, "libSceRazorCpu") or
+        std.mem.eql(u8, library, "libSceCoredump") or
+        std.mem.eql(u8, library, "libScePngEnc"))
+    {
+        return @intFromPtr(&hle.libs.services.accept);
+    }
     return null;
 }
 

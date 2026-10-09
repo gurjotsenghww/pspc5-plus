@@ -2749,6 +2749,7 @@ fn hostMapBacking(
                 var base: ?*anyopaque = @ptrFromInt(cursor);
                 var section_offset: windows.LARGE_INTEGER = @intCast(page_offset);
                 var view_size: windows.SIZE_T = @intCast(view_size_bytes);
+                const view_protection = windows.PAGE{ .EXECUTE_READWRITE = true };
                 const status = WindowsApi.NtMapViewOfSectionEx(
                     backing.handle,
                     windows.GetCurrentProcess(),
@@ -2756,7 +2757,7 @@ fn hostMapBacking(
                     &section_offset,
                     &view_size,
                     .{ .REPLACE_PLACEHOLDER = true },
-                    page,
+                    view_protection,
                     null,
                     0,
                 );
@@ -2773,7 +2774,10 @@ fn hostMapBacking(
                 // Mapping supplies the new view's protection. Recommitting
                 // existing section pages adds a syscall per view but changes
                 // neither their contents nor the physical allocation.
-                if (already_committed) continue;
+                if (already_committed) {
+                    try hostProtectContiguous(cursor, view_size_bytes, protection);
+                    continue;
+                }
 
                 var commit_base = base;
                 var commit_size: windows.SIZE_T = @intCast(view_size_bytes);
@@ -3282,6 +3286,8 @@ test "recycled direct views retain committed contents and apply fresh protection
     try space.unmap(base + granule, page_size);
     try space.mapFixed(base, page_size, .none, .direct_memory, page_size);
     try testing.expect(!isHostRangeReadable(base, page_size));
+    try space.protect(base, page_size, .read_write);
+    try testing.expect(isHostRangeWritable(base, page_size));
     try space.unmap(base, page_size);
 }
 

@@ -49,6 +49,7 @@ pub const coredump_exports = [_]symbols.Export{
     .{ .name = "libSceCoredump:kK0DUW1Ukgc", .function = trace.wrap("libSceCoredump:kK0DUW1Ukgc", &services.accept), .id_override = "kK0DUW1Ukgc" },
     .{ .name = "libSceCoredump:Jrs7UUkGOFo", .function = trace.wrap("libSceCoredump:Jrs7UUkGOFo", &services.accept), .id_override = "Jrs7UUkGOFo" },
     .{ .name = "libSceCoredump:MEJ7tc7ThwM", .function = trace.wrap("libSceCoredump:MEJ7tc7ThwM", &services.accept), .id_override = "MEJ7tc7ThwM" },
+    .{ .name = "libSceCoredump:dei8oUx6DbU", .function = trace.wrap("libSceCoredump:dei8oUx6DbU", &services.accept), .id_override = "dei8oUx6DbU" },
 };
 
 pub const camera2_exports = [_]symbols.Export{
@@ -353,6 +354,14 @@ pub const razorcpu_exports = [_]symbols.Export{
     .{ .name = "sceRazorCpuPushMarker", .function = trace.wrap("sceRazorCpuPushMarker", &services.accept), .expect_id = "zw+celG7zSI" },
     .{ .name = "sceRazorCpuPopMarker", .function = trace.wrap("sceRazorCpuPopMarker", &services.accept), .expect_id = "YpkGsMXP3ew" },
     .{ .name = "sceRazorCpuPushMarkerStatic", .function = trace.wrap("sceRazorCpuPushMarkerStatic", &services.accept), .expect_id = "uZrOwuNJX-M" },
+    .{ .name = "sceRazorCpuSync", .function = trace.wrap("sceRazorCpuSync", &services.accept), .expect_id = "Ax7NjOzctIM" },
+};
+
+pub const pngenc_exports = [_]symbols.Export{
+    .{ .name = "scePngEncQueryMemorySize", .function = trace.wrap("scePngEncQueryMemorySize", &services.accept), .expect_id = "9030RnBDoh4" },
+    .{ .name = "scePngEncCreate", .function = trace.wrap("scePngEncCreate", &services.accept), .expect_id = "7aGTPfrqT9s" },
+    .{ .name = "scePngEncEncode", .function = trace.wrap("scePngEncEncode", &services.absent), .expect_id = "xgDjJKpcyHo" },
+    .{ .name = "scePngEncDelete", .function = trace.wrap("scePngEncDelete", &services.accept), .expect_id = "RUrWdwTWZy8" },
 };
 
 pub const playgo_exports = [_]symbols.Export{
@@ -670,6 +679,7 @@ pub const all = [_]Table{
     .{ .library = "libScePad", .module = "libScePad", .exports = &pad_exports },
     .{ .library = "libScePlayGo", .module = "libScePlayGo", .exports = &playgo_exports },
     .{ .library = "libScePlayerInvitationDialog", .module = "libScePlayerInvitationDialog", .exports = &playerinvitationdialog_exports },
+    .{ .library = "libScePngEnc", .module = "libScePngEnc", .exports = &pngenc_exports },
     .{ .library = "libSceRazorCpu", .module = "libSceRazorCpu", .exports = &razorcpu_exports },
     .{ .library = "libSceRtc", .module = "libSceRtc", .exports = &rtc_exports },
     .{ .library = "libSceSaveDataDialog.native", .module = "libSceSaveDataDialog", .exports = &savedatadialog_native_exports },

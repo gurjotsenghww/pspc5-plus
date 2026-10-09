@@ -1554,7 +1554,7 @@ fn sceKernelMapDirectMemory2(
 
 /// Removes any fully covered combination of direct, flexible, or reserved
 /// mappings. AddressSpace preserves the process-wide outer reservations.
-fn sceKernelMunmap(address: u64, len: u64) callconv(abi.guest) i32 {
+pub fn sceKernelMunmap(address: u64, len: u64) callconv(abi.guest) i32 {
     if (address == 0 or len == 0 or address % page_size != 0 or len % page_size != 0) {
         return KernelError.einval.raw();
     }
