@@ -100,14 +100,36 @@ const minimal_png = [_]u8{
     0x42, 0x60, 0x82,
 };
 
-pub fn pngEncEncode(_: u64, _: u64, out_buf: u64, out_size: u64, _: u64, _: u64) callconv(abi.guest) i32 {
-    if (out_buf != 0 and out_size >= minimal_png.len) {
-        if (kernel_memory.isGuestRangeAccessible(out_buf, minimal_png.len)) {
-            const dest: [*]u8 = @ptrFromInt(out_buf);
+pub fn pngEncEncode(_: u64, arg2: u64, arg3: u64, out_size: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    const png_len: u32 = @intCast(minimal_png.len);
+
+    // Signature 1: Direct buffer (out_buf, out_size passed in arg3, out_size)
+    if (arg3 != 0 and out_size >= minimal_png.len) {
+        if (kernel_memory.isGuestRangeAccessible(arg3, minimal_png.len)) {
+            const dest: [*]u8 = @ptrFromInt(arg3);
             @memcpy(dest[0..minimal_png.len], &minimal_png);
         }
     }
-    return @intCast(minimal_png.len);
+
+    // Signature 2: Struct-based scePngEncEncode(handle, *const EncodeParam, *OutputInfo)
+    // arg2 = *const EncodeParam, arg3 = *OutputInfo
+    if (arg2 != 0 and kernel_memory.isGuestRangeAccessible(arg2, 32)) {
+        // EncodeParam: +0 image_mem_addr (u64), +8 png_mem_addr (u64), +16 png_mem_size (u32)
+        const param_ptr: [*]const u8 = @ptrFromInt(arg2);
+        const png_dest_addr = std.mem.readInt(u64, param_ptr[8..16], .little);
+        if (png_dest_addr != 0 and kernel_memory.isGuestRangeAccessible(png_dest_addr, minimal_png.len)) {
+            const dest: [*]u8 = @ptrFromInt(png_dest_addr);
+            @memcpy(dest[0..minimal_png.len], &minimal_png);
+        }
+    }
+
+    // Write output.dataSize into *OutputInfo (arg3)
+    if (arg3 != 0 and kernel_memory.isGuestRangeAccessible(arg3, 8)) {
+        const out_info: [*]u8 = @ptrFromInt(arg3);
+        std.mem.writeInt(u32, out_info[0..4], png_len, .little);
+    }
+
+    return @intCast(png_len);
 }
 
 /// Returns the stable local identity that accompanies the offline NP account.

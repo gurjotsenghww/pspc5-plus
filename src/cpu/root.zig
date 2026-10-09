@@ -1520,7 +1520,9 @@ const WindowsX64Machine = struct {
         handling_native_fault = true;
         defer handling_native_fault = false;
 
-        if (kind == .illegal_instruction and tryEmulateIllegalInstruction(context)) {
+        if (kind == .illegal_instruction and
+            (tryEmulateIllegalInstruction(context) or tryRecoverGuestDebugStop(context)))
+        {
             return exception_continue_execution;
         }
 
@@ -2818,6 +2820,52 @@ const WindowsX64Machine = struct {
         // preserving forward progress without blocking inside the VEH.
         context.Rip += instruction.length;
         return true;
+    }
+
+    fn tryRecoverGuestDebugStop(context: *std.os.windows.CONTEXT) bool {
+        if (!isGuestAddress(context.Rip)) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        // Check for UD2 (0x0F, 0x0B)
+        if (code[0] != 0x0f or code[1] != 0x0b) return false;
+
+        // Pattern 1: PS2HD orbis-gpu-gnm-ui.cpp DEBUG STOP:
+        // Context: ... e8 b7 61 7b 00 [0f 0b] 0f 0b 48 8d 35 d4 5b 84 00
+        // Clean epilogue is at -0x942 bytes (offset 0x428 stack adjustment)
+        if (code[2] == 0x0f and code[3] == 0x0b and
+            code[4] == 0x48 and code[5] == 0x8d and code[6] == 0x35)
+        {
+            // Verify epilogue signature: mov rax, rbx; add rsp, 0x428; pop rbx; pop r12; pop r13; pop r14; pop r15; pop rbp; ret
+            const epilogue_offset: usize = 0x942;
+            const epilogue_ptr = context.Rip - epilogue_offset;
+            if (isGuestAddress(epilogue_ptr)) {
+                const epilogue_code: [*]const u8 = @ptrFromInt(epilogue_ptr);
+                if (epilogue_code[0] == 0x48 and epilogue_code[1] == 0x89 and epilogue_code[2] == 0xd8) {
+                    context.Rax = 0; // return success/SCE_OK
+                    context.Rip = epilogue_ptr;
+                    std.debug.print("[cpu] recovered guest texture init DEBUG STOP @rip=0x{x} -> 0x{x}\n", .{ context.Rip + epilogue_offset, context.Rip });
+                    return true;
+                }
+            }
+        }
+
+        // Pattern 2: PS2HD sce-pngEncoder.cpp DEBUG STOP:
+        // Context: ... 0f 0b 0f 0b e8 d8 6a 7c 00 [0f 0b] 4c 89 f7
+        // Clean epilogue is at -0x7e bytes (offset 0x98 stack adjustment)
+        if (code[2] == 0x4c and code[3] == 0x89 and code[4] == 0xf7) {
+            const epilogue_offset: usize = 0x7e;
+            const epilogue_ptr = context.Rip - epilogue_offset;
+            if (isGuestAddress(epilogue_ptr)) {
+                const epilogue_code: [*]const u8 = @ptrFromInt(epilogue_ptr);
+                if (epilogue_code[0] == 0x48 and epilogue_code[1] == 0x81 and epilogue_code[2] == 0xc4) {
+                    context.Rax = 0;
+                    context.Rip = epilogue_ptr;
+                    std.debug.print("[cpu] recovered guest png encoder DEBUG STOP @rip=0x{x} -> 0x{x}\n", .{ context.Rip + epilogue_offset, context.Rip });
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     fn contextXmm(
