@@ -13584,19 +13584,18 @@ pub const Renderer = struct {
             const height = viewport.y_scale * 2.0;
             const min_depth = viewport.z_offset;
             const max_depth = viewport.z_offset + viewport.z_scale;
-            if (!std.math.isFinite(x) or !std.math.isFinite(y) or
-                !std.math.isFinite(width) or !std.math.isFinite(height) or
-                !std.math.isFinite(min_depth) or !std.math.isFinite(max_depth) or
-                width == 0 or height == 0)
+            if (std.math.isFinite(x) and std.math.isFinite(y) and
+                std.math.isFinite(width) and std.math.isFinite(height) and
+                std.math.isFinite(min_depth) and std.math.isFinite(max_depth) and
+                width > 0 and height > 0)
             {
-                return Error.UnsupportedGraphicsState;
+                result.viewport_x_bits = @bitCast(x);
+                result.viewport_y_bits = @bitCast(y);
+                result.viewport_width_bits = @bitCast(width);
+                result.viewport_height_bits = @bitCast(height);
+                result.viewport_min_depth_bits = @bitCast(std.math.clamp(min_depth, 0, 1));
+                result.viewport_max_depth_bits = @bitCast(std.math.clamp(max_depth, 0, 1));
             }
-            result.viewport_x_bits = @bitCast(x);
-            result.viewport_y_bits = @bitCast(y);
-            result.viewport_width_bits = @bitCast(width);
-            result.viewport_height_bits = @bitCast(height);
-            result.viewport_min_depth_bits = @bitCast(std.math.clamp(min_depth, 0, 1));
-            result.viewport_max_depth_bits = @bitCast(std.math.clamp(max_depth, 0, 1));
         }
         if (render.scissor) |scissor| {
             const left: u32 = @min(scissor.left, target.width);

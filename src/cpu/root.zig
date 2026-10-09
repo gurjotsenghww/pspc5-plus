@@ -428,6 +428,12 @@ pub var corrupt_agc_interrupt_list_recoveries: std.atomic.Value(u64) = .init(0);
 /// How many stale nodes in the companion AGC cleanup list followed that
 /// routine's existing null-tail exit instead of terminating CleanupThread.
 pub var corrupt_agc_cleanup_list_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many invalid or non-canonical file streams in libc passed to stdio routines
+/// (e.g. fread/fwrite) branched cleanly to their error exit instead of terminating.
+pub var corrupt_libc_stream_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many unmapped or corrupt C++ smart pointer / custom deleter virtual calls
+/// were cleanly stepped past without aborting execution.
+pub var corrupt_deleter_recoveries: std.atomic.Value(u64) = .init(0);
 /// First native access violation declined by the guest exception bridge.
 ///
 /// Host faults normally disappear into Windows with only process exit code
@@ -1016,6 +1022,38 @@ const WindowsX64Machine = struct {
                 if (count <= 8 or count % 256 == 0) std.debug.print(
                     "[cpu] dropped corrupt AGC cleanup-list tail @rip=0x{x} node=0x{x} (#{d})\n",
                     .{ context.Rip - 0x64, corrupt_node, count },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // When a non-canonical or invalid stream pointer is passed to libc stdio,
+        // branch to the function's internal error return.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            if (tryRecoverCorruptLibcStream(context, record.ExceptionInformation[1])) {
+                _ = corrupt_libc_stream_recoveries.fetchAdd(1, .monotonic);
+                const count = corrupt_libc_stream_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) std.debug.print(
+                    "[cpu] recovered corrupt libc stream @rip=0x{x} stream=0x{x} (#{d})\n",
+                    .{ context.Rip - 0x119, context.R13, count },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // When a C++ smart pointer deleter virtual call faults on an unmapped or
+        // non-canonical object/vtable, step past the call directly to slot cleanup.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            if (tryRecoverCorruptDeleterCall(context, record.ExceptionInformation[1])) {
+                _ = corrupt_deleter_recoveries.fetchAdd(1, .monotonic);
+                const count = corrupt_deleter_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) std.debug.print(
+                    "[cpu] recovered corrupt deleter call @rip=0x{x} rdi=0x{x} (#{d})\n",
+                    .{ context.Rip - 6, context.Rdi, count },
                 );
                 return exception_continue_execution;
             }
@@ -2652,6 +2690,100 @@ const WindowsX64Machine = struct {
         }
         context.R13 = 0;
         context.Rip += 0x64;
+        return true;
+    }
+
+    /// When an invalid or non-canonical file stream pointer (FILE*) is passed
+    /// to libc routines such as fread / fwrite or fclose / fflush:
+    ///   1) fread/fwrite: cmp dword ptr [r13+4], 0 ; js +0x10e
+    ///      Branch directly to the routine's internal error/EINVAL path (+0x119 bytes).
+    ///   2) fclose/fflush: test byte ptr [rdi], 3 ; mov rbx, rdi ; jz +0x55
+    ///      Branch directly to the clean function epilogue (+0x84 bytes).
+    fn tryRecoverCorruptLibcStream(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+
+        // Pattern 1: fread/fwrite: cmp dword ptr [r13+4], 0 ; js +0x10e
+        const exact_field1 = memory_address == context.R13 +% 4;
+        const poisoned_field1 = (memory_address == std.math.maxInt(u64) or memory_address == 4) and
+            !isCanonicalX64Address(context.R13);
+        if (exact_field1 or poisoned_field1) {
+            const pattern1 = [_]u8{
+                0x41, 0x83, 0x7d, 0x04, 0x00, // cmp dword ptr [r13+4], 0
+                0x0f, 0x88, 0x0e, 0x01, 0x00, 0x00, // js +0x10e
+            };
+            var matches = true;
+            for (pattern1, 0..) |byte, index| {
+                if (code[index] != byte) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                const branch_disp: u64 = 5 + 6 + 0x10e; // +0x119 bytes
+                context.Rip += branch_disp;
+                return true;
+            }
+        }
+
+        // Pattern 2: fclose/fflush: test byte ptr [rdi], 3 ; mov rbx, rdi ; jz +0x55
+        const exact_field2 = memory_address == context.Rdi;
+        const poisoned_field2 = (memory_address == std.math.maxInt(u64) or memory_address == 0) and
+            !isCanonicalX64Address(context.Rdi);
+        if (exact_field2 or poisoned_field2) {
+            const pattern2 = [_]u8{
+                0xf6, 0x07, 0x03, // test byte ptr [rdi], 3
+                0x48, 0x89, 0xfb, // mov rbx, rdi
+                0x74, 0x55, // jz +0x55
+            };
+            var matches = true;
+            for (pattern2, 0..) |byte, index| {
+                if (code[index] != byte) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                // Branch directly to the function epilogue at +0x84 bytes (0x173d)
+                context.R14 = 0; // return 0 / EOF
+                context.Rip += 0x84;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// When a C++ smart pointer destructor / deleter virtual call sequence:
+    ///   48 8b 07 : mov rax, [rdi]
+    ///   ff 50 10 : call [rax + 0x10]
+    /// faults because the object or its vtable pointer is non-canonical or unmapped,
+    /// step past the call directly to the following slot-zeroing instruction:
+    ///   48 c7 45 80 00 00 00 00 : mov qword ptr [rbp - 0x80], 0
+    fn tryRecoverCorruptDeleterCall(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const exact_field = memory_address == context.Rdi;
+        const poisoned_field = (memory_address == std.math.maxInt(u64) or memory_address == 0) and
+            !isCanonicalX64Address(context.Rdi);
+        if (!exact_field and !poisoned_field) return false;
+
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        // Pattern: mov rax, [rdi] (48 8b 07); call [rax + 0x10] (ff 50 10); mov qword ptr [rbp - 0x80], 0 (48 c7 45 80 00 00 00 00)
+        const pattern = [_]u8{
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x50, 0x10, // call [rax + 0x10]
+            0x48, 0xc7, 0x45, 0x80, 0x00, 0x00, 0x00, 0x00, // mov qword ptr [rbp - 0x80], 0
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+
+        // Step past `mov rax, [rdi]` (3 bytes) and `call [rax + 0x10]` (3 bytes) = 6 bytes
+        context.Rip += 6;
         return true;
     }
 
