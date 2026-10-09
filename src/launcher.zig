@@ -141,6 +141,16 @@ const Phrase = enum {
     launch_windows_error,
     status_launched,
     status_game_removed,
+    password_title,
+    password_subtitle,
+    password_unlock,
+    password_cancel,
+    password_placeholder,
+    password_incorrect,
+    status_unlocked,
+    view_error,
+    open_log_file,
+    passcode_btn,
 };
 
 const Rect = struct {
@@ -263,9 +273,36 @@ var game_exit_code: ?u32 = null;
 var game_title: [128]u16 = @splat(0);
 var game_title_len: usize = 0;
 
+const logs_open_file_rect = Rect{ .left = 574, .top = 138, .right = 718, .bottom = 174 };
+const logs_error_rect = Rect{ .left = 730, .top = 138, .right = 858, .bottom = 174 };
 const logs_copy_rect = Rect{ .left = 870, .top = 138, .right = 970, .bottom = 174 };
 const logs_clear_rect = Rect{ .left = 980, .top = 138, .right = 1066, .bottom = 174 };
 const logs_console_rect = Rect{ .left = 282, .top = 188, .right = 1086, .bottom = 714 };
+
+const password_dialog_rect = Rect{ .left = 370, .top = 220, .right = 810, .bottom = 510 };
+const password_input_rect = Rect{ .left = 400, .top = 340, .right = 724, .bottom = 384 };
+const password_toggle_rect = Rect{ .left = 730, .top = 340, .right = 780, .bottom = 384 };
+const password_cancel_rect = Rect{ .left = 400, .top = 430, .right = 570, .bottom = 478 };
+const password_unlock_rect = Rect{ .left = 610, .top = 430, .right = 780, .bottom = 478 };
+
+const error_dialog_rect = Rect{ .left = 300, .top = 160, .right = 880, .bottom = 600 };
+const error_open_file_rect = Rect{ .left = 500, .top = 538, .right = 670, .bottom = 580 };
+const error_close_rect = Rect{ .left = 690, .top = 538, .right = 850, .bottom = 580 };
+
+var password_modal_open: bool = false;
+var password_buffer: [128]u8 = [_]u8{0} ** 128;
+var password_len: usize = 0;
+var password_error: bool = false;
+var password_pending_launch: bool = false;
+var password_show_plain: bool = false;
+
+var last_error_subsystem: [64]u8 = [_]u8{0} ** 64;
+var last_error_subsystem_len: usize = 0;
+var last_error_message: [512]u8 = [_]u8{0} ** 512;
+var last_error_message_len: usize = 0;
+var last_error_code: u32 = 0;
+var has_recorded_error: bool = false;
+var error_inspector_open: bool = false;
 
 var status_text: [256]u16 = [_]u16{0} ** 256;
 var status_length: usize = 0;
@@ -390,6 +427,16 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Windows error",
             .status_launched => "Game launched in a separate process",
             .status_game_removed => "Game removed from the library",
+            .password_title => "Game Passcode Required",
+            .password_subtitle => "This game requires a passcode or password to unlock and decrypt.",
+            .password_unlock => "Unlock",
+            .password_cancel => "Cancel",
+            .password_placeholder => "Enter passcode...",
+            .password_incorrect => "Incorrect passcode. Please try again.",
+            .status_unlocked => "Game unlocked successfully",
+            .view_error => "View Error",
+            .open_log_file => "Open Log File",
+            .passcode_btn => "Passcode",
         },
         .chinese_simplified => switch (phrase) {
             .nav_library => "游戏库",
@@ -499,6 +546,16 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Windows 错误",
             .status_launched => "游戏已在独立进程中启动",
             .status_game_removed => "游戏已从游戏库移除",
+            .password_title => "需要游戏密码",
+            .password_subtitle => "此游戏需要输入密码或密钥才能解密与运行。",
+            .password_unlock => "解锁",
+            .password_cancel => "取消",
+            .password_placeholder => "输入密码...",
+            .password_incorrect => "密码不正确，请重试。",
+            .status_unlocked => "游戏已成功解锁",
+            .view_error => "查看错误",
+            .open_log_file => "打开日志文件",
+            .passcode_btn => "密码",
         },
         .spanish => switch (phrase) {
             .nav_library => "Biblioteca",
@@ -608,6 +665,16 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Error de Windows",
             .status_launched => "Juego iniciado en un proceso independiente",
             .status_game_removed => "Juego eliminado de la biblioteca",
+            .password_title => "Contraseña del juego requerida",
+            .password_subtitle => "Este juego requiere una contraseña o código para desbloquearse.",
+            .password_unlock => "Desbloquear",
+            .password_cancel => "Cancelar",
+            .password_placeholder => "Introduce el código...",
+            .password_incorrect => "Código incorrecto. Inténtalo de nuevo.",
+            .status_unlocked => "Juego desbloqueado con éxito",
+            .view_error => "Ver error",
+            .open_log_file => "Abrir log",
+            .passcode_btn => "Contraseña",
         },
         .arabic => switch (phrase) {
             .nav_library => "المكتبة",
@@ -717,6 +784,16 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "خطأ Windows",
             .status_launched => "تم تشغيل اللعبة في عملية منفصلة",
             .status_game_removed => "تمت إزالة اللعبة من المكتبة",
+            .password_title => "مطلوب رمز مرور اللعبة",
+            .password_subtitle => "تتطلب هذه اللعبة رمز مرور لفك التشفير والتشغيل.",
+            .password_unlock => "فتح",
+            .password_cancel => "إلغاء",
+            .password_placeholder => "أدخل الرمز...",
+            .password_incorrect => "رمز المرور غير صحيح.",
+            .status_unlocked => "تم فتح اللعبة بنجاح",
+            .view_error => "عرض الخطأ",
+            .open_log_file => "فتح ملف السجل",
+            .passcode_btn => "رمز المرور",
         },
         .portuguese => switch (phrase) {
             .nav_library => "Biblioteca",
@@ -826,6 +903,16 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Erro do Windows",
             .status_launched => "Jogo iniciado em um processo separado",
             .status_game_removed => "Jogo removido da biblioteca",
+            .password_title => "Senha do jogo necessária",
+            .password_subtitle => "Este jogo requer uma senha ou código para desbloquear.",
+            .password_unlock => "Desbloquear",
+            .password_cancel => "Cancelar",
+            .password_placeholder => "Digite o código...",
+            .password_incorrect => "Código incorreto.",
+            .status_unlocked => "Jogo desbloqueado com sucesso",
+            .view_error => "Ver erro",
+            .open_log_file => "Abrir log",
+            .passcode_btn => "Senha",
         },
         .russian => switch (phrase) {
             .nav_library => "Библиотека",
@@ -935,6 +1022,16 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Ошибка Windows",
             .status_launched => "Игра запущена в отдельном процессе",
             .status_game_removed => "Игра удалена из библиотеки",
+            .password_title => "Требуется пароль игры",
+            .password_subtitle => "Для расшифровки и запуска этой игры необходим пароль.",
+            .password_unlock => "Разблокировать",
+            .password_cancel => "Отмена",
+            .password_placeholder => "Введите пароль...",
+            .password_incorrect => "Неверный код.",
+            .status_unlocked => "Игра успешно разблокирована",
+            .view_error => "Показать ошибку",
+            .open_log_file => "Открыть лог",
+            .passcode_btn => "Пароль",
         },
         .german => switch (phrase) {
             .nav_library => "Bibliothek",
@@ -1044,6 +1141,16 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Windows-Fehler",
             .status_launched => "Spiel in einem separaten Prozess gestartet",
             .status_game_removed => "Spiel aus der Bibliothek entfernt",
+            .password_title => "Spiel-Passwort erforderlich",
+            .password_subtitle => "Dieses Spiel erfordert ein Passwort oder einen Passcode.",
+            .password_unlock => "Entsperren",
+            .password_cancel => "Abbrechen",
+            .password_placeholder => "Code eingeben...",
+            .password_incorrect => "Falscher Code.",
+            .status_unlocked => "Spiel erfolgreich entsperrt",
+            .view_error => "Fehler anzeigen",
+            .open_log_file => "Logdatei öffnen",
+            .passcode_btn => "Passwort",
         },
         .french => switch (phrase) {
             .nav_library => "Bibliothèque",
@@ -1153,6 +1260,16 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Erreur Windows",
             .status_launched => "Jeu lancé dans un processus séparé",
             .status_game_removed => "Jeu retiré de la bibliothèque",
+            .password_title => "Mot de passe du jeu requis",
+            .password_subtitle => "Ce jeu nécessite un code ou mot de passe pour être lancé.",
+            .password_unlock => "Déverrouiller",
+            .password_cancel => "Annuler",
+            .password_placeholder => "Entrez le code...",
+            .password_incorrect => "Code incorrect.",
+            .status_unlocked => "Jeu déverrouillé avec succès",
+            .view_error => "Voir l'erreur",
+            .open_log_file => "Ouvrir le log",
+            .passcode_btn => "Mot de passe",
         },
     };
 }
@@ -1355,7 +1472,48 @@ fn windowProcedure(
             handleClick(window, x, y);
             return 0;
         },
+        Win32.wm_char => {
+            if (password_modal_open) {
+                const ch = word_parameter;
+                if (ch >= 32 and ch < 127 and password_len < password_buffer.len - 1) {
+                    password_buffer[password_len] = @truncate(ch);
+                    password_len += 1;
+                    password_buffer[password_len] = 0;
+                    password_error = false;
+                    _ = Win32.InvalidateRect(window, null, 0);
+                    return 0;
+                }
+            }
+        },
         Win32.wm_key_down => {
+            if (password_modal_open) {
+                if (word_parameter == 0x1b) {
+                    password_modal_open = false;
+                    password_pending_launch = false;
+                    password_error = false;
+                    _ = Win32.InvalidateRect(window, null, 0);
+                    return 0;
+                } else if (word_parameter == 0x0d) {
+                    submitPasswordUnlock(window);
+                    return 0;
+                } else if (word_parameter == 0x08) {
+                    if (password_len > 0) {
+                        password_len -= 1;
+                        password_buffer[password_len] = 0;
+                        password_error = false;
+                        _ = Win32.InvalidateRect(window, null, 0);
+                    }
+                    return 0;
+                }
+                return 0;
+            }
+            if (error_inspector_open) {
+                if (word_parameter == 0x1b or word_parameter == 0x0d) {
+                    error_inspector_open = false;
+                    _ = Win32.InvalidateRect(window, null, 0);
+                    return 0;
+                }
+            }
             if (capture_mapping) |index| {
                 if (word_parameter == 0x1b) {
                     capture_mapping = null;
@@ -1414,8 +1572,9 @@ const nav_rects = [_]Rect{
 };
 
 const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 500, .bottom = 700 };
-const library_extract_rect = Rect{ .left = 516, .top = 646, .right = 760, .bottom = 700 };
-const library_launch_rect = Rect{ .left = 776, .top = 646, .right = 1086, .bottom = 700 };
+const library_extract_rect = Rect{ .left = 516, .top = 646, .right = 720, .bottom = 700 };
+const library_passcode_rect = Rect{ .left = 736, .top = 646, .right = 876, .bottom = 700 };
+const library_launch_rect = Rect{ .left = 892, .top = 646, .right = 1086, .bottom = 700 };
 
 // The arrows sit in the margins either side of the grid rather than inside
 // it, so a second page costs the artwork none of its width.
@@ -1597,6 +1756,16 @@ fn indexOfRect(rects: []const Rect, x: i32, y: i32) ?usize {
 
 /// Whether the pointer is over something that responds to a click.
 fn clickableAt(x: i32, y: i32) bool {
+    if (password_modal_open) {
+        return password_unlock_rect.contains(x, y) or
+            password_cancel_rect.contains(x, y) or
+            password_toggle_rect.contains(x, y) or
+            password_input_rect.contains(x, y);
+    }
+    if (error_inspector_open) {
+        return error_close_rect.contains(x, y) or
+            error_open_file_rect.contains(x, y);
+    }
     if (indexOfRect(&nav_rects, x, y) != null) return true;
     return switch (current_page) {
         .library => recentGameAt(x, y) != null or
@@ -1606,6 +1775,7 @@ fn clickableAt(x: i32, y: i32) bool {
             (extract_state != .running and library_extract_rect.contains(x, y)) or
             (extractFinished() and extract_panel_rect.contains(x, y)) or
             (extract_state != .idle and extract_copy_rect.contains(x, y)) or
+            library_passcode_rect.contains(x, y) or
             library_launch_rect.contains(x, y),
         .input => blk: {
             if (pad_presence.connected and pad_test_rect.contains(x, y)) break :blk true;
@@ -1623,11 +1793,34 @@ fn clickableAt(x: i32, y: i32) bool {
             indexOfRect(&resolution_rects, x, y) != null or
             indexOfRect(&preset_rects, x, y) != null or
             indexOfRect(&settings_toggle_rects, x, y) != null,
-        .logs => logs_copy_rect.contains(x, y) or logs_clear_rect.contains(x, y),
+        .logs => logs_copy_rect.contains(x, y) or logs_clear_rect.contains(x, y) or
+            logs_error_rect.contains(x, y) or logs_open_file_rect.contains(x, y),
     };
 }
 
 fn handleClick(window: Win32.Window, x: i32, y: i32) void {
+    if (password_modal_open) {
+        if (password_cancel_rect.contains(x, y)) {
+            password_modal_open = false;
+            password_pending_launch = false;
+            password_error = false;
+        } else if (password_unlock_rect.contains(x, y)) {
+            submitPasswordUnlock(window);
+        } else if (password_toggle_rect.contains(x, y)) {
+            password_show_plain = !password_show_plain;
+        }
+        _ = Win32.InvalidateRect(window, null, 0);
+        return;
+    }
+    if (error_inspector_open) {
+        if (error_close_rect.contains(x, y)) {
+            error_inspector_open = false;
+        } else if (error_open_file_rect.contains(x, y)) {
+            openLastErrorLog(window);
+        }
+        _ = Win32.InvalidateRect(window, null, 0);
+        return;
+    }
     if (indexOfRect(&nav_rects, x, y)) |index| {
         switch (index) {
             0 => current_page = .library,
@@ -1680,6 +1873,14 @@ fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
     }
     if (library_browse_rect.contains(x, y)) chooseGameFolder(window);
     if (library_extract_rect.contains(x, y) and extract_state != .running) extractPackage(window);
+    if (library_passcode_rect.contains(x, y)) {
+        if (game_folder_length == 0) {
+            setStatusPhrase(.status_choose_folder, true);
+        } else {
+            openPasswordModal(false);
+        }
+        return;
+    }
     if (library_launch_rect.contains(x, y)) launchGame(window);
 }
 
@@ -1774,6 +1975,11 @@ fn paint(window: Win32.Window) void {
         .logs => drawLogs(dc),
     }
     drawFooter(dc);
+    if (password_modal_open) {
+        drawPasswordModal(dc);
+    } else if (error_inspector_open) {
+        drawErrorInspector(dc);
+    }
 }
 
 fn drawBrand(dc: Win32.DeviceContext) void {
@@ -1879,6 +2085,7 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
 
     button(dc, library_browse_rect, .choose_folder, false);
     button(dc, library_extract_rect, .extract_pkg, extract_state == .running);
+    button(dc, library_passcode_rect, .passcode_btn, game_folder_length == 0);
     drawLegalNotice(dc);
     button(dc, library_launch_rect, .launch_game, game_folder_length == 0);
 }
@@ -2449,6 +2656,236 @@ fn loadRecentGame(folder: []const u16) ?RecentGame {
     return game;
 }
 
+fn currentTitlePasscodeKey(output: *[128]u16) usize {
+    if (title_identifier_length != 0) {
+        const len = @min(title_identifier_length, output.len - 1);
+        @memcpy(output[0..len], title_identifier[0..len]);
+        output[len] = 0;
+        return len;
+    }
+    return fallbackFolderTitle(game_folder[0..game_folder_length], output);
+}
+
+fn getSavedPasscode(key: []const u16, output: *[128]u16) usize {
+    if (ini_path_length == 0 or key.len == 0) return 0;
+    var title_key: [128]u16 = @splat(0);
+    const key_len = @min(key.len, title_key.len - 1);
+    @memcpy(title_key[0..key_len], key[0..key_len]);
+    title_key[key_len] = 0;
+    return Win32.GetPrivateProfileStringW(w("passcodes"), @ptrCast(&title_key), w(""), output, output.len, @ptrCast(&ini_path));
+}
+
+fn saveTitlePasscode(key: []const u16, code: []const u8) void {
+    if (ini_path_length == 0 or key.len == 0) return;
+    var title_key: [128]u16 = @splat(0);
+    const key_len = @min(key.len, title_key.len - 1);
+    @memcpy(title_key[0..key_len], key[0..key_len]);
+    title_key[key_len] = 0;
+
+    var val_w: [128]u16 = @splat(0);
+    const val_len = std.unicode.utf8ToUtf16Le(&val_w, code) catch return;
+    val_w[val_len] = 0;
+    _ = Win32.WritePrivateProfileStringW(w("passcodes"), @ptrCast(&title_key), @ptrCast(&val_w), @ptrCast(&ini_path));
+}
+
+fn checkFolderPasscodeRequirement(folder: []const u16) bool {
+    const lock_files = [_][]const u8{
+        "\\passcode.dat",
+        "\\passcode.txt",
+        "\\locked.txt",
+        "\\sce_sys\\passcode.dat",
+        "\\sce_sys\\keystone",
+    };
+    var path: [1024]u16 = @splat(0);
+    inline for (lock_files) |suffix| {
+        if (childPath(&path, folder, suffix) != 0) {
+            if (Win32.GetFileAttributesW(@ptrCast(&path)) != Win32.invalid_file_attributes) {
+                return true;
+            }
+        }
+    }
+    if (childPath(&path, folder, "\\sce_sys\\param.json") != 0) {
+        var document: [8192]u8 = undefined;
+        if (readSmallFile(@ptrCast(&path), &document)) |bytes| {
+            if (std.mem.indexOf(u8, bytes, "\"passcode\"") != null or
+                std.mem.indexOf(u8, bytes, "\"requiresPasscode\"") != null or
+                std.mem.indexOf(u8, bytes, "\"passcodeRequired\"") != null)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn openPasswordModal(pending_launch: bool) void {
+    password_modal_open = true;
+    password_pending_launch = pending_launch;
+    password_error = false;
+    var key_buf: [128]u16 = @splat(0);
+    const key_len = currentTitlePasscodeKey(&key_buf);
+    var saved_code_w: [128]u16 = @splat(0);
+    const saved_len = if (key_len > 0) getSavedPasscode(key_buf[0..key_len], &saved_code_w) else 0;
+    if (saved_len > 0) {
+        password_len = std.unicode.utf16LeToUtf8(&password_buffer, saved_code_w[0..saved_len]) catch 0;
+        password_buffer[password_len] = 0;
+    } else {
+        password_len = 0;
+        password_buffer[0] = 0;
+    }
+}
+
+fn submitPasswordUnlock(window: Win32.Window) void {
+    if (password_len == 0) {
+        password_error = true;
+        _ = Win32.InvalidateRect(window, null, 0);
+        return;
+    }
+    var key_buf: [128]u16 = @splat(0);
+    const key_len = currentTitlePasscodeKey(&key_buf);
+    if (key_len > 0) {
+        saveTitlePasscode(key_buf[0..key_len], password_buffer[0..password_len]);
+    }
+    var pass_w: [128]u16 = @splat(0);
+    const pass_w_len = std.unicode.utf8ToUtf16Le(&pass_w, password_buffer[0..password_len]) catch 0;
+    pass_w[pass_w_len] = 0;
+    _ = Win32.SetEnvironmentVariableW(w("PS5_GAME_PASSCODE"), @ptrCast(&pass_w));
+
+    password_modal_open = false;
+    password_error = false;
+    setStatusPhrase(.status_unlocked, false);
+
+    if (password_pending_launch) {
+        password_pending_launch = false;
+        launchGame(window);
+    } else {
+        _ = Win32.InvalidateRect(window, null, 0);
+    }
+}
+
+fn recordDiagnosticError(subsystem: []const u8, message: []const u8, code: u32) void {
+    last_error_subsystem_len = @min(subsystem.len, last_error_subsystem.len);
+    @memcpy(last_error_subsystem[0..last_error_subsystem_len], subsystem[0..last_error_subsystem_len]);
+
+    last_error_message_len = @min(message.len, last_error_message.len);
+    @memcpy(last_error_message[0..last_error_message_len], message[0..last_error_message_len]);
+
+    last_error_code = code;
+    has_recorded_error = true;
+
+    var logs_dir: [1024]u16 = @splat(0);
+    const home_len = emulatorHomeDirectory(&logs_dir);
+    if (home_len == 0) return;
+    const logs_suffix = w("logs");
+    const logs_suffix_len = wideLength(logs_suffix);
+    if (home_len + logs_suffix_len + 2 >= logs_dir.len) return;
+    logs_dir[home_len] = '\\';
+    @memcpy(logs_dir[home_len + 1 ..][0..logs_suffix_len], logs_suffix[0..logs_suffix_len]);
+    logs_dir[home_len + 1 + logs_suffix_len] = 0;
+    _ = Win32.CreateDirectoryW(@ptrCast(&logs_dir), null);
+
+    var error_log_path: [1024]u16 = @splat(0);
+    @memcpy(error_log_path[0 .. home_len + 1 + logs_suffix_len], logs_dir[0 .. home_len + 1 + logs_suffix_len]);
+    var log_path_len = home_len + 1 + logs_suffix_len;
+    const file_suffix = w("\\last_error.log");
+    const file_suffix_len = wideLength(file_suffix);
+    @memcpy(error_log_path[log_path_len..][0..file_suffix_len], file_suffix[0..file_suffix_len]);
+    log_path_len += file_suffix_len;
+    error_log_path[log_path_len] = 0;
+
+    const handle = Win32.CreateFileW(
+        @ptrCast(&error_log_path),
+        Win32.generic_write,
+        Win32.file_share_read,
+        null,
+        Win32.create_always,
+        0,
+        null,
+    );
+    if (@intFromPtr(handle) != Win32.invalid_handle) {
+        defer _ = Win32.CloseHandle(handle);
+
+        var report_buf: [8192]u8 = undefined;
+        var stream = std.Io.Writer.fixed(&report_buf);
+        stream.print(
+            "================================================================================\r\n" ++
+            "PSPC5 Plus Diagnostic Error Report\r\n" ++
+            "Release Version: {s}\r\n" ++
+            "Subsystem:       {s}\r\n" ++
+            "Error Code:      {d} (0x{X})\r\n" ++
+            "Message:         {s}\r\n" ++
+            "================================================================================\r\n\r\n" ++
+            "Game Details:\r\n" ++
+            "- Title:  ",
+            .{ build_options.release_version, subsystem, code, code, message }
+        ) catch {};
+
+        var title_utf8: [256]u8 = undefined;
+        if (game_title_len > 0) {
+            const tlen = std.unicode.utf16LeToUtf8(&title_utf8, game_title[0..game_title_len]) catch 0;
+            stream.print("{s}", .{title_utf8[0..tlen]}) catch {};
+        } else {
+            stream.print("(none)", .{}) catch {};
+        }
+
+        stream.print("\r\n- Path:   ", .{}) catch {};
+        var folder_utf8: [512]u8 = undefined;
+        if (game_folder_length > 0) {
+            const flen = std.unicode.utf16LeToUtf8(&folder_utf8, game_folder[0..game_folder_length]) catch 0;
+            stream.print("{s}", .{folder_utf8[0..flen]}) catch {};
+        } else {
+            stream.print("(none)", .{}) catch {};
+        }
+
+        stream.print(
+            "\r\n\r\nRecent Engine Output:\r\n" ++
+            "--------------------------------------------------------------------------------\r\n",
+            .{}
+        ) catch {};
+
+        lockGameFeed();
+        const feed_count = game_feed.log_count;
+        const visible = @min(feed_count, 16);
+        const start_idx = (game_feed.log_next + game_log_capacity - visible) % game_log_capacity;
+        for (0..visible) |i| {
+            const slot = (start_idx + i) % game_log_capacity;
+            const len = game_feed.log_lengths[slot];
+            if (len > 0) {
+                stream.print("{s}\r\n", .{game_feed.log[slot][0..len]}) catch {};
+            }
+        }
+        game_lock.unlock();
+
+        stream.print(
+            "--------------------------------------------------------------------------------\r\n\r\n" ++
+            "Diagnostic / Next Steps:\r\n" ++
+            "1. Inform the assistant: say \"check and read logs\" in chat to auto-diagnose.\r\n" ++
+            "2. If game requires a passcode, enter it via the Passcode button.\r\n" ++
+            "3. If Vulkan failed, verify GPU Vulkan 1.2+ support and updated GPU drivers.\r\n" ++
+            "4. If Smart App Control blocked execution, add exclusion or check app permissions.\r\n" ++
+            "================================================================================\r\n",
+            .{}
+        ) catch {};
+
+        const output_bytes = stream.buffered();
+        var written: u32 = 0;
+        _ = Win32.WriteFile(handle, output_bytes.ptr, @intCast(output_bytes.len), &written, null);
+    }
+}
+
+fn openLastErrorLog(window: Win32.Window) void {
+    var logs_path: [1024]u16 = @splat(0);
+    const home_len = emulatorHomeDirectory(&logs_path);
+    if (home_len == 0) return;
+    const file_suffix = w("logs\\last_error.log");
+    const file_suffix_len = wideLength(file_suffix);
+    if (home_len + file_suffix_len + 1 >= logs_path.len) return;
+    @memcpy(logs_path[home_len..][0..file_suffix_len], file_suffix[0..file_suffix_len]);
+    logs_path[home_len + file_suffix_len] = 0;
+
+    _ = Win32.ShellExecuteW(window, w("open"), @ptrCast(&logs_path), null, null, Win32.show_normal);
+}
+
 fn recentKey(index: usize, output: *[32]u16) void {
     var utf8: [32]u8 = undefined;
     var stream = std.Io.Writer.fixed(&utf8);
@@ -2626,6 +3063,15 @@ fn handleSavesClick(window: Win32.Window, x: i32, y: i32) void {
 }
 
 fn handleLogsClick(window: Win32.Window, x: i32, y: i32) void {
+    if (logs_open_file_rect.contains(x, y)) {
+        openLastErrorLog(window);
+        return;
+    }
+    if (logs_error_rect.contains(x, y)) {
+        error_inspector_open = !error_inspector_open;
+        _ = Win32.InvalidateRect(window, null, 0);
+        return;
+    }
     if (logs_copy_rect.contains(x, y)) {
         copyGameLog(window);
         return;
@@ -2705,6 +3151,8 @@ fn drawSettings(dc: Win32.DeviceContext) void {
 fn drawLogs(dc: Win32.DeviceContext) void {
     pageHeading(dc, .logs_heading, .logs_subtitle);
 
+    button(dc, logs_open_file_rect, .open_log_file, false);
+    button(dc, logs_error_rect, .view_error, false);
     button(dc, logs_copy_rect, .copy_log, false);
     button(dc, logs_clear_rect, .clear_log, false);
 
@@ -2713,7 +3161,7 @@ fn drawLogs(dc: Win32.DeviceContext) void {
         roundFill(dc, .{ .left = 296, .top = 152, .right = 304, .bottom = 160 }, 4, 0x0068d391);
         text(dc, w("RUNNING"), -1, .{ .left = 312, .top = 146, .right = 422, .bottom = 168 }, 0x0068d391, small_font, Win32.dt_left);
         if (game_title_len > 0) {
-            text(dc, &game_title, @intCast(game_title_len), .{ .left = 444, .top = 146, .right = 850, .bottom = 168 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+            text(dc, &game_title, @intCast(game_title_len), .{ .left = 444, .top = 146, .right = 560, .bottom = 168 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
         }
     } else if (game_exit_code) |code| {
         roundFill(dc, .{ .left = 282, .top = 138, .right = 430, .bottom = 174 }, 10, 0x002c2520);
@@ -2722,7 +3170,7 @@ fn drawLogs(dc: Win32.DeviceContext) void {
         const code_str = std.fmt.bufPrint(&code_buf, "EXITED ({d})", .{code}) catch "EXITED";
         drawAscii(dc, code_str, .{ .left = 312, .top = 146, .right = 422, .bottom = 168 }, if (code == 0) 0x0068d391 else 0x006b77ff, small_font, Win32.dt_left);
         if (game_title_len > 0) {
-            text(dc, &game_title, @intCast(game_title_len), .{ .left = 444, .top = 146, .right = 850, .bottom = 168 }, 0x009b9088, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+            text(dc, &game_title, @intCast(game_title_len), .{ .left = 444, .top = 146, .right = 560, .bottom = 168 }, 0x009b9088, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
         }
     } else {
         roundFill(dc, .{ .left = 282, .top = 138, .right = 380, .bottom = 174 }, 10, 0x00251f1b);
@@ -2762,6 +3210,77 @@ fn drawLogs(dc: Win32.DeviceContext) void {
         }
         textUtf8(dc, line_str, .{ .left = 302, .top = y, .right = 1066, .bottom = y + 21 }, text_color, console_font, Win32.dt_left | Win32.dt_end_ellipsis);
     }
+}
+
+fn drawPasswordModal(dc: Win32.DeviceContext) void {
+    fill(dc, .{ .left = 0, .top = 0, .right = window_width, .bottom = window_height }, 0x000c0a08);
+    card(dc, password_dialog_rect);
+    roundFill(dc, password_dialog_rect, 14, 0x002c231e);
+
+    localizedText(dc, .password_title, .{ .left = 400, .top = 242, .right = 780, .bottom = 270 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .password_subtitle, .{ .left = 400, .top = 276, .right = 780, .bottom = 326 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_word_break);
+
+    roundFill(dc, password_input_rect, 8, 0x001a1512);
+    if (password_len == 0) {
+        localizedText(dc, .password_placeholder, .{ .left = password_input_rect.left + 12, .top = password_input_rect.top + 12, .right = password_input_rect.right - 12, .bottom = password_input_rect.bottom - 8 }, 0x006d625b, small_font, Win32.dt_left);
+    } else {
+        if (password_show_plain) {
+            textUtf8(dc, password_buffer[0..password_len], .{ .left = password_input_rect.left + 12, .top = password_input_rect.top + 12, .right = password_input_rect.right - 12, .bottom = password_input_rect.bottom - 8 }, 0x00f4f0ea, regular_font, Win32.dt_left);
+        } else {
+            var mask: [128]u8 = @splat('*');
+            const mask_len = @min(password_len, mask.len);
+            textUtf8(dc, mask[0..mask_len], .{ .left = password_input_rect.left + 12, .top = password_input_rect.top + 12, .right = password_input_rect.right - 12, .bottom = password_input_rect.bottom - 8 }, 0x00ffac64, regular_font, Win32.dt_left);
+        }
+    }
+
+    roundFill(dc, password_toggle_rect, 8, if (password_show_plain) 0x0042362e else 0x00251f1b);
+    text(dc, if (password_show_plain) w("HIDE") else w("SHOW"), -1, .{ .left = password_toggle_rect.left, .top = password_toggle_rect.top + 12, .right = password_toggle_rect.right, .bottom = password_toggle_rect.bottom }, 0x00a89e96, small_font, Win32.dt_center);
+
+    if (password_error) {
+        localizedText(dc, .password_incorrect, .{ .left = 400, .top = 394, .right = 780, .bottom = 416 }, 0x006b77ff, small_font, Win32.dt_left);
+    }
+
+    roundFill(dc, password_cancel_rect, 10, 0x00352c27);
+    localizedText(dc, .password_cancel, .{ .left = password_cancel_rect.left, .top = password_cancel_rect.top + 14, .right = password_cancel_rect.right, .bottom = password_cancel_rect.bottom }, 0x00d8d0c9, medium_font, Win32.dt_center);
+
+    roundFill(dc, password_unlock_rect, 10, 0x00ff9c3d);
+    localizedText(dc, .password_unlock, .{ .left = password_unlock_rect.left, .top = password_unlock_rect.top + 14, .right = password_unlock_rect.right, .bottom = password_unlock_rect.bottom }, 0x00181510, medium_font, Win32.dt_center);
+}
+
+fn drawErrorInspector(dc: Win32.DeviceContext) void {
+    fill(dc, .{ .left = 0, .top = 0, .right = window_width, .bottom = window_height }, 0x000c0a08);
+    card(dc, error_dialog_rect);
+    roundFill(dc, error_dialog_rect, 14, 0x002c231e);
+
+    roundFill(dc, .{ .left = 330, .top = 184, .right = 430, .bottom = 212 }, 6, 0x00282048);
+    text(dc, w("ERROR"), -1, .{ .left = 330, .top = 188, .right = 430, .bottom = 210 }, 0x006b77ff, small_font, Win32.dt_center);
+
+    if (last_error_subsystem_len > 0) {
+        textUtf8(dc, last_error_subsystem[0..last_error_subsystem_len], .{ .left = 444, .top = 188, .right = 850, .bottom = 210 }, 0x00ffac64, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    } else {
+        text(dc, w("DIAGNOSTIC REPORT"), -1, .{ .left = 444, .top = 188, .right = 850, .bottom = 210 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    }
+
+    var code_buf: [64]u8 = undefined;
+    const code_str = std.fmt.bufPrint(&code_buf, "Exit Code / Status: {d} (0x{X})", .{ last_error_code, last_error_code }) catch "";
+    textUtf8(dc, code_str, .{ .left = 330, .top = 224, .right = 850, .bottom = 246 }, 0x009b9088, small_font, Win32.dt_left);
+
+    const msg_rect = Rect{ .left = 330, .top = 256, .right = 850, .bottom = 516 };
+    roundFill(dc, msg_rect, 8, 0x00130f0c);
+
+    if (last_error_message_len > 0) {
+        textUtf8(dc, last_error_message[0..last_error_message_len], .{ .left = msg_rect.left + 16, .top = msg_rect.top + 16, .right = msg_rect.right - 16, .bottom = msg_rect.top + 100 }, 0x00f4f0ea, regular_font, Win32.dt_left | Win32.dt_word_break);
+    } else {
+        text(dc, w("No active errors recorded in this session."), -1, .{ .left = msg_rect.left + 16, .top = msg_rect.top + 16, .right = msg_rect.right - 16, .bottom = msg_rect.top + 40 }, 0x007c716a, regular_font, Win32.dt_left);
+    }
+
+    text(dc, w("Say \"check and read logs\" to let the AI assistant inspect and fix issues."), -1, .{ .left = msg_rect.left + 16, .top = msg_rect.bottom - 46, .right = msg_rect.right - 16, .bottom = msg_rect.bottom - 12 }, 0x005cd69a, small_font, Win32.dt_left);
+
+    roundFill(dc, error_open_file_rect, 8, 0x00352c27);
+    localizedText(dc, .open_log_file, .{ .left = error_open_file_rect.left, .top = error_open_file_rect.top + 12, .right = error_open_file_rect.right, .bottom = error_open_file_rect.bottom }, 0x00ffac64, small_font, Win32.dt_center);
+
+    roundFill(dc, error_close_rect, 8, 0x00ff9c3d);
+    text(dc, w("Close"), -1, .{ .left = error_close_rect.left, .top = error_close_rect.top + 12, .right = error_close_rect.right, .bottom = error_close_rect.bottom }, 0x00181510, medium_font, Win32.dt_center);
 }
 
 fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void {
@@ -3223,6 +3742,15 @@ fn acceptGameLine(raw: []const u8) void {
     game_feed.log_count = @min(game_feed.log_count + 1, game_log_capacity);
     game_lock.unlock();
 
+    if (is_error) {
+        if (std.mem.indexOf(u8, value, "fatal") != null or
+            std.mem.indexOf(u8, value, "panic") != null or
+            std.mem.indexOf(u8, value, "EXCEPTION_") != null)
+        {
+            recordDiagnosticError("Engine Runtime", value, 1);
+        }
+    }
+
     game_dirty.store(true, .release);
 }
 
@@ -3273,6 +3801,11 @@ fn finishGame(window: Win32.Window, exit_code: u32) void {
     var exit_msg: [64]u8 = undefined;
     const msg = std.fmt.bufPrint(&exit_msg, "[process exited with code {d}]", .{exit_code}) catch "";
     acceptGameLine(msg);
+    if (exit_code != 0) {
+        var fail_buf: [128]u8 = undefined;
+        const fail_str = std.fmt.bufPrint(&fail_buf, "Game runner process terminated with non-zero exit code {d}.", .{exit_code}) catch "Game runner process terminated with error.";
+        recordDiagnosticError("Game Runner", fail_str, exit_code);
+    }
     _ = Win32.InvalidateRect(window, null, 0);
 }
 
@@ -3292,6 +3825,20 @@ fn launchGame(owner: Win32.Window) void {
     if (runner_len == 0 or Win32.GetFileAttributesW(@ptrCast(&runner)) == Win32.invalid_file_attributes) {
         setStatusPhrase(.status_runner_missing, true);
         return;
+    }
+
+    var key_buf: [128]u16 = @splat(0);
+    const key_len = currentTitlePasscodeKey(&key_buf);
+    var saved_code_w: [128]u16 = @splat(0);
+    const saved_len = if (key_len > 0) getSavedPasscode(key_buf[0..key_len], &saved_code_w) else 0;
+    if (saved_len > 0) {
+        _ = Win32.SetEnvironmentVariableW(w("PS5_GAME_PASSCODE"), @ptrCast(&saved_code_w));
+    } else if (checkFolderPasscodeRequirement(game_folder[0..game_folder_length])) {
+        openPasswordModal(true);
+        _ = Win32.InvalidateRect(owner, null, 0);
+        return;
+    } else {
+        _ = Win32.SetEnvironmentVariableW(w("PS5_GAME_PASSCODE"), null);
     }
 
     _ = Win32.SetEnvironmentVariableW(w("PS5_AUDIO_DISABLED"), if (sound_enabled) null else w("1"));
@@ -3423,6 +3970,7 @@ fn launchFailureHint(code: u32) Phrase {
 /// likely to try the runner from a command prompt. Windows supplies its own
 /// explanation in the user's language; the hint says what to do about it.
 fn reportLaunchFailure(owner: Win32.Window, code: u32) void {
+    recordDiagnosticError("Process Launch", tr(launchFailureHint(code)), code);
     var status: [160]u8 = undefined;
     const summary = std.fmt.bufPrint(&status, "{s} · {s} {d}", .{ tr(.status_launch_failed), tr(.launch_windows_error), code }) catch tr(.status_launch_failed);
     setStatus(summary, true);
@@ -3960,6 +4508,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const hand_cursor: [*:0]align(1) const u16 = @ptrFromInt(32649);
     const app_icon_resource: [*:0]align(1) const u16 = @ptrFromInt(1);
     const wm_key_down: u32 = 0x0100;
+    const wm_char: u32 = 0x0102;
     const wm_left_button_up: u32 = 0x0202;
     const tme_leave: u32 = 0x0000_0002;
     const transparent: i32 = 1;
@@ -3989,8 +4538,11 @@ const Win32 = if (builtin.os.tag == .windows) struct {
 
     const file_attribute_directory: u32 = 0x10;
     const generic_read: u32 = 0x8000_0000;
+    const generic_write: u32 = 0x4000_0000;
     const file_share_read: u32 = 0x0000_0001;
+    const create_always: u32 = 2;
     const open_existing: u32 = 3;
+    const open_always: u32 = 4;
     const invalid_handle: usize = std.math.maxInt(usize);
     const error_class_already_exists: u32 = 1410;
     const bif_return_only_fs_dirs: u32 = 0x0001;
@@ -4072,6 +4624,8 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn FindClose(*anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn CreateFileW([*:0]const u16, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) callconv(.winapi) Handle;
     extern "kernel32" fn ReadFile(Handle, [*]u8, u32, ?*u32, ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn WriteFile(Handle, [*]const u8, u32, ?*u32, ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn CreateDirectoryW([*:0]const u16, ?*anyopaque) callconv(.winapi) i32;
     extern "user32" fn GetCursorPos(*NativePoint) callconv(.winapi) i32;
     extern "user32" fn ScreenToClient(Window, *NativePoint) callconv(.winapi) i32;
     extern "user32" fn LoadIconW(Instance, ?[*:0]align(1) const u16) callconv(.winapi) Icon;
