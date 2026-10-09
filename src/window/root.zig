@@ -207,6 +207,11 @@ pub const HostWindow = struct {
         long_parameter: isize,
     ) callconv(.winapi) isize {
         switch (message) {
+            Win32.wm_paint => {
+                _ = Win32.ValidateRect(window, null);
+                return 0;
+            },
+            Win32.wm_erase_background => return 1,
             Win32.wm_close => {
                 _ = Win32.DestroyWindow(window);
                 return 0;
@@ -260,6 +265,8 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const window_style: u32 = 0x00c0_0000 | 0x0008_0000 | 0x0002_0000;
     const use_default: i32 = @bitCast(@as(u32, 0x8000_0000));
     const show_normal: i32 = 5;
+    const wm_paint: u32 = 0x000F;
+    const wm_erase_background: u32 = 0x0014;
     const wm_destroy: u32 = 0x0002;
     const wm_close: u32 = 0x0010;
     const arrow_cursor: [*:0]const u8 = @ptrFromInt(32512);
@@ -269,6 +276,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
     extern "user32" fn RegisterClassExA(class: *const WndClassExA) callconv(.winapi) u16;
     extern "user32" fn AdjustWindowRect(*Rect, u32, i32) callconv(.winapi) i32;
+    extern "user32" fn ValidateRect(Window, ?*const Rect) callconv(.winapi) i32;
     extern "user32" fn GetClientRect(Window, *Rect) callconv(.winapi) i32;
     extern "user32" fn SystemParametersInfoA(u32, u32, ?*anyopaque, u32) callconv(.winapi) i32;
     extern "user32" fn CreateWindowExA(

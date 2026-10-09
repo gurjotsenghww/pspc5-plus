@@ -7048,6 +7048,7 @@ pub const Renderer = struct {
             @ptrCast(&after_blit),
         );
         try self.submitOneShot(command_buffer);
+        try self.waitForSubmittedWork();
 
         // Flush the copy even inside a guest batch. Presentation waits on the
         // GPU signal, so the CPU can continue processing guest commands.

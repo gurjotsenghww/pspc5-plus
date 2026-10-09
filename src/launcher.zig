@@ -150,6 +150,7 @@ const Phrase = enum {
     status_unlocked,
     view_error,
     open_log_file,
+    open_terminal,
     passcode_btn,
 };
 
@@ -274,6 +275,7 @@ var game_title: [128]u16 = @splat(0);
 var game_title_len: usize = 0;
 var live_log_handle: Win32.Handle = null;
 
+const logs_terminal_rect = Rect{ .left = 434, .top = 138, .right = 564, .bottom = 174 };
 const logs_open_file_rect = Rect{ .left = 574, .top = 138, .right = 718, .bottom = 174 };
 const logs_error_rect = Rect{ .left = 730, .top = 138, .right = 858, .bottom = 174 };
 const logs_copy_rect = Rect{ .left = 870, .top = 138, .right = 970, .bottom = 174 };
@@ -437,6 +439,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_unlocked => "Game unlocked successfully",
             .view_error => "View Error",
             .open_log_file => "Open Log File",
+            .open_terminal => "Live Terminal",
             .passcode_btn => "Passcode",
         },
         .chinese_simplified => switch (phrase) {
@@ -556,6 +559,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_unlocked => "游戏已成功解锁",
             .view_error => "查看错误",
             .open_log_file => "打开日志文件",
+            .open_terminal => "实时终端",
             .passcode_btn => "密码",
         },
         .spanish => switch (phrase) {
@@ -675,6 +679,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_unlocked => "Juego desbloqueado con éxito",
             .view_error => "Ver error",
             .open_log_file => "Abrir log",
+            .open_terminal => "Terminal en vivo",
             .passcode_btn => "Contraseña",
         },
         .arabic => switch (phrase) {
@@ -794,6 +799,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_unlocked => "تم فتح اللعبة بنجاح",
             .view_error => "عرض الخطأ",
             .open_log_file => "فتح ملف السجل",
+            .open_terminal => "طرفية مباشرة",
             .passcode_btn => "رمز المرور",
         },
         .portuguese => switch (phrase) {
@@ -913,6 +919,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_unlocked => "Jogo desbloqueado com sucesso",
             .view_error => "Ver erro",
             .open_log_file => "Abrir log",
+            .open_terminal => "Terminal ao vivo",
             .passcode_btn => "Senha",
         },
         .russian => switch (phrase) {
@@ -1032,6 +1039,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_unlocked => "Игра успешно разблокирована",
             .view_error => "Показать ошибку",
             .open_log_file => "Открыть лог",
+            .open_terminal => "Терминал",
             .passcode_btn => "Пароль",
         },
         .german => switch (phrase) {
@@ -1151,6 +1159,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_unlocked => "Spiel erfolgreich entsperrt",
             .view_error => "Fehler anzeigen",
             .open_log_file => "Logdatei öffnen",
+            .open_terminal => "Live-Terminal",
             .passcode_btn => "Passwort",
         },
         .french => switch (phrase) {
@@ -1270,6 +1279,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_unlocked => "Jeu déverrouillé avec succès",
             .view_error => "Voir l'erreur",
             .open_log_file => "Ouvrir le log",
+            .open_terminal => "Terminal en direct",
             .passcode_btn => "Mot de passe",
         },
     };
@@ -1795,7 +1805,8 @@ fn clickableAt(x: i32, y: i32) bool {
             indexOfRect(&preset_rects, x, y) != null or
             indexOfRect(&settings_toggle_rects, x, y) != null,
         .logs => logs_copy_rect.contains(x, y) or logs_clear_rect.contains(x, y) or
-            logs_error_rect.contains(x, y) or logs_open_file_rect.contains(x, y),
+            logs_error_rect.contains(x, y) or logs_open_file_rect.contains(x, y) or
+            logs_terminal_rect.contains(x, y),
     };
 }
 
@@ -2887,6 +2898,35 @@ fn openLastErrorLog(window: Win32.Window) void {
     _ = Win32.ShellExecuteW(window, w("open"), @ptrCast(&logs_path), null, null, Win32.show_normal);
 }
 
+fn openLiveTerminal(window: Win32.Window) void {
+    var logs_path: [1024]u16 = @splat(0);
+    const home_len = emulatorHomeDirectory(&logs_path);
+    if (home_len == 0) return;
+    const file_suffix = w("logs\\live_output.log");
+    const file_suffix_len = wideLength(file_suffix);
+    if (home_len + file_suffix_len + 1 >= logs_path.len) return;
+    @memcpy(logs_path[home_len..][0..file_suffix_len], file_suffix[0..file_suffix_len]);
+    logs_path[home_len + file_suffix_len] = 0;
+
+    var utf8_path: [1024]u8 = undefined;
+    const path_len = std.unicode.utf16LeToUtf8(&utf8_path, logs_path[0 .. home_len + file_suffix_len]) catch return;
+
+    var cmd_buf: [1500]u8 = undefined;
+    const cmd_str = std.fmt.bufPrint(&cmd_buf, "$host.UI.RawUI.WindowTitle = 'PSPC5 Plus - Live Output Console'; Write-Host '=== PSPC5 Plus Live Engine Output ===' -ForegroundColor Cyan; Get-Content -Path '{s}' -Wait -Tail 30 -ErrorAction SilentlyContinue", .{utf8_path[0..path_len]}) catch return;
+
+    var wide_cmd: [1500]u16 = undefined;
+    const wide_len = std.unicode.utf8ToUtf16Le(&wide_cmd, cmd_str) catch return;
+
+    var wide_args: [1600]u16 = undefined;
+    const prefix = w("-NoExit -Command ");
+    const prefix_len = wideLength(prefix);
+    @memcpy(wide_args[0..prefix_len], prefix[0..prefix_len]);
+    @memcpy(wide_args[prefix_len..][0..wide_len], wide_cmd[0..wide_len]);
+    wide_args[prefix_len + wide_len] = 0;
+
+    _ = Win32.ShellExecuteW(window, w("open"), w("powershell.exe"), @ptrCast(&wide_args), null, Win32.show_normal);
+}
+
 fn recentKey(index: usize, output: *[32]u16) void {
     var utf8: [32]u8 = undefined;
     var stream = std.Io.Writer.fixed(&utf8);
@@ -3064,6 +3104,10 @@ fn handleSavesClick(window: Win32.Window, x: i32, y: i32) void {
 }
 
 fn handleLogsClick(window: Win32.Window, x: i32, y: i32) void {
+    if (logs_terminal_rect.contains(x, y)) {
+        openLiveTerminal(window);
+        return;
+    }
     if (logs_open_file_rect.contains(x, y)) {
         openLastErrorLog(window);
         return;
@@ -3152,6 +3196,7 @@ fn drawSettings(dc: Win32.DeviceContext) void {
 fn drawLogs(dc: Win32.DeviceContext) void {
     pageHeading(dc, .logs_heading, .logs_subtitle);
 
+    button(dc, logs_terminal_rect, .open_terminal, false);
     button(dc, logs_open_file_rect, .open_log_file, false);
     button(dc, logs_error_rect, .view_error, false);
     button(dc, logs_copy_rect, .copy_log, false);
@@ -3817,6 +3862,7 @@ fn finishGame(window: Win32.Window, exit_code: u32) void {
         var fail_buf: [128]u8 = undefined;
         const fail_str = std.fmt.bufPrint(&fail_buf, "Game runner process terminated with non-zero exit code {d}.", .{exit_code}) catch "Game runner process terminated with error.";
         recordDiagnosticError("Game Runner", fail_str, exit_code);
+        error_inspector_open = true;
     }
     _ = Win32.InvalidateRect(window, null, 0);
 }
