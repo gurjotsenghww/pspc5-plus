@@ -65,6 +65,7 @@ const Phrase = enum {
     vulkan_no_device,
     vulkan_too_old,
     launch_game,
+    stop_game,
     input_heading,
     input_subtitle,
     keyboard,
@@ -275,11 +276,12 @@ var game_title: [128]u16 = @splat(0);
 var game_title_len: usize = 0;
 var live_log_handle: Win32.Handle = null;
 
-const logs_terminal_rect = Rect{ .left = 434, .top = 138, .right = 564, .bottom = 174 };
-const logs_open_file_rect = Rect{ .left = 574, .top = 138, .right = 718, .bottom = 174 };
-const logs_error_rect = Rect{ .left = 730, .top = 138, .right = 858, .bottom = 174 };
-const logs_copy_rect = Rect{ .left = 870, .top = 138, .right = 970, .bottom = 174 };
-const logs_clear_rect = Rect{ .left = 980, .top = 138, .right = 1066, .bottom = 174 };
+const logs_stop_rect = Rect{ .left = 386, .top = 138, .right = 496, .bottom = 174 };
+const logs_terminal_rect = Rect{ .left = 504, .top = 138, .right = 624, .bottom = 174 };
+const logs_open_file_rect = Rect{ .left = 632, .top = 138, .right = 756, .bottom = 174 };
+const logs_error_rect = Rect{ .left = 764, .top = 138, .right = 874, .bottom = 174 };
+const logs_copy_rect = Rect{ .left = 882, .top = 138, .right = 970, .bottom = 174 };
+const logs_clear_rect = Rect{ .left = 978, .top = 138, .right = 1066, .bottom = 174 };
 const logs_console_rect = Rect{ .left = 282, .top = 188, .right = 1086, .bottom = 714 };
 
 const password_dialog_rect = Rect{ .left = 370, .top = 220, .right = 810, .bottom = 510 };
@@ -354,6 +356,7 @@ fn tr(phrase: Phrase) []const u8 {
             .vulkan_no_device => "No Vulkan device · check your GPU driver",
             .vulkan_too_old => "Vulkan below 1.2 · update your GPU driver",
             .launch_game => "Launch game  ▶",
+            .stop_game => "Stop Game  ■",
             .input_heading => "Controls",
             .input_subtitle => "Choose an input source and map keyboard keys to DualSense buttons",
             .keyboard => "Keyboard",
@@ -474,6 +477,7 @@ fn tr(phrase: Phrase) []const u8 {
             .vulkan_no_device => "未发现 Vulkan 设备 · 请检查显卡驱动",
             .vulkan_too_old => "Vulkan 低于 1.2 · 请更新显卡驱动",
             .launch_game => "启动游戏  ▶",
+            .stop_game => "停止游戏  ■",
             .input_heading => "控制设置",
             .input_subtitle => "选择输入方式，并将键盘按键映射到 DualSense 按钮",
             .keyboard => "键盘",
@@ -594,6 +598,7 @@ fn tr(phrase: Phrase) []const u8 {
             .vulkan_no_device => "Sin dispositivo Vulkan · revisa el controlador de tu GPU",
             .vulkan_too_old => "Vulkan inferior a 1.2 · actualiza el controlador de tu GPU",
             .launch_game => "Iniciar juego  ▶",
+            .stop_game => "Detener juego  ■",
             .input_heading => "Controles",
             .input_subtitle => "Elige una fuente de entrada y asigna teclas a los botones de DualSense",
             .keyboard => "Teclado",
@@ -714,6 +719,7 @@ fn tr(phrase: Phrase) []const u8 {
             .vulkan_no_device => "لا يوجد جهاز Vulkan · تحقق من تعريف بطاقتك",
             .vulkan_too_old => "إصدار Vulkan أقدم من 1.2 · حدّث تعريف بطاقتك",
             .launch_game => "تشغيل اللعبة  ▶",
+            .stop_game => "إيقاف اللعبة  ■",
             .input_heading => "التحكم",
             .input_subtitle => "اختر مصدر الإدخال واربط مفاتيح لوحة المفاتيح بأزرار DualSense",
             .keyboard => "لوحة المفاتيح",
@@ -834,6 +840,7 @@ fn tr(phrase: Phrase) []const u8 {
             .vulkan_no_device => "Nenhum dispositivo Vulkan · verifique o driver da sua GPU",
             .vulkan_too_old => "Vulkan abaixo de 1.2 · atualize o driver da sua GPU",
             .launch_game => "Iniciar jogo  ▶",
+            .stop_game => "Parar jogo  ■",
             .input_heading => "Controles",
             .input_subtitle => "Escolha uma fonte de entrada e associe teclas aos botões do DualSense",
             .keyboard => "Teclado",
@@ -954,6 +961,7 @@ fn tr(phrase: Phrase) []const u8 {
             .vulkan_no_device => "Нет устройства Vulkan · проверьте драйвер видеокарты",
             .vulkan_too_old => "Vulkan ниже 1.2 · обновите драйвер видеокарты",
             .launch_game => "Запустить игру  ▶",
+            .stop_game => "Остановить игру  ■",
             .input_heading => "Управление",
             .input_subtitle => "Выберите источник и назначьте клавиши на кнопки DualSense",
             .keyboard => "Клавиатура",
@@ -1074,6 +1082,7 @@ fn tr(phrase: Phrase) []const u8 {
             .vulkan_no_device => "Kein Vulkan-Gerät · GPU-Treiber prüfen",
             .vulkan_too_old => "Vulkan älter als 1.2 · GPU-Treiber aktualisieren",
             .launch_game => "Spiel starten  ▶",
+            .stop_game => "Spiel beenden  ■",
             .input_heading => "Steuerung",
             .input_subtitle => "Eingabequelle wählen und Tasten den DualSense-Buttons zuweisen",
             .keyboard => "Tastatur",
@@ -1194,6 +1203,7 @@ fn tr(phrase: Phrase) []const u8 {
             .vulkan_no_device => "Aucun périphérique Vulkan · vérifiez le pilote de votre GPU",
             .vulkan_too_old => "Vulkan antérieur à 1.2 · mettez à jour le pilote de votre GPU",
             .launch_game => "Lancer le jeu  ▶",
+            .stop_game => "Arrêter le jeu  ■",
             .input_heading => "Commandes",
             .input_subtitle => "Choisissez une source et associez les touches aux boutons DualSense",
             .keyboard => "Clavier",
@@ -1382,7 +1392,13 @@ fn windowProcedure(
             if (word_parameter == game_timer_id) {
                 if (game_dirty.swap(false, .acq_rel)) {
                     if (current_page == .logs) {
-                        _ = Win32.InvalidateRect(window, null, 0);
+                        var native_logs = Win32.NativeRect{
+                            .left = logs_console_rect.left,
+                            .top = logs_console_rect.top,
+                            .right = logs_console_rect.right,
+                            .bottom = logs_console_rect.bottom,
+                        };
+                        _ = Win32.InvalidateRect(window, &native_logs, 0);
                     }
                 }
                 return 0;
@@ -1554,7 +1570,11 @@ fn windowProcedure(
             // Closing the launcher abandons the extraction; the extractor has
             // no window of its own to be stopped from.
             if (extract_process != null) _ = Win32.TerminateProcess(extract_process, 1);
-            if (game_process != null) _ = Win32.CloseHandle(game_process);
+            if (game_process != null) {
+                _ = Win32.TerminateProcess(game_process, 0);
+                _ = Win32.CloseHandle(game_process);
+                game_process = null;
+            }
             input.hid.stopTest();
             Win32.PostQuitMessage(0);
             return 0;
@@ -1806,7 +1826,7 @@ fn clickableAt(x: i32, y: i32) bool {
             indexOfRect(&settings_toggle_rects, x, y) != null,
         .logs => logs_copy_rect.contains(x, y) or logs_clear_rect.contains(x, y) or
             logs_error_rect.contains(x, y) or logs_open_file_rect.contains(x, y) or
-            logs_terminal_rect.contains(x, y),
+            logs_terminal_rect.contains(x, y) or (game_running and logs_stop_rect.contains(x, y)),
     };
 }
 
@@ -1893,7 +1913,13 @@ fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
         }
         return;
     }
-    if (library_launch_rect.contains(x, y)) launchGame(window);
+    if (library_launch_rect.contains(x, y)) {
+        if (game_running) {
+            stopGame(window);
+        } else {
+            launchGame(window);
+        }
+    }
 }
 
 fn handleInputClick(x: i32, y: i32) void {
@@ -2099,7 +2125,11 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
     button(dc, library_extract_rect, .extract_pkg, extract_state == .running);
     button(dc, library_passcode_rect, .passcode_btn, game_folder_length == 0);
     drawLegalNotice(dc);
-    button(dc, library_launch_rect, .launch_game, game_folder_length == 0);
+    if (game_running) {
+        dangerButton(dc, library_launch_rect, .stop_game, false);
+    } else {
+        button(dc, library_launch_rect, .launch_game, game_folder_length == 0);
+    }
 }
 
 fn extractFinished() bool {
@@ -3104,6 +3134,10 @@ fn handleSavesClick(window: Win32.Window, x: i32, y: i32) void {
 }
 
 fn handleLogsClick(window: Win32.Window, x: i32, y: i32) void {
+    if (game_running and logs_stop_rect.contains(x, y)) {
+        stopGame(window);
+        return;
+    }
     if (logs_terminal_rect.contains(x, y)) {
         openLiveTerminal(window);
         return;
@@ -3196,6 +3230,7 @@ fn drawSettings(dc: Win32.DeviceContext) void {
 fn drawLogs(dc: Win32.DeviceContext) void {
     pageHeading(dc, .logs_heading, .logs_subtitle);
 
+    dangerButton(dc, logs_stop_rect, .stop_game, !game_running);
     button(dc, logs_terminal_rect, .open_terminal, false);
     button(dc, logs_open_file_rect, .open_log_file, false);
     button(dc, logs_error_rect, .view_error, false);
@@ -3203,25 +3238,19 @@ fn drawLogs(dc: Win32.DeviceContext) void {
     button(dc, logs_clear_rect, .clear_log, false);
 
     if (game_running) {
-        roundFill(dc, .{ .left = 282, .top = 138, .right = 430, .bottom = 174 }, 10, 0x00243818);
-        roundFill(dc, .{ .left = 296, .top = 152, .right = 304, .bottom = 160 }, 4, 0x0068d391);
-        text(dc, w("RUNNING"), -1, .{ .left = 312, .top = 146, .right = 422, .bottom = 168 }, 0x0068d391, small_font, Win32.dt_left);
-        if (game_title_len > 0) {
-            text(dc, &game_title, @intCast(game_title_len), .{ .left = 444, .top = 146, .right = 560, .bottom = 168 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-        }
+        roundFill(dc, .{ .left = 282, .top = 138, .right = 378, .bottom = 174 }, 10, 0x00243818);
+        roundFill(dc, .{ .left = 294, .top = 152, .right = 302, .bottom = 160 }, 4, 0x0068d391);
+        text(dc, w("RUNNING"), -1, .{ .left = 308, .top = 146, .right = 374, .bottom = 168 }, 0x0068d391, small_font, Win32.dt_left);
     } else if (game_exit_code) |code| {
-        roundFill(dc, .{ .left = 282, .top = 138, .right = 430, .bottom = 174 }, 10, 0x002c2520);
-        roundFill(dc, .{ .left = 296, .top = 152, .right = 304, .bottom = 160 }, 4, if (code == 0) 0x0068d391 else 0x006b77ff);
+        roundFill(dc, .{ .left = 282, .top = 138, .right = 378, .bottom = 174 }, 10, 0x002c2520);
+        roundFill(dc, .{ .left = 294, .top = 152, .right = 302, .bottom = 160 }, 4, if (code == 0) 0x0068d391 else 0x006b77ff);
         var code_buf: [32]u8 = undefined;
-        const code_str = std.fmt.bufPrint(&code_buf, "EXITED ({d})", .{code}) catch "EXITED";
-        drawAscii(dc, code_str, .{ .left = 312, .top = 146, .right = 422, .bottom = 168 }, if (code == 0) 0x0068d391 else 0x006b77ff, small_font, Win32.dt_left);
-        if (game_title_len > 0) {
-            text(dc, &game_title, @intCast(game_title_len), .{ .left = 444, .top = 146, .right = 560, .bottom = 168 }, 0x009b9088, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-        }
+        const code_str = std.fmt.bufPrint(&code_buf, "EXIT ({d})", .{code}) catch "EXITED";
+        drawAscii(dc, code_str, .{ .left = 308, .top = 146, .right = 374, .bottom = 168 }, if (code == 0) 0x0068d391 else 0x006b77ff, small_font, Win32.dt_left);
     } else {
-        roundFill(dc, .{ .left = 282, .top = 138, .right = 380, .bottom = 174 }, 10, 0x00251f1b);
-        roundFill(dc, .{ .left = 296, .top = 152, .right = 304, .bottom = 160 }, 4, 0x006d625b);
-        text(dc, w("IDLE"), -1, .{ .left = 312, .top = 146, .right = 372, .bottom = 168 }, 0x007c716a, small_font, Win32.dt_left);
+        roundFill(dc, .{ .left = 282, .top = 138, .right = 378, .bottom = 174 }, 10, 0x00251f1b);
+        roundFill(dc, .{ .left = 294, .top = 152, .right = 302, .bottom = 160 }, 4, 0x006d625b);
+        text(dc, w("IDLE"), -1, .{ .left = 308, .top = 146, .right = 374, .bottom = 168 }, 0x007c716a, small_font, Win32.dt_left);
     }
 
     roundFill(dc, logs_console_rect, 10, 0x00130f0c);
@@ -3369,6 +3398,11 @@ fn card(dc: Win32.DeviceContext, rectangle: Rect) void {
 fn button(dc: Win32.DeviceContext, rectangle: Rect, label: Phrase, disabled: bool) void {
     roundFill(dc, rectangle, 10, if (disabled) 0x00352c27 else 0x00ff9c3d);
     localizedText(dc, label, .{ .left = rectangle.left + 12, .top = rectangle.top + 14, .right = rectangle.right - 12, .bottom = rectangle.bottom - 8 }, if (disabled) 0x007d736c else 0x00181510, medium_font, Win32.dt_center);
+}
+
+fn dangerButton(dc: Win32.DeviceContext, rectangle: Rect, label: Phrase, disabled: bool) void {
+    roundFill(dc, rectangle, 10, if (disabled) 0x00352c27 else 0x003535d4);
+    localizedText(dc, label, .{ .left = rectangle.left + 8, .top = rectangle.top + 14, .right = rectangle.right - 8, .bottom = rectangle.bottom - 8 }, if (disabled) 0x007d736c else 0x00ffffff, medium_font, Win32.dt_center);
 }
 
 fn drawToggle(dc: Win32.DeviceContext, x: i32, y: i32, enabled: bool) void {
@@ -3796,7 +3830,6 @@ fn acceptGameLine(raw: []const u8) void {
         var written: u32 = 0;
         _ = Win32.WriteFile(live_log_handle, value.ptr, @intCast(length), &written, null);
         _ = Win32.WriteFile(live_log_handle, "\r\n", 2, &written, null);
-        _ = Win32.FlushFileBuffers(live_log_handle);
     }
 
     if (is_error) {
@@ -3847,7 +3880,16 @@ fn clearGameLog(window: Win32.Window) void {
     _ = Win32.InvalidateRect(window, null, 0);
 }
 
+fn stopGame(window: Win32.Window) void {
+    if (!game_running) return;
+    if (game_process) |proc| {
+        _ = Win32.TerminateProcess(proc, 0);
+    }
+    finishGame(window, 0);
+}
+
 fn finishGame(window: Win32.Window, exit_code: u32) void {
+    if (!game_running) return;
     _ = Win32.KillTimer(window, game_timer_id);
     if (game_process != null) {
         _ = Win32.CloseHandle(game_process);
@@ -4039,7 +4081,7 @@ fn launchGame(owner: Win32.Window) void {
     rememberGameFolder(game_folder[0..game_folder_length], true);
     setStatusPhrase(.status_launched, false);
     current_page = .logs;
-    _ = Win32.SetTimer(owner, game_timer_id, 100, null);
+    _ = Win32.SetTimer(owner, game_timer_id, 50, null);
     _ = Win32.InvalidateRect(owner, null, 0);
 }
 

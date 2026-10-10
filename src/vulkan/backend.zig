@@ -7056,13 +7056,7 @@ pub const Renderer = struct {
         try self.submitOneShot(command_buffer);
         try self.waitForSubmittedWork();
 
-        // Flush the copy even inside a guest batch. Presentation waits on the
-        // GPU signal, so the CPU can continue processing guest commands.
-        const render_complete = presentation.render_complete[image_index];
-        try self.flushQueuedCommandsSignaling(render_complete);
         const present_info = vk.PresentInfoKHR{
-            .wait_semaphore_count = 1,
-            .wait_semaphores = @ptrCast(&render_complete),
             .swapchain_count = 1,
             .swapchains = @ptrCast(&presentation.swapchain),
             .image_indices = @ptrCast(&image_index),
