@@ -6694,8 +6694,11 @@ pub const Renderer = struct {
         const presentation = &(self.window_presentation orelse return Error.PresentationRejected);
         if (!presentation.needs_recreate) return true;
         var capabilities: vk.SurfaceCapabilitiesKHR = undefined;
-        if (presentation.surface_functions.get_surface_capabilities(self.physical_device, presentation.surface, &capabilities) != vk.success)
-            return Error.SurfaceQueryFailed;
+        if (presentation.surface_functions.get_surface_capabilities(self.physical_device, presentation.surface, &capabilities) != vk.success) {
+            // Transient failure during window resize, occlusion, or message dispatch.
+            // Leave needs_recreate set so we retry on subsequent flips instead of failing presentation.
+            return false;
+        }
         // A minimized window cannot own a zero-sized swapchain. Keep retrying
         // on later frames without blocking the guest until the window returns.
         if (capabilities.current_extent.width == 0 or capabilities.current_extent.height == 0) return false;
@@ -6706,7 +6709,7 @@ pub const Renderer = struct {
         destroyWindowSwapchain(self.allocator, self.device, &self.device_functions, presentation);
         // Keep the surface and retry flag if creation fails (e.g. another resize
         // raced the capabilities query). No retired handle is reused on retry.
-        presentation.* = try createWindowPresentation(
+        presentation.* = createWindowPresentation(
             self.allocator,
             self.physical_device,
             self.device,
@@ -6716,7 +6719,11 @@ pub const Renderer = struct {
             presentation.surface,
             presentation.surface_functions,
             presentation.swapchain_functions,
-        );
+        ) catch |err| {
+            presentation.needs_recreate = true;
+            return err;
+        };
+        presentation.needs_recreate = false;
         return true;
     }
 
@@ -6880,20 +6887,19 @@ pub const Renderer = struct {
         if (!gpu_packed_scanout and packedHdrSwapchainFormat(self.render_targets.items[target_index].target.format.vulkan)) {
             return self.presentResidentTarget(target_index, flip);
         }
-        try self.blitRenderTargetToSwapchain(target_index, flip);
-        return true;
+        return try self.blitRenderTargetToSwapchain(target_index, flip);
     }
 
     /// Presents a resident color attachment without a GPU→CPU→GPU round trip.
     /// Vulkan performs format conversion and 1920×1080→window scaling in the
     /// blit; the source returns to attachment layout for the next guest draw.
-    fn blitRenderTargetToSwapchain(self: *Renderer, target_index: usize, flip: ?gpu.state.Flip) anyerror!void {
-        if (self.present_in_flight) return Error.PresentationRejected;
+    fn blitRenderTargetToSwapchain(self: *Renderer, target_index: usize, flip: ?gpu.state.Flip) anyerror!bool {
+        if (self.present_in_flight) return false;
         self.present_in_flight = true;
         defer self.present_in_flight = false;
         if (!try self.ensureWindowSwapchain()) {
             self.present_dropped += 1;
-            return;
+            return false;
         }
         if (target_index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
         try self.transitionRenderTargetToColorAttachment(target_index);
@@ -6944,7 +6950,7 @@ pub const Renderer = struct {
         if (acquired == vk.not_ready or acquired == vk.timeout or acquired == vk.error_out_of_date_khr) {
             if (acquired == vk.error_out_of_date_khr) presentation.needs_recreate = true;
             self.present_dropped += 1;
-            return;
+            return false;
         }
         if (acquired != vk.success and acquired != vk.suboptimal_khr) return Error.SwapchainAcquireFailed;
         if (acquired == vk.suboptimal_khr) presentation.needs_recreate = true;
@@ -7065,9 +7071,10 @@ pub const Renderer = struct {
         if (presented == vk.error_out_of_date_khr or presented == vk.suboptimal_khr) {
             presentation.needs_recreate = true;
             if (presented == vk.error_out_of_date_khr) self.present_dropped += 1;
-            return;
+            return false;
         }
         if (presented != vk.success and presented != vk.suboptimal_khr) return Error.SwapchainPresentFailed;
+        return true;
     }
 
     /// Whether a colour export wrote the texels currently cached at `address`.
@@ -18819,7 +18826,7 @@ pub const Renderer = struct {
         color.write_mask = 15;
         color.tile_mode = .linear;
         const index = try self.uploadLinearColorTarget(try guestColorTarget(color), pixels);
-        try self.blitRenderTargetToSwapchain(index, null);
+        _ = try self.blitRenderTargetToSwapchain(index, null);
     }
 
     pub fn probePackedScanout(self: *Renderer) anyerror!void {
@@ -23228,7 +23235,7 @@ pub const Renderer = struct {
         const index = self.latest_video_render_target_index orelse return;
         if (index >= self.render_targets.items.len) return;
         if (!self.render_targets.items[index].initialized) return;
-        self.blitRenderTargetToSwapchain(index, null) catch return;
+        _ = self.blitRenderTargetToSwapchain(index, null) catch return;
         self.presented_video_frames.store(self.uploaded_video_frame, .release);
     }
 
@@ -31163,13 +31170,11 @@ pub const Renderer = struct {
                                 self.last_flip_error = err;
                                 return false;
                             }
-                        else blk: {
+                        else
                             self.blitRenderTargetToSwapchain(target_index, flip) catch |err| {
                                 self.last_flip_error = err;
                                 return false;
                             };
-                            break :blk true;
-                        };
                         if (!presented) {
                             self.last_flip_error = Error.PresentationRejected;
                             return false;
@@ -31249,10 +31254,14 @@ pub const Renderer = struct {
                             return false;
                         }
                     } else {
-                        self.blitRenderTargetToSwapchain(video_index, null) catch |err| {
+                        const presented = self.blitRenderTargetToSwapchain(video_index, null) catch |err| {
                             self.last_flip_error = err;
                             return false;
                         };
+                        if (!presented) {
+                            self.last_flip_error = Error.PresentationRejected;
+                            return false;
+                        }
                     }
                     if (self.flip_callbacks <= 24 or self.presented_frames % 30 == 0 or log_verbose_gpu) {
                         std.debug.print(
